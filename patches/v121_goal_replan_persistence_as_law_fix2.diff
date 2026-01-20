@@ -1,0 +1,1864 @@
+--- /dev/null	2026-01-16 11:39:09
++++ atos_core/goal_replan_persistence_law_v121.py	2026-01-16 10:58:43
+@@ -0,0 +1,245 @@
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++
++FAIL_REASON_MISSING_CONVERSATION_TURNS_V121 = "missing_conversation_turns_v121"
++FAIL_REASON_MISSING_ACTION_PLANS_V121 = "missing_action_plans_v121"
++FAIL_REASON_GOAL_DIED_ON_FAIL_V121 = "goal_died_on_fail_v121"
++FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121 = "exhaustion_without_proof_v121"
++
++OK_REASON_OK_V121 = "ok"
++OK_REASON_GOAL_EXHAUSTED_V121 = "goal_exhausted_v121"
++
++
++_WAITING_OBJECTIVE_KINDS_V121 = {"COMM_ASK_CLARIFY", "COMM_CONFIRM"}
++
++
++@dataclass(frozen=True)
++class GoalReplanPersistenceResultV121:
++    ok: bool
++    reason: str
++    details: Dict[str, Any]
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _payload_view(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    for r in rows:
++        if not isinstance(r, dict):
++            continue
++        payload = r.get("payload")
++        if isinstance(payload, dict):
++            out.append(dict(payload))
++    return out
++
++
++def _extract_last_user_turn_payload(run_dir: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "conversation_turns.jsonl"))
++    payloads = _payload_view(rows)
++    users: List[Dict[str, Any]] = [dict(p) for p in payloads if isinstance(p, dict) and str(p.get("role") or "") == "user"]
++    if not users:
++        return {}
++    users.sort(key=lambda p: (int(p.get("turn_index", 0) or 0), int(p.get("created_step", 0) or 0), str(p.get("turn_id") or "")))
++    return dict(users[-1])
++
++
++def _plan_row_for_user_turn(run_dir: str, user_turn_id: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "action_plans.jsonl"))
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        if str(row.get("user_turn_id") or "") == str(user_turn_id):
++            return dict(row)
++    return {}
++
++
++def _eval_by_id(run_dir: str) -> Dict[str, Dict[str, Any]]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "objective_evals.jsonl"))
++    out: Dict[str, Dict[str, Any]] = {}
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        eval_id = str(row.get("eval_id") or "")
++        if eval_id and eval_id not in out:
++            out[eval_id] = dict(row)
++    return dict(out)
++
++
++def _attempt_proof_from_plan(
++    *, plan_row: Dict[str, Any], eval_by_id: Dict[str, Dict[str, Any]]
++) -> Tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
++    attempted = plan_row.get("attempted_actions") if isinstance(plan_row.get("attempted_actions"), list) else []
++    proof: List[Dict[str, Any]] = []
++    missing: List[Dict[str, Any]] = []
++    for i, a in enumerate([x for x in attempted if isinstance(x, dict)]):
++        act_id = str(a.get("act_id") or "")
++        eval_id = str(a.get("eval_id") or "")
++        if not act_id or not eval_id:
++            missing.append({"attempt_index": int(i), "missing": "act_id_or_eval_id"})
++            continue
++        eval_row = eval_by_id.get(eval_id) if isinstance(eval_by_id.get(eval_id), dict) else None
++        if not isinstance(eval_row, dict):
++            missing.append({"attempt_index": int(i), "missing": "eval_row", "eval_id": str(eval_id)})
++            continue
++        verdict = eval_row.get("verdict") if isinstance(eval_row.get("verdict"), dict) else {}
++        verdict_ok = bool(verdict.get("ok", False))
++        verdict_reason = str(verdict.get("reason") or "")
++        sem = {"act_id": str(act_id), "eval_id": str(eval_id)}
++        plan_hash = sha256_hex(canonical_json_dumps(sem).encode("utf-8"))
++        proof.append(
++            {
++                "attempt_index": int(i),
++                "plan_hash": str(plan_hash),
++                "act_id": str(act_id),
++                "eval_id": str(eval_id),
++                "attempt_ok": bool(a.get("ok", False)),
++                "eval_verdict_ok": bool(verdict_ok),
++                "eval_reason": str(verdict_reason),
++            }
++        )
++    ok = len(missing) == 0
++    return bool(ok), list(proof), list(missing)
++
++
++def verify_goal_replan_persistence_law_v121(*, run_dir: str, max_replans_per_turn: int) -> GoalReplanPersistenceResultV121:
++    """
++    V121 law (deterministic, fail-closed):
++      - If a plan fails and there are remaining ranked candidates under budget, this is a violation (goal_died_on_fail_v121).
++      - If exhaustion is claimed (no remaining candidates or budget reached), proof is required:
++          attempted_actions must be complete and each attempt must have a corresponding objective_eval row.
++    """
++    rd = str(run_dir)
++    turns_path = os.path.join(rd, "conversation_turns.jsonl")
++    plans_path = os.path.join(rd, "action_plans.jsonl")
++
++    if not os.path.exists(turns_path):
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_MISSING_CONVERSATION_TURNS_V121, details={"conversation_turns_jsonl": str(turns_path)})
++    if not os.path.exists(plans_path):
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_MISSING_ACTION_PLANS_V121, details={"action_plans_jsonl": str(plans_path)})
++
++    last_user = _extract_last_user_turn_payload(rd)
++    user_turn_id = str(last_user.get("turn_id") or "")
++    if not user_turn_id:
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_MISSING_CONVERSATION_TURNS_V121, details={"missing": "last_user_turn_id"})
++
++    plan_row = _plan_row_for_user_turn(rd, user_turn_id)
++    if not plan_row:
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_MISSING_ACTION_PLANS_V121, details={"user_turn_id": str(user_turn_id)})
++
++    ranked = plan_row.get("ranked_candidates") if isinstance(plan_row.get("ranked_candidates"), list) else []
++    attempted = plan_row.get("attempted_actions") if isinstance(plan_row.get("attempted_actions"), list) else []
++    ranked_total = len([x for x in ranked if isinstance(x, dict)])
++    attempts_total = len([x for x in attempted if isinstance(x, dict)])
++    chosen_ok = bool(plan_row.get("chosen_ok", False))
++    objective_kind = str(plan_row.get("objective_kind") or "")
++    waiting_for_user = objective_kind in _WAITING_OBJECTIVE_KINDS_V121
++
++    # If chosen_ok is True, the runner satisfied within this turn; law is vacuously satisfied.
++    if bool(chosen_ok):
++        details = {
++            "schema_version": 121,
++            "kind": "goal_replan_persistence_law_v121_result",
++            "ok": True,
++            "reason": OK_REASON_OK_V121,
++            "user_turn_id": str(user_turn_id),
++            "objective_kind": str(objective_kind),
++            "waiting_for_user": bool(waiting_for_user),
++            "ranked_total": int(ranked_total),
++            "attempts_total": int(attempts_total),
++        }
++        return GoalReplanPersistenceResultV121(ok=True, reason=OK_REASON_OK_V121, details=dict(details))
++
++    # chosen_ok is False: either replanning is required (violation) or exhaustion is proven.
++    cap = int(max_replans_per_turn)
++    if cap <= 0:
++        cap = 0
++    budgeted_ranked_total = int(min(int(ranked_total), int(cap))) if int(cap) > 0 else int(ranked_total)
++    remaining = max(0, int(ranked_total) - int(attempts_total))
++
++    # If we haven't tried all ranked candidates (or we are under the replanning budget), we must not fail early.
++    if (not waiting_for_user) and int(attempts_total) < int(budgeted_ranked_total) and int(remaining) > 0:
++        details = {
++            "schema_version": 121,
++            "kind": "goal_replan_persistence_law_v121_result",
++            "ok": False,
++            "reason": FAIL_REASON_GOAL_DIED_ON_FAIL_V121,
++            "user_turn_id": str(user_turn_id),
++            "objective_kind": str(objective_kind),
++            "waiting_for_user": bool(waiting_for_user),
++            "ranked_total": int(ranked_total),
++            "attempts_total": int(attempts_total),
++            "remaining_candidates": int(remaining),
++            "max_replans_per_turn": int(max_replans_per_turn),
++        }
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_GOAL_DIED_ON_FAIL_V121, details=dict(details))
++
++    # Exhaustion (or waiting): proof required for exhaustion cases.
++    eval_by_id = _eval_by_id(rd)
++    ok_pf, proof, missing = _attempt_proof_from_plan(plan_row=dict(plan_row), eval_by_id=dict(eval_by_id))
++    if not bool(ok_pf):
++        details = {
++            "schema_version": 121,
++            "kind": "goal_replan_persistence_law_v121_result",
++            "ok": False,
++            "reason": FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121,
++            "user_turn_id": str(user_turn_id),
++            "objective_kind": str(objective_kind),
++            "waiting_for_user": bool(waiting_for_user),
++            "ranked_total": int(ranked_total),
++            "attempts_total": int(attempts_total),
++            "missing_proof": list(missing),
++        }
++        return GoalReplanPersistenceResultV121(ok=False, reason=FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121, details=dict(details))
++
++    details = {
++        "schema_version": 121,
++        "kind": "goal_replan_persistence_law_v121_result",
++        "ok": True,
++        "reason": OK_REASON_GOAL_EXHAUSTED_V121 if not bool(waiting_for_user) else OK_REASON_OK_V121,
++        "user_turn_id": str(user_turn_id),
++        "objective_kind": str(objective_kind),
++        "waiting_for_user": bool(waiting_for_user),
++        "ranked_total": int(ranked_total),
++        "attempts_total": int(attempts_total),
++        "attempts_proof": list(proof),
++    }
++    return GoalReplanPersistenceResultV121(ok=True, reason=str(details["reason"]), details=dict(details))
++
++
++def write_goal_replan_persistence_summary_v121(*, run_dir: str, max_replans_per_turn: int) -> Dict[str, Any]:
++    """
++    Write-once summary artifact: goal_replan_persistence_summary_v121.json (deterministic).
++    """
++    res = verify_goal_replan_persistence_law_v121(run_dir=str(run_dir), max_replans_per_turn=int(max_replans_per_turn))
++    body = dict(res.details)
++    body["summary_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    path = os.path.join(str(run_dir), "goal_replan_persistence_summary_v121.json")
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return dict(body)
++
+--- /dev/null	2026-01-16 11:39:09
++++ atos_core/conversation_loop_v121.py	2026-01-16 11:36:02
+@@ -0,0 +1,633 @@
++from __future__ import annotations
++
++import json
++import os
++import shutil
++from dataclasses import dataclass
++from typing import Any, Dict, List, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .ato_v71 import ATOv71, stable_hash_obj
++from .conversation_loop_v110 import run_conversation_v110
++from .conversation_loop_v116 import apply_dialogue_survival_as_law_v116
++from .conversation_v96 import verify_chained_jsonl_v96
++from .goal_persistence_law_v120 import write_goal_persistence_summary_v120
++from .goal_persistence_v115 import render_fail_response_v115
++from .goal_plan_eval_gate_v115 import goal_id_v115, verify_goal_plan_eval_law_v115
++from .goal_replan_persistence_law_v121 import write_goal_replan_persistence_summary_v121
++from .mind_graph_v71 import append_chained_jsonl, verify_chained_jsonl
++
++
++FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V121 = "plan_search_budget_exhausted_v121"
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _last_entry_hash(path: str) -> str:
++    last = ""
++    if not os.path.exists(path):
++        return last
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if isinstance(obj, dict):
++                last = str(obj.get("entry_hash") or last)
++    return str(last)
++
++
++def _sorted_dict_list(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    pairs: List[Tuple[str, Dict[str, Any]]] = []
++    for it in items:
++        if not isinstance(it, dict):
++            continue
++        try:
++            k = canonical_json_dumps(it)
++        except Exception:
++            k = str(it)
++        pairs.append((str(k), dict(it)))
++    pairs.sort(key=lambda kv: str(kv[0]))
++    return [v for _, v in pairs]
++
++
++def _copy_file_worm(src: str, dst: str) -> None:
++    _ensure_absent(dst)
++    with open(src, "rb") as f:
++        data = f.read()
++    tmp = dst + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "wb") as f:
++        f.write(data)
++    os.replace(tmp, dst)
++
++
++def _copy_tree_worm(src_dir: str, dst_dir: str) -> None:
++    _ensure_absent(dst_dir)
++    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=False)
++
++
++def _promote_attempt_to_root(*, attempt_dir: str, out_dir: str) -> None:
++    ad = str(attempt_dir)
++    od = str(out_dir)
++    for name in sorted(os.listdir(ad), key=str):
++        src = os.path.join(ad, name)
++        dst = os.path.join(od, name)
++        if os.path.isdir(src):
++            if name.startswith("attempt_") or name.startswith("replan_attempt_"):
++                continue
++            _copy_tree_worm(src, dst)
++        else:
++            _copy_file_worm(src, dst)
++
++
++def _extract_last_user_turn_payload(run_dir: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "conversation_turns.jsonl"))
++    users: List[Dict[str, Any]] = []
++    for row in rows:
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        if str(payload.get("role") or "") == "user":
++            users.append(dict(payload))
++    if not users:
++        return {}
++    users.sort(key=lambda p: (int(p.get("turn_index", 0) or 0), int(p.get("created_step", 0) or 0), str(p.get("turn_id") or "")))
++    return dict(users[-1])
++
++
++def _plan_row_for_user_turn(run_dir: str, user_turn_id: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "action_plans.jsonl"))
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        if str(row.get("user_turn_id") or "") == str(user_turn_id):
++            return dict(row)
++    return {}
++
++
++def _make_plan_ato_v121(*, action_plan: Dict[str, Any]) -> ATOv71:
++    plan_id = str(action_plan.get("plan_id") or action_plan.get("plan_sig") or "")
++    if not plan_id:
++        raise ValueError("missing_plan_id")
++    created_step = int(action_plan.get("created_step", 0) or 0)
++    user_turn_id = str(action_plan.get("user_turn_id") or "")
++    user_turn_index = int(action_plan.get("user_turn_index", -1) or -1)
++    ranked = action_plan.get("ranked_candidates") if isinstance(action_plan.get("ranked_candidates"), list) else []
++    attempted = action_plan.get("attempted_actions") if isinstance(action_plan.get("attempted_actions"), list) else []
++    subgraph = {
++        "schema_version": 121,
++        "plan_id": str(plan_id),
++        "user_turn_id": str(user_turn_id),
++        "user_turn_index": int(user_turn_index),
++        "chosen_action_id": str(action_plan.get("chosen_action_id") or ""),
++        "chosen_eval_id": str(action_plan.get("chosen_eval_id") or ""),
++        "chosen_ok": bool(action_plan.get("chosen_ok", False)),
++        "ranked_candidates": [
++            {
++                "act_id": str(r.get("act_id") or ""),
++                "expected_success": float(r.get("expected_success", 0.0) or 0.0),
++                "expected_cost": float(r.get("expected_cost", 0.0) or 0.0),
++            }
++            for r in ranked
++            if isinstance(r, dict)
++        ],
++        "attempted_actions": [
++            {"act_id": str(a.get("act_id") or ""), "eval_id": str(a.get("eval_id") or ""), "ok": bool(a.get("ok", False))}
++            for a in attempted
++            if isinstance(a, dict)
++        ],
++    }
++    subgraph["ranked_candidates"].sort(key=lambda d: str(d.get("act_id") or ""))
++    subgraph["attempted_actions"].sort(key=lambda d: (str(d.get("eval_id") or ""), str(d.get("act_id") or "")))
++    return ATOv71(
++        ato_id=str(plan_id),
++        ato_type="PLAN",
++        subgraph=dict(subgraph),
++        slots={},
++        bindings={},
++        cost=float(len(subgraph["ranked_candidates"])),
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 121, "plan_kind": "action_plan_v100"},
++        created_step=int(created_step),
++        last_step=int(created_step),
++    )
++
++
++def _make_fail_event_ato_v121(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    reason_code: str,
++    step: int,
++    evidence: Dict[str, Any],
++) -> ATOv71:
++    body = {
++        "schema_version": 121,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": str(reason_code),
++        "evidence": dict(evidence) if isinstance(evidence, dict) else {},
++    }
++    fail_id = "fail_event_v121_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(body, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 121, "eval_kind": "FAIL_EVENT_V121"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _append_fail_event_to_mind_graph_v121(
++    *,
++    mind_graph_v121_dir: str,
++    fail_ato: ATOv71,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    user_turn_id: str,
++    step: int,
++    evidence_refs: Sequence[Dict[str, Any]],
++) -> None:
++    mg_dir = str(mind_graph_v121_dir)
++    nodes_path = os.path.join(mg_dir, "mind_nodes.jsonl")
++    edges_path = os.path.join(mg_dir, "mind_edges.jsonl")
++    if not os.path.exists(nodes_path) or not os.path.exists(edges_path):
++        raise ValueError("missing_mind_graph_files_v121")
++
++    fail_ato_dict = fail_ato.to_dict(include_sig=True)
++    prev_nodes_hash = _last_entry_hash(nodes_path) or None
++    nodes_entry = {
++        "time": deterministic_iso(step=int(step)),
++        "step": int(step),
++        "event": "NODE",
++        "payload": {"reason": "fail_event_v121", "ato": dict(fail_ato_dict)},
++    }
++    append_chained_jsonl(nodes_path, dict(nodes_entry), prev_hash=prev_nodes_hash)
++
++    ev_refs = _sorted_dict_list([x for x in evidence_refs if isinstance(x, dict)])
++
++    def _mk_edge(dst: str) -> Dict[str, Any]:
++        edge_sem_sig = {"src": str(fail_ato.ato_id), "dst": str(dst), "edge_type": "DERIVED_FROM", "evidence_refs": list(ev_refs)}
++        return dict(edge_sem_sig, edge_sig=str(stable_hash_obj(edge_sem_sig)))
++
++    dsts = [str(goal_ato_id), str(plan_ato_id), str(user_turn_id)]
++    dsts = [d for d in dsts if d]
++    for dst in dsts:
++        prev_edges_hash = _last_entry_hash(edges_path) or None
++        edges_entry = {
++            "time": deterministic_iso(step=int(step)),
++            "step": int(step),
++            "event": "EDGE",
++            "payload": {"reason": "fail_event_v121", "edge": _mk_edge(dst)},
++        }
++        append_chained_jsonl(edges_path, dict(edges_entry), prev_hash=prev_edges_hash)
++
++
++def _transcript_view_from_run_dir(run_dir: str) -> List[Dict[str, Any]]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "transcript.jsonl"))
++    out: List[Dict[str, Any]] = []
++    for row in rows:
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        role = str(payload.get("role") or "")
++        text = str(payload.get("text") or "")
++        if role in {"user", "assistant"}:
++            out.append({"role": role, "text": text})
++    return out
++
++
++@dataclass(frozen=True)
++class AttemptRecordV121:
++    attempt_index: int
++    seed_used: int
++    attempt_dir: str
++    goal_id: str
++    user_turn_id: str
++    ok_final_v116: bool
++    reason_final_v116: str
++    ok_goal_persistence: bool
++    reason_goal_persistence: str
++    ok_goal_replan_persistence: bool
++    reason_goal_replan_persistence: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "attempt_index": int(self.attempt_index),
++            "seed_used": int(self.seed_used),
++            "attempt_dir": str(self.attempt_dir),
++            "goal_id": str(self.goal_id),
++            "user_turn_id": str(self.user_turn_id),
++            "ok_final_v116": bool(self.ok_final_v116),
++            "reason_final_v116": str(self.reason_final_v116),
++            "ok_goal_persistence": bool(self.ok_goal_persistence),
++            "reason_goal_persistence": str(self.reason_goal_persistence),
++            "ok_goal_replan_persistence": bool(self.ok_goal_replan_persistence),
++            "reason_goal_replan_persistence": str(self.reason_goal_replan_persistence),
++        }
++
++
++def _replan_trace_obj_v121(
++    *,
++    conversation_id: str,
++    attempts: List[AttemptRecordV121],
++    chosen_attempt_index: int,
++    budget_total: int,
++    final_ok: bool,
++    final_reason: str,
++) -> Dict[str, Any]:
++    body = {
++        "schema_version": 121,
++        "kind": "replan_trace_v121",
++        "conversation_id": str(conversation_id),
++        "budget_total": int(budget_total),
++        "chosen_attempt_index": int(chosen_attempt_index),
++        "final_ok": bool(final_ok),
++        "final_reason": str(final_reason),
++        "attempts": [a.to_dict() for a in list(attempts)],
++    }
++    body["trace_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return dict(body)
++
++
++def run_conversation_v121(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_plan_attempts: int = 8,
++    max_replans_per_turn: int = 3,
++    goal_autopilot_total_steps: int = 60,
++) -> Dict[str, Any]:
++    """
++    V121: add "goal replan persistence as law" as an additional hard gate inside the attempt replanning loop.
++    """
++    od = str(out_dir)
++    _ensure_absent(od)
++    os.makedirs(od, exist_ok=False)
++
++    attempts: List[AttemptRecordV121] = []
++    chosen_attempt = -1
++    conversation_id_seen = ""
++
++    for a in range(int(max_plan_attempts)):
++        seed_used = int(seed) + int(a)
++        attempt_dir = os.path.join(od, f"attempt_{a:03d}")
++
++        # 1) Base pipeline (V110) with discourse variants enabled and optional autopilot horizon override.
++        run_conversation_v110(
++            user_turn_texts=list(user_turn_texts),
++            out_dir=str(attempt_dir),
++            seed=int(seed_used),
++            discourse_variants_v119_enabled=True,
++            goal_autopilot_total_steps=int(goal_autopilot_total_steps),
++        )
++
++        # 2) Apply V115 goal-plan-eval law.
++        gate = verify_goal_plan_eval_law_v115(
++            run_dir=str(attempt_dir),
++            max_replans_per_turn=int(max_replans_per_turn),
++            write_mind_graph=True,
++            write_snapshots=True,
++        )
++        fr115 = {
++            "schema_version": 115,
++            "kind": "final_response_v115",
++            "ok": bool(gate.ok),
++            "reason": str(gate.reason if not bool(gate.ok) else "ok"),
++            "fail_response_text": str(render_fail_response_v115(str(gate.reason))) if not bool(gate.ok) else "",
++        }
++        fr115["final_sig"] = sha256_hex(canonical_json_dumps(fr115).encode("utf-8"))
++        _write_once_json(os.path.join(str(attempt_dir), "final_response_v115.json"), dict(fr115))
++
++        # 3) Apply V116 dialogue survival law.
++        applied = apply_dialogue_survival_as_law_v116(run_dir=str(attempt_dir), write_mind_graph=True)
++        fr116_path = os.path.join(str(attempt_dir), "final_response_v116.json")
++        fr116 = _read_json(fr116_path) if os.path.exists(fr116_path) else {}
++        ok_final = bool(fr116.get("ok", False)) if isinstance(fr116, dict) else False
++        reason_final = str(fr116.get("reason") or "") if isinstance(fr116, dict) else "missing_final_response_v116"
++
++        # 5) Goal persistence law (V120).
++        gps = write_goal_persistence_summary_v120(run_dir=str(attempt_dir), expected_autopilot_total_steps=int(goal_autopilot_total_steps))
++        ok_gp = bool(gps.get("ok", False))
++        reason_gp = str(gps.get("reason") or "") if isinstance(gps, dict) else "missing_goal_persistence_summary"
++
++        # 6) Goal replanning persistence law (V121).
++        grps = write_goal_replan_persistence_summary_v121(run_dir=str(attempt_dir), max_replans_per_turn=int(max_replans_per_turn))
++        ok_gr = bool(grps.get("ok", False))
++        reason_gr = str(grps.get("reason") or "") if isinstance(grps, dict) else "missing_goal_replan_persistence_summary"
++
++        last_user = _extract_last_user_turn_payload(str(attempt_dir))
++        user_turn_id = str(last_user.get("turn_id") or "")
++        conversation_id = str(last_user.get("conversation_id") or str(applied.details.get("conversation_id") or ""))
++        if conversation_id and not conversation_id_seen:
++            conversation_id_seen = str(conversation_id)
++        user_turn_index = int(last_user.get("turn_index", 0) or 0)
++        refs = last_user.get("refs") if isinstance(last_user.get("refs"), dict) else {}
++        parse_sig = str(refs.get("parse_sig") or "")
++        user_text = str(last_user.get("text") or "")
++        gid = goal_id_v115(
++            conversation_id=str(conversation_id),
++            user_turn_id=str(user_turn_id),
++            user_turn_index=int(user_turn_index),
++            parse_sig=str(parse_sig),
++            user_text=str(user_text),
++        )
++
++        attempts.append(
++            AttemptRecordV121(
++                attempt_index=int(a),
++                seed_used=int(seed_used),
++                attempt_dir=os.path.basename(str(attempt_dir)),
++                goal_id=str(gid),
++                user_turn_id=str(user_turn_id),
++                ok_final_v116=bool(ok_final),
++                reason_final_v116=str(reason_final),
++                ok_goal_persistence=bool(ok_gp),
++                reason_goal_persistence=str(reason_gp) if not bool(ok_gp) else "ok",
++                ok_goal_replan_persistence=bool(ok_gr),
++                reason_goal_replan_persistence=str(reason_gr) if not bool(ok_gr) else "ok",
++            )
++        )
++
++        if bool(ok_final) and bool(ok_gp) and bool(ok_gr):
++            chosen_attempt = int(a)
++            break
++
++    if not attempts:
++        raise ValueError("no_attempts_v121")
++
++    final_ok = chosen_attempt >= 0
++    final_reason = "ok" if final_ok else FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V121
++    chosen_idx = int(chosen_attempt if chosen_attempt >= 0 else (len(attempts) - 1))
++    chosen_attempt_dir = os.path.join(od, f"attempt_{chosen_idx:03d}")
++
++    # Promote chosen attempt artifacts to root (WORM).
++    _promote_attempt_to_root(attempt_dir=str(chosen_attempt_dir), out_dir=str(od))
++
++    # Write replanning trace (WORM).
++    rep_obj = _replan_trace_obj_v121(
++        conversation_id=str(conversation_id_seen),
++        attempts=list(attempts),
++        chosen_attempt_index=int(chosen_attempt if chosen_attempt >= 0 else -1),
++        budget_total=int(max_plan_attempts),
++        final_ok=bool(final_ok),
++        final_reason=str(final_reason),
++    )
++    _write_once_json(os.path.join(od, "replan_trace_v121.json"), dict(rep_obj))
++
++    # Write final_response_v121.json (WORM).
++    fr116_root_path = os.path.join(od, "final_response_v116.json")
++    fr116_root = _read_json(fr116_root_path) if os.path.exists(fr116_root_path) else {}
++    final_obj = {
++        "schema_version": 121,
++        "kind": "final_response_v121",
++        "ok": bool(final_ok),
++        "reason": str(final_reason if not final_ok else "ok"),
++        "fail_response_text": str(render_fail_response_v115(str(final_reason))) if not bool(final_ok) else "",
++        "upstream": {"final_response_v116": dict(fr116_root) if isinstance(fr116_root, dict) else {}},
++    }
++    final_obj["final_sig"] = sha256_hex(canonical_json_dumps(final_obj).encode("utf-8"))
++    _write_once_json(os.path.join(od, "final_response_v121.json"), dict(final_obj))
++
++    # Create mind_graph_v121: copy mind_graph_v116 and append FAIL_EVENT_V121 nodes for rejected attempts.
++    mg116_dir = os.path.join(od, "mind_graph_v116")
++    mg121_dir = os.path.join(od, "mind_graph_v121")
++    if os.path.isdir(mg116_dir):
++        os.makedirs(mg121_dir, exist_ok=False)
++        _copy_file_worm(os.path.join(mg116_dir, "mind_nodes.jsonl"), os.path.join(mg121_dir, "mind_nodes.jsonl"))
++        _copy_file_worm(os.path.join(mg116_dir, "mind_edges.jsonl"), os.path.join(mg121_dir, "mind_edges.jsonl"))
++        nodes_path = os.path.join(mg121_dir, "mind_nodes.jsonl")
++        edges_path = os.path.join(mg121_dir, "mind_edges.jsonl")
++        if not verify_chained_jsonl(nodes_path) or not verify_chained_jsonl(edges_path):
++            raise ValueError("mind_graph_v121_chain_invalid_after_copy")
++
++        existing_nodes: Dict[str, Dict[str, Any]] = {}
++        for row in _read_jsonl(nodes_path):
++            payload = row.get("payload") if isinstance(row, dict) else None
++            ato = payload.get("ato") if isinstance(payload, dict) else None
++            if not isinstance(ato, dict):
++                continue
++            ato_id = str(ato.get("ato_id") or "")
++            if ato_id:
++                existing_nodes[ato_id] = dict(ato)
++
++        chosen_last_user = _extract_last_user_turn_payload(str(chosen_attempt_dir))
++        chosen_user_turn_id = str(chosen_last_user.get("turn_id") or "")
++        chosen_conversation_id = str(chosen_last_user.get("conversation_id") or "")
++        chosen_user_turn_index = int(chosen_last_user.get("turn_index", 0) or 0)
++        chosen_refs = chosen_last_user.get("refs") if isinstance(chosen_last_user.get("refs"), dict) else {}
++        chosen_parse_sig = str(chosen_refs.get("parse_sig") or "")
++        chosen_user_text = str(chosen_last_user.get("text") or "")
++        chosen_goal_id = goal_id_v115(
++            conversation_id=str(chosen_conversation_id),
++            user_turn_id=str(chosen_user_turn_id),
++            user_turn_index=int(chosen_user_turn_index),
++            parse_sig=str(chosen_parse_sig),
++            user_text=str(chosen_user_text),
++        )
++        chosen_plan_row = _plan_row_for_user_turn(str(chosen_attempt_dir), str(chosen_user_turn_id))
++        chosen_plan_id = str(chosen_plan_row.get("plan_id") or chosen_plan_row.get("plan_sig") or "")
++        step0 = int(chosen_last_user.get("created_step", 0) or 0)
++
++        for ar in sorted(list(attempts), key=lambda a: int(a.attempt_index)):
++            if int(ar.attempt_index) == int(chosen_attempt):
++                continue
++
++            attempt_subdir = os.path.join(od, f"attempt_{int(ar.attempt_index):03d}")
++            plan_row = _plan_row_for_user_turn(str(attempt_subdir), str(ar.user_turn_id))
++            plan_id = str(plan_row.get("plan_id") or plan_row.get("plan_sig") or "") if isinstance(plan_row, dict) else ""
++
++            if plan_id and plan_id not in existing_nodes and isinstance(plan_row, dict) and plan_row:
++                plan_ato = _make_plan_ato_v121(action_plan=dict(plan_row))
++                plan_ato_dict = plan_ato.to_dict(include_sig=True)
++                prev_nodes_hash = _last_entry_hash(nodes_path) or None
++                nodes_entry = {
++                    "time": deterministic_iso(step=int(plan_ato.created_step)),
++                    "step": int(plan_ato.created_step),
++                    "event": "NODE",
++                    "payload": {"reason": "plan_import_v121", "ato": dict(plan_ato_dict)},
++                }
++                append_chained_jsonl(nodes_path, dict(nodes_entry), prev_hash=prev_nodes_hash)
++                existing_nodes[str(plan_id)] = dict(plan_ato_dict)
++
++            fail_specs: List[Tuple[str, Dict[str, Any]]] = []
++            if not bool(ar.ok_final_v116):
++                fail_specs.append(
++                    (
++                        "final_v116_fail",
++                        {
++                            "attempt_index": int(ar.attempt_index),
++                            "seed_used": int(ar.seed_used),
++                            "attempt_dir": str(ar.attempt_dir),
++                            "reason_final_v116": str(ar.reason_final_v116),
++                        },
++                    )
++                )
++            if not bool(ar.ok_goal_persistence):
++                gsum_path = os.path.join(str(attempt_subdir), "goal_persistence_summary_v120.json")
++                gsum_sig = ""
++                if os.path.exists(gsum_path):
++                    gobj = _read_json(gsum_path)
++                    if isinstance(gobj, dict):
++                        gsum_sig = str(gobj.get("summary_sig") or "")
++                fail_specs.append(
++                    (
++                        "goal_persistence_" + str(ar.reason_goal_persistence),
++                        {
++                            "attempt_index": int(ar.attempt_index),
++                            "seed_used": int(ar.seed_used),
++                            "attempt_dir": str(ar.attempt_dir),
++                            "reason_goal_persistence": str(ar.reason_goal_persistence),
++                            "goal_persistence_summary_sig": str(gsum_sig),
++                            "goal_persistence_summary_file": os.path.basename(str(gsum_path)),
++                        },
++                    )
++                )
++            if not bool(ar.ok_goal_replan_persistence):
++                rsum_path = os.path.join(str(attempt_subdir), "goal_replan_persistence_summary_v121.json")
++                rsum_sig = ""
++                if os.path.exists(rsum_path):
++                    robj = _read_json(rsum_path)
++                    if isinstance(robj, dict):
++                        rsum_sig = str(robj.get("summary_sig") or "")
++                fail_specs.append(
++                    (
++                        "goal_replan_persistence_" + str(ar.reason_goal_replan_persistence),
++                        {
++                            "attempt_index": int(ar.attempt_index),
++                            "seed_used": int(ar.seed_used),
++                            "attempt_dir": str(ar.attempt_dir),
++                            "reason_goal_replan_persistence": str(ar.reason_goal_replan_persistence),
++                            "goal_replan_persistence_summary_sig": str(rsum_sig),
++                            "goal_replan_persistence_summary_file": os.path.basename(str(rsum_path)),
++                        },
++                    )
++                )
++
++            for reason_code, evidence in sorted(fail_specs, key=lambda kv: str(kv[0])):
++                fail_ato = _make_fail_event_ato_v121(
++                    conversation_id=str(chosen_conversation_id),
++                    user_turn_id=str(chosen_user_turn_id),
++                    goal_ato_id=str(chosen_goal_id),
++                    plan_ato_id=str(plan_id or chosen_plan_id),
++                    reason_code=str(reason_code),
++                    step=int(step0),
++                    evidence=dict(evidence, replan_trace_sig=str(rep_obj.get("trace_sig") or ""), replan_trace_file="replan_trace_v121.json"),
++                )
++                _append_fail_event_to_mind_graph_v121(
++                    mind_graph_v121_dir=str(mg121_dir),
++                    fail_ato=fail_ato,
++                    goal_ato_id=str(chosen_goal_id),
++                    plan_ato_id=str(plan_id or chosen_plan_id),
++                    user_turn_id=str(chosen_user_turn_id),
++                    step=int(step0),
++                    evidence_refs=[
++                        {"kind": "turn", "turn_id": str(chosen_user_turn_id)},
++                        {"kind": "replan_trace", "trace_sig": str(rep_obj.get("trace_sig") or "")},
++                        {"kind": "attempt", "attempt_index": int(ar.attempt_index), "seed_used": int(ar.seed_used)},
++                    ],
++                )
++
++        if not verify_chained_jsonl(nodes_path) or not verify_chained_jsonl(edges_path):
++            raise ValueError("mind_graph_v121_chain_invalid_after_append")
++
++    # Best-effort chain checks on promoted ledgers.
++    for p in [
++        os.path.join(od, "transcript.jsonl"),
++        os.path.join(od, "conversation_turns.jsonl"),
++        os.path.join(od, "intent_parses.jsonl"),
++        os.path.join(od, "objective_evals.jsonl"),
++        os.path.join(od, "dialogue_trials.jsonl"),
++        os.path.join(od, "action_plans.jsonl"),
++        os.path.join(od, "goal_events.jsonl"),
++    ]:
++        if os.path.exists(p) and not bool(verify_chained_jsonl_v96(p)):
++            raise ValueError(f"chain_invalid_promoted:{os.path.basename(p)}")
++
++    return {"final_response_v121": dict(final_obj), "replan_trace_v121_sig": str(rep_obj.get("trace_sig") or "")}
+--- /dev/null	2026-01-16 11:39:09
++++ scripts/smoke_v121_goal_replan_until_exhausted.py	2026-01-16 11:02:09
+@@ -0,0 +1,210 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import shutil
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.goal_replan_persistence_law_v121 import (
++    FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121,
++    FAIL_REASON_GOAL_DIED_ON_FAIL_V121,
++    OK_REASON_GOAL_EXHAUSTED_V121,
++    verify_goal_replan_persistence_law_v121,
++)
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
++    _ensure_absent(path)
++    lines = [json.dumps(r, ensure_ascii=False, sort_keys=True) for r in rows]
++    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
++
++
++def _mk_case_dir(*, out_dir: Path, case_name: str) -> Path:
++    cd = out_dir / case_name
++    _ensure_absent(cd)
++    cd.mkdir(parents=True, exist_ok=False)
++    return cd
++
++
++def _write_case_replan_ok(case_dir: Path) -> None:
++    # One user turn, and an action plan that shows a failed attempt then a successful replanned attempt.
++    _write_jsonl(case_dir / "conversation_turns.jsonl", [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}])
++    _write_jsonl(
++        case_dir / "action_plans.jsonl",
++        [
++            {
++                "user_turn_id": "turn_u0",
++                "objective_kind": "COMM_RESPOND",
++                "chosen_ok": True,
++                "ranked_candidates": [{"act_id": "A"}, {"act_id": "B"}],
++                "attempted_actions": [
++                    {"act_id": "A", "eval_id": "e0", "ok": False},
++                    {"act_id": "B", "eval_id": "e1", "ok": True},
++                ],
++            }
++        ],
++    )
++    _write_jsonl(
++        case_dir / "objective_evals.jsonl",
++        [
++            {"eval_id": "e0", "verdict": {"ok": False, "reason": "fail_A"}},
++            {"eval_id": "e1", "verdict": {"ok": True, "reason": ""}},
++        ],
++    )
++
++
++def _write_case_exhausted_with_proof(case_dir: Path) -> None:
++    _write_jsonl(case_dir / "conversation_turns.jsonl", [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}])
++    _write_jsonl(
++        case_dir / "action_plans.jsonl",
++        [
++            {
++                "user_turn_id": "turn_u0",
++                "objective_kind": "COMM_RESPOND",
++                "chosen_ok": False,
++                "ranked_candidates": [{"act_id": "A"}, {"act_id": "B"}],
++                "attempted_actions": [
++                    {"act_id": "A", "eval_id": "e0", "ok": False},
++                    {"act_id": "B", "eval_id": "e1", "ok": False},
++                ],
++            }
++        ],
++    )
++    _write_jsonl(
++        case_dir / "objective_evals.jsonl",
++        [
++            {"eval_id": "e0", "verdict": {"ok": False, "reason": "fail_A"}},
++            {"eval_id": "e1", "verdict": {"ok": False, "reason": "fail_B"}},
++        ],
++    )
++
++
++def _tamper_exhaustion_proof(*, src_case_dir: Path, dst_dir: Path) -> Path:
++    _ensure_absent(dst_dir)
++    shutil.copytree(str(src_case_dir), str(dst_dir), dirs_exist_ok=False)
++    # Remove one eval row to break the proof deterministically.
++    evals_path = dst_dir / "objective_evals.jsonl"
++    rows = [json.loads(x) for x in evals_path.read_text(encoding="utf-8").splitlines() if x.strip()]
++    rows2 = [r for r in rows if isinstance(r, dict) and str(r.get("eval_id") or "") != "e1"]
++    evals_path.write_text("\n".join([json.dumps(r, ensure_ascii=False, sort_keys=True) for r in rows2]) + "\n", encoding="utf-8")
++    return dst_dir
++
++
++def _smoke_once(*, out_dir: Path) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    case00 = _mk_case_dir(out_dir=out_dir, case_name="case_00_replan_required")
++    _write_case_replan_ok(case00)
++    r00 = verify_goal_replan_persistence_law_v121(run_dir=str(case00), max_replans_per_turn=3)
++    if not r00.ok:
++        _fail(f"case00_unexpected_fail:{r00.reason}")
++
++    case01 = _mk_case_dir(out_dir=out_dir, case_name="case_01_exhausted_with_proof")
++    _write_case_exhausted_with_proof(case01)
++    r01 = verify_goal_replan_persistence_law_v121(run_dir=str(case01), max_replans_per_turn=3)
++    if not r01.ok or str(r01.reason) != OK_REASON_GOAL_EXHAUSTED_V121:
++        _fail(f"case01_expected_goal_exhausted_but:{r01.ok}:{r01.reason}")
++
++    eval_obj = {
++        "schema_version": 121,
++        "kind": "smoke_v121_goal_replan_until_exhausted_eval",
++        "case00": {"ok": bool(r00.ok), "reason": str(r00.reason)},
++        "case01": {"ok": bool(r01.ok), "reason": str(r01.reason)},
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++    core = {"schema_version": 121, "eval_sha256": _sha256_file(out_dir / "eval.json"), "eval_sig": str(eval_obj["eval_sig"])}
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    _write_once_json(out_dir / "smoke_summary.json", {"schema_version": 121, "kind": "smoke_v121_goal_replan_until_exhausted_summary", "core": core, "summary_sha256": str(summary_sha256)})
++    return {"core": dict(core), "summary_sha256": str(summary_sha256), "out_dir": str(out_dir)}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    # seed currently unused (smoke is deterministic without RNG), but keep for uniform CLI and future extensions.
++    _seed = int(args.seed)
++
++    r1 = _smoke_once(out_dir=Path(out_base + "_try1"))
++    r2 = _smoke_once(out_dir=Path(out_base + "_try2"))
++
++    if canonical_json_dumps(r1["core"]) != canonical_json_dumps(r2["core"]):
++        _fail("determinism_core_mismatch")
++    if str(r1["summary_sha256"]) != str(r2["summary_sha256"]):
++        _fail("determinism_summary_sha256_mismatch")
++
++    # Negative tamper: corrupt exhaustion proof and require stable failure reason.
++    tamper_dir = Path(out_base + "_try1_tamper")
++    src_case = Path(out_base + "_try1") / "case_01_exhausted_with_proof"
++    tampered_case = _tamper_exhaustion_proof(src_case_dir=src_case, dst_dir=tamper_dir)
++    res = verify_goal_replan_persistence_law_v121(run_dir=str(tampered_case), max_replans_per_turn=3)
++    if bool(res.ok):
++        _fail("tamper_expected_fail_but_ok")
++    if str(res.reason) != FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121:
++        _fail(f"tamper_reason_mismatch:{res.reason}")
++
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "determinism_ok": True,
++                "summary_sha256": str(r1["summary_sha256"]),
++                "out_try1": str(out_base + "_try1"),
++                "out_try2": str(out_base + "_try2"),
++                "tamper_reason": str(res.reason),
++                "sha256_eval_json_try1": _sha256_file(Path(out_base + "_try1") / "eval.json"),
++            },
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-16 11:39:09
++++ scripts/smoke_v121_family7_real_history_stress.py	2026-01-16 11:09:49
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import EXTERNAL_WORLD_ACTION_SEARCH_V111
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    env = dict(os.environ)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v121.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(seed),
++        "--max_tasks",
++        "9999",
++        "--max_rewrites",
++        "4",
++        "--max_replans_per_turn",
++        "3",
++        "--max_plan_attempts",
++        "8",
++    ]
++    p = subprocess.run(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
++    if p.returncode != 0:
++        raise SystemExit("runner_failed:\nSTDOUT:\n{out}\nSTDERR:\n{err}".format(out=p.stdout, err=p.stderr))
++
++
++def _negative_tests(*, world_manifest: str) -> Dict[str, Any]:
++    ok1 = False
++    reason1 = ""
++    try:
++        external_world_access_v113(
++            allowed=False,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="validator_failed_fluency_contract",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok1 = True
++    except ValueError as e:
++        reason1 = str(e)
++
++    ok2 = False
++    reason2 = ""
++    try:
++        external_world_access_v113(
++            allowed=True,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="invalid_reason_code_x",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok2 = True
++    except ValueError as e:
++        reason2 = str(e)
++
++    return {
++        "access_not_allowed": {"ok": bool(ok1), "reason": str(reason1)},
++        "invalid_reason_code": {"ok": bool(ok2), "reason": str(reason2)},
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_base = Path(str(args.out_base))
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        raise SystemExit("empty_tasks")
++    world_manifest = str(tasks[0].get("world_manifest") or "")
++
++    neg = _negative_tests(world_manifest=world_manifest)
++    if neg["access_not_allowed"]["reason"] != "external_world_access_not_allowed":
++        raise SystemExit("negative_failed:access_not_allowed")
++    if neg["invalid_reason_code"]["reason"] != "invalid_reason_code":
++        raise SystemExit("negative_failed:invalid_reason_code")
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    _run_runner(tasks=tasks_path, out_dir=out1, seed=seed)
++    _run_runner(tasks=tasks_path, out_dir=out2, seed=seed)
++
++    s1 = _load_json(out1 / "summary.json")
++    s2 = _load_json(out2 / "summary.json")
++    eval_sha1 = str(s1.get("eval_sha256") or "")
++    eval_sha2 = str(s2.get("eval_sha256") or "")
++    if eval_sha1 != eval_sha2:
++        raise SystemExit("determinism_failed:eval_sha")
++
++    ev1 = _load_json(out1 / "eval.json")
++    ev2 = _load_json(out2 / "eval.json")
++    if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++        raise SystemExit("determinism_failed:eval_json")
++
++    if int(ev1.get("tasks_ok") or 0) != int(ev1.get("tasks_total") or 0):
++        raise SystemExit("tasks_not_all_ok")
++
++    res1 = ev1.get("results") if isinstance(ev1.get("results"), list) else []
++    ext_counts = [int(r.get("external_world_events_total") or 0) for r in res1 if isinstance(r, dict)]
++    if sum(1 for c in ext_counts if c == 1) != 1:
++        raise SystemExit("external_world_in_cycle_expected_one_call")
++
++    core = {
++        "schema_version": 121,
++        "seed": int(seed),
++        "try1": {"eval_sha256": eval_sha1, "tasks_ok": int(s1.get("tasks_ok") or 0)},
++        "try2": {"eval_sha256": eval_sha2, "tasks_ok": int(s2.get("tasks_ok") or 0)},
++        "negative_tests": dict(neg),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(summary_sha256),
++        "core": core,
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++        "sha256_eval_json": _sha256_file(out1 / "eval.json"),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-16 11:39:09
++++ scripts/run_family7_dla_v121.py	2026-01-16 11:33:59
+@@ -0,0 +1,450 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v121 import run_conversation_v121
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import (
++    EXTERNAL_WORLD_ACTION_SEARCH_V111,
++    EXTERNAL_WORLD_REASON_CODES_V111,
++    compute_external_world_chain_hash_v111,
++    verify_external_world_event_sig_chain_v111,
++)
++from atos_core.fluency_survival_v112 import fluency_contract_v112, fluency_survival_plan_v112, summarize_fluency_fail_code_v112
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++ACK_TO_CHOICE_LABEL_V112 = {
++    "ok",
++    "okay",
++    "certo",
++    "beleza",
++    "blz",
++    "continua",
++    "continue",
++    "segue",
++    "vai",
++    "faz",
++    "pode",
++    "sim",
++}
++
++
++def _canon_ack_token_v112(s: str) -> str:
++    t = str(s or "").strip().lower()
++    t = " ".join([x for x in t.split() if x])
++    return t
++
++
++def _choiceify_minimal_ack_v112(user_turn_texts: Sequence[str]) -> List[str]:
++    out: List[str] = []
++    for s in user_turn_texts:
++        cs = _canon_ack_token_v112(str(s))
++        if cs in ACK_TO_CHOICE_LABEL_V112:
++            out.append("A")
++        else:
++            out.append(str(s))
++    return out
++
++
++def _load_jsonl_payload_view(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if not isinstance(obj, dict):
++                continue
++            payload = obj.get("payload")
++            if not isinstance(payload, dict):
++                continue
++            out.append(dict(payload))
++    return out
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _compute_external_world_access_once_v113(
++    *,
++    world_manifest: str,
++    reason_code: str,
++    query: str,
++    seed: int,
++) -> List[Dict[str, Any]]:
++    evs, _ = external_world_access_v113(
++        allowed=True,
++        world_manifest=str(world_manifest),
++        action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++        reason_code=str(reason_code),
++        args={"query": str(query), "limit": 3, "roles": ["user"]},
++        seed=int(seed),
++        turn_index=0,
++        prev_event_sig="",
++    )
++    return list(evs)
++
++
++def _count_unresolved_reference_events(binding_events: Sequence[Dict[str, Any]]) -> int:
++    bad = 0
++    for ev in binding_events:
++        if not isinstance(ev, dict):
++            continue
++        t = str(ev.get("type") or "")
++        if t in {"BIND_MISS", "BIND_AMBIGUOUS"}:
++            bad += 1
++    return int(bad)
++
++
++def _unresolved_reference_final_from_flow(flow_events: Sequence[Dict[str, Any]]) -> int:
++    if not flow_events:
++        return 0
++    last = flow_events[-1] if isinstance(flow_events[-1], dict) else {}
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        return 0
++    return 1 if bool(flags.get("UNRESOLVED_REFERENCE")) else 0
++
++
++def _count_semantic_contradiction_flags(semantic_events: Sequence[Dict[str, Any]]) -> int:
++    cnt = 0
++    for ev in semantic_events:
++        if not isinstance(ev, dict):
++            continue
++        flags = ev.get("flags_v109")
++        if not isinstance(flags, dict):
++            continue
++        if bool(flags.get("CONTRADICTION_UNREPAIRED")):
++            cnt += 1
++    return int(cnt)
++
++
++def _write_external_world_ledger(*, task_dir: Path, events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    events_path = task_dir / "external_world_events.jsonl"
++    _ensure_absent(events_path)
++    if events:
++        with open(events_path, "x", encoding="utf-8") as f:
++            for e in events:
++                f.write(canonical_json_dumps(e))
++                f.write("\n")
++    else:
++        events_path.write_text("", encoding="utf-8")
++
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v111(list(events))
++    if not ok_sig:
++        _fail(f"external_world_sig_chain_fail:{reason_sig}")
++    chain_hash = compute_external_world_chain_hash_v111(list(events))
++    snap = {
++        "schema_version": 111,
++        "kind": "external_world_registry_snapshot_v111",
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++    }
++    snap_path = task_dir / "external_world_registry_snapshot_v111.json"
++    _write_once_json(snap_path, snap)
++    return {
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++        "external_world_events_jsonl": str(events_path),
++        "external_world_registry_snapshot_v111_json": str(snap_path),
++    }
++
++
++def _compute_freeze_manifest_v121(*, task_dir: Path, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    sha256_rel: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        pp = str(p or "")
++        sha256_rel[str(k)] = str(os.path.basename(pp)) if pp else ""
++        if pp and os.path.exists(pp):
++            sha256[str(k)] = _sha256_file(Path(pp))
++    body = {
++        "schema_version": 121,
++        "kind": "freeze_manifest_v121",
++        "task_dir": str(task_dir.name),
++        "sha256": dict(sha256),
++        "sha256_paths": dict(sha256_rel),
++    }
++    body["manifest_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    path = task_dir / "freeze_manifest_v121.json"
++    _write_once_json(path, body)
++    return dict(body)
++
++
++def _summarize_task_result_v121(*, task_dir: Path, attempts: Sequence[Dict[str, Any]], chosen_attempt: int) -> Dict[str, Any]:
++    chosen_dir = task_dir / "attempt_{a:03d}".format(a=chosen_attempt)
++    final_path = chosen_dir / "final_response_v121.json"
++    fr = _load_json(final_path) if final_path.exists() else {}
++    ok = bool(fr.get("ok", False)) if isinstance(fr, dict) else False
++    reason = str(fr.get("reason") or "") if isinstance(fr, dict) else "missing_final_response_v121"
++    rel_final_path = str(Path("attempt_{a:03d}".format(a=chosen_attempt)) / "final_response_v121.json")
++    return {
++        "ok": bool(ok),
++        "reason": str(reason),
++        "chosen_attempt_index": int(chosen_attempt),
++        "attempts_total": int(len(list(attempts))),
++        "attempt_final_response_v121": str(rel_final_path),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", type=int, default=9999)
++    ap.add_argument("--max_rewrites", type=int, default=4)
++    ap.add_argument("--max_replans_per_turn", type=int, default=3)
++    ap.add_argument("--max_plan_attempts", type=int, default=8)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_dir = Path(str(args.out))
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        _fail("empty_tasks")
++
++    max_tasks = min(int(args.max_tasks), len(tasks))
++    results: List[Dict[str, Any]] = []
++    failures: List[Dict[str, Any]] = []
++
++    for i, task in enumerate(tasks[:max_tasks]):
++        if not isinstance(task, dict):
++            continue
++        task_id = str(task.get("task_id") or f"task_{i:03d}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        user_turn_texts = _choiceify_minimal_ack_v112(user_turn_texts)
++        require_fluency = "fluency_survival_v112" in [str(x) for x in (task.get("expected_validators") if isinstance(task.get("expected_validators"), list) else [])]
++        allow_external = bool(task.get("allow_external_world_once", False))
++        world_manifest = str(task.get("world_manifest") or "")
++        probe_reason = str(task.get("external_world_probe_reason_code") or "validator_failed_fluency_contract")
++
++        task_dir = out_dir / "task_{i:03d}".format(i=i)
++        _ensure_absent(task_dir)
++        task_dir.mkdir(parents=True, exist_ok=False)
++
++        if allow_external and probe_reason and str(probe_reason) not in set(EXTERNAL_WORLD_REASON_CODES_V111):
++            _fail(f"invalid_reason_code_in_task:{probe_reason}")
++
++        attempts: List[Dict[str, Any]] = []
++        chosen_attempt = -1
++
++        rewrite_seeds = fluency_survival_plan_v112(base_seed=int(seed), max_attempts=int(args.max_rewrites))
++        ext_used = False
++        ext_used_reason = ""
++        ext_events_final: List[Dict[str, Any]] = []
++
++        for a, seed_used in enumerate(rewrite_seeds):
++            attempt_dir = task_dir / "attempt_{a:03d}".format(a=a)
++            _ensure_absent(attempt_dir)
++
++            run_conversation_v121(
++                user_turn_texts=list(user_turn_texts),
++                out_dir=str(attempt_dir),
++                seed=int(seed_used),
++                max_replans_per_turn=int(args.max_replans_per_turn),
++                max_plan_attempts=int(args.max_plan_attempts),
++            )
++
++            fr115 = _load_json(attempt_dir / "final_response_v115.json")
++            fr116 = _load_json(attempt_dir / "final_response_v116.json")
++            fr121 = _load_json(attempt_dir / "final_response_v121.json")
++
++            ok_gate = bool(fr115.get("ok", False)) if isinstance(fr115, dict) else False
++            gate_reason = str(fr115.get("reason") or "") if isinstance(fr115, dict) else "missing_final_response_v115"
++            ok_dialogue = bool(fr116.get("dialogue_survival_ok", False)) if isinstance(fr116, dict) else False
++            reason_dialogue = str(fr116.get("dialogue_survival_reason") or "") if isinstance(fr116, dict) else "missing_final_response_v116"
++            ok_final = bool(fr121.get("ok", False)) if isinstance(fr121, dict) else False
++            reason_final = str(fr121.get("reason") or "") if isinstance(fr121, dict) else "missing_final_response_v121"
++
++            transcript_rows = _load_jsonl_payload_view(attempt_dir / "transcript.jsonl")
++            user_i = 0
++            transcript_view: List[Dict[str, Any]] = []
++            for r in transcript_rows:
++                role = str(r.get("role") or "")
++                text = str(r.get("text") or "")
++                if role == "user" and user_i < len(user_turn_texts):
++                    text = str(user_turn_texts[user_i])
++                    user_i += 1
++                transcript_view.append({"role": role, "text": text})
++
++            ok_fc, reason_fc, details_fc = fluency_contract_v112(transcript_view=transcript_view)
++            # Deterministic external world gating exercise: force probe on attempt 0 for the single allow_external task.
++            if allow_external and (not ext_used) and a == 0:
++                ok_fc = False
++                reason_fc = "forced_external_world_probe"
++
++            binding_events = _load_jsonl(attempt_dir / "binding_events.jsonl")
++            unresolved_refs_total = _count_unresolved_reference_events(binding_events)
++            flow_events = _load_jsonl(attempt_dir / "flow_events.jsonl")
++            unresolved_refs_final = _unresolved_reference_final_from_flow(flow_events)
++            semantic_events = _load_jsonl(attempt_dir / "semantic_events.jsonl")
++            contradiction_flags = _count_semantic_contradiction_flags(semantic_events)
++
++            ok_unresolved = unresolved_refs_final == 0
++            ok_semantic = contradiction_flags == 0
++
++            ok_attempt = bool(ok_gate) and bool(ok_unresolved) and bool(ok_semantic) and bool(ok_dialogue) and bool(ok_final)
++            if require_fluency:
++                ok_attempt = bool(ok_attempt) and bool(ok_fc)
++
++            attempts.append(
++                {
++                    "attempt_index": int(a),
++                    "seed_used": int(seed_used),
++                    "ok_gate_v115": bool(ok_gate),
++                    "reason_gate_v115": str(gate_reason),
++                    "ok_dialogue_survival_v116": bool(ok_dialogue),
++                    "reason_dialogue_survival_v116": str(reason_dialogue),
++                    "ok_final_v121": bool(ok_final),
++                    "reason_final_v121": str(reason_final),
++                    "ok_fluency": bool(ok_fc),
++                    "reason_fluency": str(summarize_fluency_fail_code_v112(str(reason_fc))),
++                    "unresolved_reference_events_total": int(unresolved_refs_total),
++                    "unresolved_reference_final": int(unresolved_refs_final),
++                    "semantic_contradiction_flags_total": int(contradiction_flags),
++                    "fluency_details": dict(details_fc),
++                }
++            )
++
++            if allow_external and (not ext_used) and (not ok_fc) and world_manifest and str(probe_reason) in set(EXTERNAL_WORLD_REASON_CODES_V111):
++                ext_events_final = _compute_external_world_access_once_v113(
++                    world_manifest=str(world_manifest),
++                    reason_code=str(probe_reason),
++                    query=str(task_id),
++                    seed=int(seed_used),
++                )
++                ext_used = True
++                ext_used_reason = str(probe_reason)
++
++            if ok_attempt:
++                chosen_attempt = int(a)
++                break
++
++        if chosen_attempt < 0:
++            chosen_attempt = int(len(attempts) - 1) if attempts else 0
++
++        ext_info = _write_external_world_ledger(task_dir=task_dir, events=list(ext_events_final))
++
++        summary = _summarize_task_result_v121(task_dir=task_dir, attempts=list(attempts), chosen_attempt=int(chosen_attempt))
++        ok_task = bool(summary.get("ok", False))
++        result_row = {
++            "task_id": str(task_id),
++            "task_index": int(i),
++            "ok": bool(ok_task),
++            "chosen_attempt": int(chosen_attempt),
++            "attempts": list(attempts),
++            "external_world_events_total": int(ext_info.get("events_total", 0)),
++            "external_world_used_reason": str(ext_used_reason),
++            "final": dict(summary),
++        }
++        result_row["row_sig"] = sha256_hex(canonical_json_dumps(result_row).encode("utf-8"))
++        results.append(dict(result_row))
++
++        if not ok_task:
++            failures.append({"task_id": str(task_id), "task_index": int(i), "reason": str(summary.get("reason") or ""), "chosen_attempt": int(chosen_attempt)})
++
++        # Minimal freeze manifest per task (WORM).
++        sha256_paths = {
++            "final_response_v121_json": str((task_dir / "attempt_{a:03d}".format(a=int(chosen_attempt)) / "final_response_v121.json")),
++            "external_world_events_jsonl": str(task_dir / "external_world_events.jsonl"),
++        }
++        _compute_freeze_manifest_v121(task_dir=task_dir, sha256_paths=dict(sha256_paths))
++
++    tasks_total = int(len(results))
++    tasks_ok = int(sum(1 for r in results if isinstance(r, dict) and bool(r.get("ok", False))))
++    eval_obj = {
++        "schema_version": 121,
++        "kind": "family7_dla_eval_v121",
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "tasks_failed": int(tasks_total - tasks_ok),
++        "results": list(results),
++        "failures": list(failures),
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    summary = {
++        "schema_version": 121,
++        "kind": "family7_dla_summary_v121",
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": _sha256_file(out_dir / "eval.json"),
++    }
++    summary["summary_sig"] = sha256_hex(canonical_json_dumps(summary).encode("utf-8"))
++    _write_once_json(out_dir / "summary.json", summary)
++
++    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-16 11:39:09
++++ tests/test_goal_replan_persistence_law_v121.py	2026-01-16 11:01:24
+@@ -0,0 +1,125 @@
++import json
++import os
++import tempfile
++import unittest
++
++from atos_core.goal_replan_persistence_law_v121 import (
++    FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121,
++    FAIL_REASON_GOAL_DIED_ON_FAIL_V121,
++    OK_REASON_GOAL_EXHAUSTED_V121,
++    verify_goal_replan_persistence_law_v121,
++)
++
++
++def _write_jsonl(path: str, rows) -> None:
++    with open(path, "w", encoding="utf-8") as f:
++        for r in rows:
++            f.write(json.dumps(r, ensure_ascii=False, sort_keys=True))
++            f.write("\n")
++
++
++class TestGoalReplanPersistenceLawV121(unittest.TestCase):
++    def test_fail_without_replan_when_remaining_candidates(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            _write_jsonl(
++                os.path.join(td, "conversation_turns.jsonl"),
++                [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}],
++            )
++            _write_jsonl(
++                os.path.join(td, "action_plans.jsonl"),
++                [
++                    {
++                        "user_turn_id": "turn_u0",
++                        "objective_kind": "COMM_RESPOND",
++                        "chosen_ok": False,
++                        "ranked_candidates": [{"act_id": "A"}, {"act_id": "B"}],
++                        "attempted_actions": [{"act_id": "A", "eval_id": "e0", "ok": False}],
++                    }
++                ],
++            )
++            _write_jsonl(os.path.join(td, "objective_evals.jsonl"), [{"eval_id": "e0", "verdict": {"ok": False, "reason": "x"}}])
++            res = verify_goal_replan_persistence_law_v121(run_dir=str(td), max_replans_per_turn=3)
++            self.assertFalse(res.ok)
++            self.assertEqual(res.reason, FAIL_REASON_GOAL_DIED_ON_FAIL_V121)
++
++    def test_pass_when_waiting_for_user(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            _write_jsonl(
++                os.path.join(td, "conversation_turns.jsonl"),
++                [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}],
++            )
++            _write_jsonl(
++                os.path.join(td, "action_plans.jsonl"),
++                [
++                    {
++                        "user_turn_id": "turn_u0",
++                        "objective_kind": "COMM_ASK_CLARIFY",
++                        "chosen_ok": True,
++                        "ranked_candidates": [{"act_id": "ask"}],
++                        "attempted_actions": [{"act_id": "ask", "eval_id": "e0", "ok": True}],
++                    }
++                ],
++            )
++            _write_jsonl(os.path.join(td, "objective_evals.jsonl"), [{"eval_id": "e0", "verdict": {"ok": True, "reason": ""}}])
++            res = verify_goal_replan_persistence_law_v121(run_dir=str(td), max_replans_per_turn=3)
++            self.assertTrue(res.ok)
++            self.assertEqual(res.reason, "ok")
++
++    def test_exhaustion_declared_without_proof_fails(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            _write_jsonl(
++                os.path.join(td, "conversation_turns.jsonl"),
++                [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}],
++            )
++            _write_jsonl(
++                os.path.join(td, "action_plans.jsonl"),
++                [
++                    {
++                        "user_turn_id": "turn_u0",
++                        "objective_kind": "COMM_RESPOND",
++                        "chosen_ok": False,
++                        "ranked_candidates": [{"act_id": "A"}, {"act_id": "B"}],
++                        "attempted_actions": [
++                            {"act_id": "A", "eval_id": "e0", "ok": False},
++                            {"act_id": "B", "eval_id": "e1", "ok": False},
++                        ],
++                    }
++                ],
++            )
++            _write_jsonl(os.path.join(td, "objective_evals.jsonl"), [{"eval_id": "e0", "verdict": {"ok": False, "reason": "x"}}])
++            res = verify_goal_replan_persistence_law_v121(run_dir=str(td), max_replans_per_turn=3)
++            self.assertFalse(res.ok)
++            self.assertEqual(res.reason, FAIL_REASON_EXHAUSTION_WITHOUT_PROOF_V121)
++
++    def test_exhaustion_with_proof_passes(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            _write_jsonl(
++                os.path.join(td, "conversation_turns.jsonl"),
++                [{"payload": {"role": "user", "turn_id": "turn_u0", "turn_index": 0, "created_step": 0}}],
++            )
++            _write_jsonl(
++                os.path.join(td, "action_plans.jsonl"),
++                [
++                    {
++                        "user_turn_id": "turn_u0",
++                        "objective_kind": "COMM_RESPOND",
++                        "chosen_ok": False,
++                        "ranked_candidates": [{"act_id": "A"}, {"act_id": "B"}],
++                        "attempted_actions": [
++                            {"act_id": "A", "eval_id": "e0", "ok": False},
++                            {"act_id": "B", "eval_id": "e1", "ok": False},
++                        ],
++                    }
++                ],
++            )
++            _write_jsonl(
++                os.path.join(td, "objective_evals.jsonl"),
++                [
++                    {"eval_id": "e0", "verdict": {"ok": False, "reason": "x"}},
++                    {"eval_id": "e1", "verdict": {"ok": False, "reason": "y"}},
++                ],
++            )
++            res = verify_goal_replan_persistence_law_v121(run_dir=str(td), max_replans_per_turn=3)
++            self.assertTrue(res.ok)
++            self.assertEqual(res.reason, OK_REASON_GOAL_EXHAUSTED_V121)
++

@@ -1,0 +1,18 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         self.vm = AtoLangVM(rng=self.rng)
+         self.config = config or EngineConfig()
+         self._tables: Dict[str, Dict[str, Dict[str, int]]] = {}
+         self._predictors: List[Act] = []
++        self._predictor_by_id: Dict[str, Act] = {}
++        self._predictor_order: Dict[str, int] = {}
+         self._mode_selectors: List[Act] = []
+         self._mode_policy: Optional[Act] = None
+         self._rewrite_rules: List[Act] = []
+         self._selector: Optional[Act] = None
+         self._unigram: Optional[Act] = None
++        self._macro_router: Optional[Act] = None
++        self._macro_router_table: Optional[Dict[str, Any]] = None
+         self.rebuild_cache()
+*** End Patch

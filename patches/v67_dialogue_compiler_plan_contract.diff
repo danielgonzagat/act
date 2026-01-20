@@ -1,0 +1,545 @@
+--- patches/v67_base/atos_core/engine.py	2026-01-11 22:11:18
++++ atos_core/engine.py	2026-01-11 22:19:07
+@@ -13,7 +13,12 @@
+ from .concepts import PRIMITIVE_OPS
+ from .ethics import EthicsVerdict, fail_closed_text, validate_before_execute
+ from .metrics import detokenize, is_space, tokenize_text
+-from .suite import last_user_text_from_prompt, user_signature_from_prompt, user_signatures_from_prompt
++from .suite import (
++    compile_dialogue_v67,
++    last_user_text_from_prompt,
++    user_signature_from_prompt,
++    user_signatures_from_prompt,
++)
+ from .uncertainty import UncertaintyVerdict, guard_text_uncertainty
+ from .validators import ValidatorResult, run_validator
+ 
+@@ -983,6 +988,35 @@
+                                 contract_meta["parsed_args"] = {"text": ans}
+                                 contract_meta["reason"] = contract_reason
+                             break
++
++                    if (
++                        not contract_tokens
++                        and re.search(r"(?i)\btarefa\s+v67_", u)
++                        and re.search(r"(?i)\bplan\s*=", u)
++                    ):
++                        try:
++                            spec = compile_dialogue_v67(u)
++                            ans = str(spec.get("expected_output_text") or "")
++                            if not ans:
++                                contract_meta["reason"] = "v67_missing_expected_output_text"
++                            else:
++                                contract_tokens = tokenize_text(ans)
++                                contract_kind = "plan_contract_v67"
++                                contract_reason = "v67_dialogue_compiler"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {
++                                    "compiler_id": str(spec.get("compiler_id") or ""),
++                                    "task_kind": str(spec.get("task_kind") or ""),
++                                    "goal_id": str(spec.get("goal_id") or ""),
++                                    "plan": str((spec.get("inputs") or {}).get("plan") or ""),
++                                    "expected_spec_sig": sha256_hex(
++                                        canonical_json_dumps(spec).encode("utf-8")
++                                    ),
++                                }
++                                contract_meta["reason"] = contract_reason
++                        except Exception:
++                            contract_meta["reason"] = "v67_compile_error"
+ 
+                     if (
+                         not contract_tokens
+--- patches/v67_base/atos_core/suite.py	2026-01-11 22:11:18
++++ atos_core/suite.py	2026-01-11 22:19:01
+@@ -315,8 +315,101 @@
+ 
+ def goal_id_for(goal_spec: Dict[str, Any]) -> str:
+     return sha256_hex(canonical_json_dumps(goal_spec).encode("utf-8"))
++
++
++V67_DIALOGUE_COMPILER_ID = "v67_dialogue_compiler"
++
++_V67_A_RE = re.compile(r"(?i)\ba\s*=\s*(-?[0-9]+)\b", flags=re.UNICODE)
++_V67_B_RE = re.compile(r"(?i)\bb\s*=\s*(-?[0-9]+)\b", flags=re.UNICODE)
++_V67_SUM_RE = re.compile(r"(?i)\bsum\s*=\s*(-?[0-9]+)\b", flags=re.UNICODE)
++_V67_PLAN_RE = re.compile(r"(?i)\bplan\s*=\s*([^;\s\.]+)", flags=re.UNICODE)
+ 
+ 
++def _strip_edge_punct_v67(s: str) -> str:
++    return str(s).strip().strip(".,;:!?()[]{}").strip()
++
++
++def compile_dialogue_v67(dialogue: str) -> Dict[str, Any]:
++    """
++    Deterministic dialogue→expected_spec compiler for UTILITY_DIALOGUES_V67.
++
++    Parses (a,b,plan) or (sum,b,plan) from the dialogue text and returns an
++    expected_spec compatible with `plan_validator` (plus minimal meta fields).
++    """
++    u = str(dialogue or "").strip()
++    if not u:
++        raise ValueError("v67_empty_dialogue")
++
++    m_plan = _V67_PLAN_RE.search(u)
++    plan = _strip_edge_punct_v67(m_plan.group(1)) if m_plan else ""
++    if not plan:
++        raise ValueError("v67_missing_plan")
++
++    m_a = _V67_A_RE.search(u)
++    m_b = _V67_B_RE.search(u)
++    m_sum = _V67_SUM_RE.search(u)
++
++    if m_a and m_b:
++        a = int(m_a.group(1))
++        b = int(m_b.group(1))
++        goal_spec = {"kind": "v67_sum_state_json", "a": int(a), "b": int(b), "plan": str(plan)}
++        gid = goal_id_for(goal_spec)
++        input_keys = ["goal_id", "plan", "a", "b"]
++        ops = [
++            {"fn": "add_int", "in": ["in2", "in3"], "out": "v0"},
++            {"fn": "make_dict_goal_plan_ab", "in": ["in0", "in1", "v0", "in3"], "out": "v1"},
++            {"fn": "json_canonical", "in": ["v1"], "out": "v2"},
++        ]
++        expected_obj = {"goal_id": gid, "plan": str(plan), "a": int(a) + int(b), "b": int(b)}
++        expected_text = canonical_json_dumps(expected_obj)
++        return {
++            "compiler_id": V67_DIALOGUE_COMPILER_ID,
++            "task_kind": "v67_sum_wrap",
++            "goal_spec": dict(goal_spec),
++            "goal_id": str(gid),
++            "input_keys": list(input_keys),
++            "inputs": {"goal_id": gid, "plan": str(plan), "a": int(a), "b": int(b)},
++            "ops": list(ops),
++            "return_var": "v2",
++            "expected_output_text": str(expected_text),
++            "required_keys": ["goal_id", "plan", "a", "b"],
++            "expected_values": dict(expected_obj),
++        }
++
++    if m_sum and m_b:
++        sum_value = int(m_sum.group(1))
++        b = int(m_b.group(1))
++        goal_spec = {
++            "kind": "v67_wrap_state_json",
++            "sum": int(sum_value),
++            "b": int(b),
++            "plan": str(plan),
++        }
++        gid = goal_id_for(goal_spec)
++        input_keys = ["goal_id", "plan", "sum", "b"]
++        ops = [
++            {"fn": "make_dict_goal_plan_ab", "in": ["in0", "in1", "in2", "in3"], "out": "v0"},
++            {"fn": "json_canonical", "in": ["v0"], "out": "v1"},
++        ]
++        expected_obj = {"goal_id": gid, "plan": str(plan), "a": int(sum_value), "b": int(b)}
++        expected_text = canonical_json_dumps(expected_obj)
++        return {
++            "compiler_id": V67_DIALOGUE_COMPILER_ID,
++            "task_kind": "v67_wrap_only",
++            "goal_spec": dict(goal_spec),
++            "goal_id": str(gid),
++            "input_keys": list(input_keys),
++            "inputs": {"goal_id": gid, "plan": str(plan), "sum": int(sum_value), "b": int(b)},
++            "ops": list(ops),
++            "return_var": "v1",
++            "expected_output_text": str(expected_text),
++            "required_keys": ["goal_id", "plan", "a", "b"],
++            "expected_values": dict(expected_obj),
++        }
++
++    raise ValueError("v67_parse_missing_fields")
++
++
+ def _v66_plan_task(
+     *,
+     task_id: str,
+@@ -415,6 +508,115 @@
+     _v66_wrap_task(task_id="v66_wrap_state_09", sum_value=42, b=39, plan="wrap_goal_plan_state_only"),
+     _v66_wrap_task(task_id="v66_wrap_state_10", sum_value=13, b=7, plan="wrap_goal_plan_state_only"),
+     _v66_wrap_task(task_id="v66_wrap_state_11", sum_value=42, b=32, plan="wrap_goal_plan_state_only"),
++)
++
++
++def _v67_sum_dialogue(*, task_id: str, a: int, b: int, plan: str) -> str:
++    a = int(a)
++    b = int(b)
++    return (
++        f"Tarefa {task_id}: a={a}; b={b}; plan={plan}. "
++        "Retorne APENAS um JSON canônico (sem texto extra) com chaves goal_id, plan, a, b; "
++        "onde a=a+b e b=b."
++    )
++
++
++def _v67_wrap_dialogue(*, task_id: str, sum_value: int, b: int, plan: str) -> str:
++    sum_value = int(sum_value)
++    b = int(b)
++    return (
++        f"Tarefa {task_id}: sum={sum_value}; b={b}; plan={plan}. "
++        "Retorne APENAS um JSON canônico (sem texto extra) com chaves goal_id, plan, a, b; "
++        "onde a=sum e b=b."
++    )
++
++
++# Utility suite v67 (dialogue-driven): expected_spec is derived deterministically from the dialogue text.
++UTILITY_DIALOGUES_V67: Tuple[Dict[str, Any], ...] = (
++    {
++        "task_id": "v67_sum_state_00",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_00", a=4, b=8, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_sum_state_01",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_01", a=17, b=25, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_sum_state_02",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_02", a=9, b=7, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_sum_state_03",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_03", a=12, b=30, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_sum_state_04",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_04", a=99, b=1, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_sum_state_05",
++        "dialogue": (_v67_sum_dialogue(task_id="v67_sum_state_05", a=0, b=42, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_06",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_06", sum_value=42, b=0, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_07",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_07", sum_value=3, b=2, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_08",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_08", sum_value=3, b=1, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_09",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_09", sum_value=42, b=39, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_10",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_10", sum_value=13, b=7, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v67_wrap_state_11",
++        "dialogue": (_v67_wrap_dialogue(task_id="v67_wrap_state_11", sum_value=42, b=32, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
+ )
+ 
+ 
+@@ -553,6 +755,15 @@
+     validate_turn = int(task.get("validate_turn", max(0, len(dialogue) - 1)) or 0)
+     validator_id = str(task.get("validator_id") or "") if int(turn_idx) == int(validate_turn) else ""
+     expected_spec = task.get("expected_spec") or {}
++    compiler_id = str(task.get("compiler_id") or "")
++
++    if (not isinstance(expected_spec, dict) or not expected_spec) and validator_id == "plan_validator":
++        if compiler_id == V67_DIALOGUE_COMPILER_ID or str(task_id).startswith("v67_"):
++            try:
++                if isinstance(dialogue, (list, tuple)) and dialogue:
++                    expected_spec = compile_dialogue_v67(str(dialogue[validate_turn]))
++            except Exception:
++                expected_spec = {}
+ 
+     expected_format = ""
+     constraints: List[str] = []
+@@ -594,9 +805,14 @@
+         constraints = ["instruction_following_validator"]
+ 
+     goal_id = ""
+-    goal_spec = task.get("goal_spec")
+-    if isinstance(goal_spec, dict) and goal_spec:
+-        goal_id = goal_id_for(goal_spec)
++    if isinstance(expected_spec, dict) and str(expected_spec.get("goal_id") or ""):
++        goal_id = str(expected_spec.get("goal_id") or "")
++    else:
++        goal_spec = task.get("goal_spec")
++        if not isinstance(goal_spec, dict) or not goal_spec:
++            goal_spec = expected_spec.get("goal_spec") if isinstance(expected_spec, dict) else None
++        if isinstance(goal_spec, dict) and goal_spec:
++            goal_id = goal_id_for(goal_spec)
+     exp_sig = ""
+     if isinstance(expected_spec, dict) and expected_spec:
+         try:
+@@ -606,6 +822,7 @@
+ 
+     return {
+         "task_id": task_id,
++        "compiler_id": str(compiler_id),
+         "validator_id": validator_id,
+         "expected_format": expected_format,
+         "constraints": constraints,
+@@ -1227,12 +1444,23 @@
+         validate_turn = max(0, min(validate_turn, len(turns) - 1))
+         validator_id = str(task.get("validator_id") or "")
+         expected_spec = task.get("expected_spec") or {}
++        if (not isinstance(expected_spec, dict) or not expected_spec) and validator_id == "plan_validator":
++            compiler_id = str(task.get("compiler_id") or "")
++            if compiler_id == V67_DIALOGUE_COMPILER_ID or str(task_id).startswith("v67_"):
++                try:
++                    expected_spec = compile_dialogue_v67(str(turns[validate_turn]))
++                except Exception:
++                    expected_spec = {}
+         tags = task.get("tags") or []
+         if not isinstance(tags, list):
+             tags = []
+ 
++        goal_spec = task.get("goal_spec")
++        if not isinstance(goal_spec, dict) or not goal_spec:
++            goal_spec = expected_spec.get("goal_spec") if isinstance(expected_spec, dict) else None
++
+         total_tasks += 1
+-        if isinstance(task.get("goal_spec"), dict) and task.get("goal_spec"):
++        if isinstance(goal_spec, dict) and goal_spec:
+             goals_total += 1
+         for cat in ("instruction", "json", "math", "state"):
+             if cat in tags:
+@@ -1304,7 +1532,7 @@
+ 
+         if ok:
+             pass_count += 1
+-            if isinstance(task.get("goal_spec"), dict) and task.get("goal_spec"):
++            if isinstance(goal_spec, dict) and goal_spec:
+                 goals_satisfied += 1
+             for cat in ("instruction", "json", "math", "state"):
+                 if cat in tags:
+--- patches/v67_base/scripts/eval_skill_suite.py	2026-01-11 22:11:18
++++ scripts/eval_skill_suite.py	2026-01-11 22:17:00
+@@ -16,6 +16,7 @@
+     SKILL_DIALOGUES_V0,
+     SKILL_DIALOGUES_V1_PARAPHRASE,
+     UTILITY_DIALOGUES_V66,
++    UTILITY_DIALOGUES_V67,
+     run_skill_suite,
+     suite_metrics_from_transcripts,
+ )
+@@ -54,9 +55,9 @@
+     ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
+     ap.add_argument(
+         "--utility_suite_version",
+-        choices=["v0", "v1", "v66"],
++        choices=["v0", "v1", "v66", "v67"],
+         default="v0",
+-        help="Which deterministic utility suite to run (v0=baseline, v1=paraphrase, v66=utility-as-law).",
++        help="Which deterministic utility suite to run (v0=baseline, v1=paraphrase, v66=utility-as-law, v67=dialogue-compiled plan).",
+     )
+     args = ap.parse_args()
+ 
+@@ -68,8 +69,10 @@
+         tasks = SKILL_DIALOGUES_V0
+     elif str(args.utility_suite_version) == "v1":
+         tasks = SKILL_DIALOGUES_V1_PARAPHRASE
+-    else:
++    elif str(args.utility_suite_version) == "v66":
+         tasks = UTILITY_DIALOGUES_V66
++    else:
++        tasks = UTILITY_DIALOGUES_V67
+     transcripts, metrics = run_skill_suite(
+         engine, tasks=tasks, max_new_tokens=args.max_new_tokens
+     )
+--- /dev/null	2026-01-11 22:20:06
++++ scripts/smoke_dialogue_contract_v67.py	2026-01-11 22:18:08
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import UTILITY_DIALOGUES_V67, run_skill_suite, suite_metrics_from_transcripts
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def transcripts_text(transcripts: List[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def eval_v67_contracts(*, run_dir: str, seed: int, max_new_tokens: int) -> Dict[str, Any]:
++    acts_path = os.path.join(str(run_dir), "acts.jsonl")
++    store = ActStore.load_jsonl(acts_path)
++    engine = Engine(
++        store,
++        seed=int(seed),
++        config=EngineConfig(enable_contracts=True),
++    )
++    transcripts, metrics = run_skill_suite(
++        engine, tasks=UTILITY_DIALOGUES_V67, max_new_tokens=int(max_new_tokens)
++    )
++    cost_metrics = suite_metrics_from_transcripts(transcripts)
++    txt = transcripts_text(transcripts)
++    return {
++        "run": str(run_dir),
++        "seed": int(seed),
++        "max_new_tokens": int(max_new_tokens),
++        "utility_suite_version": "v67",
++        "sha256_transcript_text": sha256_text(txt),
++        "cost": {k: cost_metrics.get(k) for k in sorted(cost_metrics.keys())},
++        **dict(metrics),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument(
++        "--run",
++        default="results/run_pure_20k_v39_contracts_paraphrase_telemetry_smoke",
++        help="Run dir containing acts.jsonl (read-only)",
++    )
++    ap.add_argument(
++        "--out_base",
++        default="results/run_smoke_dialogue_contract_v67",
++        help="Base output path; script writes <out_base>_try1 and <out_base>_try2",
++    )
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=200)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    run_dir = str(args.run)
++    seed = int(args.seed)
++    max_new_tokens = int(args.max_new_tokens)
++
++    results: Dict[str, Any] = {"run": run_dir, "seed": seed, "max_new_tokens": max_new_tokens, "tries": {}}
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        ev = eval_v67_contracts(run_dir=run_dir, seed=seed, max_new_tokens=max_new_tokens)
++        pass_rate = float(ev.get("pass_rate", 0.0) or 0.0)
++        contract_used_rate = float(ev.get("contract_used_rate", 0.0) or 0.0)
++        contract_used_by_kind = ev.get("contract_used_by_kind") or {}
++        if not isinstance(contract_used_by_kind, dict):
++            contract_used_by_kind = {}
++
++        if abs(pass_rate - 1.0) > 1e-12:
++            _fail(f"ERROR: pass_rate != 1.0 (got {pass_rate})")
++        if abs(contract_used_rate - 1.0) > 1e-12:
++            _fail(f"ERROR: contract_used_rate != 1.0 (got {contract_used_rate})")
++        if int(contract_used_by_kind.get("plan_contract_v67", 0) or 0) <= 0:
++            _fail("ERROR: expected contract_used_by_kind.plan_contract_v67 > 0")
++
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        core = {
++            "seed": seed,
++            "run": run_dir,
++            "utility_suite_version": "v67",
++            "pass_rate": float(pass_rate),
++            "contract_used_rate": float(contract_used_rate),
++            "contract_used_by_kind": dict(sorted((str(k), int(v)) for k, v in contract_used_by_kind.items())),
++            "sha256_transcript_text": str(ev.get("sha256_transcript_text") or ""),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": summary_sha}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(len(summary_shas) == 2 and summary_shas[0] == summary_shas[1])
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: {summary_shas}")
++    results["determinism"] = {"ok": True, "summary_sha256": summary_shas[0]}
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

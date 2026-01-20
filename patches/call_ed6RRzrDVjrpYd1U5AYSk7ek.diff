@@ -1,0 +1,100 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         def penalty_view(tokens: List[str], gen: List[str]) -> Dict[str, Any]:
+             filtered = [x for x in tokens if x not in {"<BOS>"}]
+             recent = filtered[-self.config.repetition_recent :]
+             return {
+                 "recent_tokens": recent,
+                 "history_ngrams": set(history_ngram_set),
+                 "gen_tokens": list(gen),
+                 "mode": mode_state,
+             }
+ 
++        def _top1_token(cands: Dict[str, Candidate]) -> Optional[str]:
++            if not cands:
++                return None
++            return min(cands.values(), key=lambda c: (-c.score, c.token, c.source_act)).token
++
++        def _apply_rewrite_rules(
++            cands: Dict[str, Candidate],
++            *,
++            record_trace: bool,
++            context: Sequence[str],
++            penalties: Dict[str, Any],
++        ) -> Dict[str, Candidate]:
++            rr_hits: List[str] = []
++            top_tok = _top1_token(cands)
++            for rr in self._rewrite_rules:
++                before_tok = top_tok
++                before_score = cands.get(before_tok).score if before_tok in cands else None
++                st = self.vm.run(
++                    rr,
++                    context=context,
++                    tables=self._tables,
++                    vocab=self.vocab(),
++                    initial_candidates=cands,
++                    penalties=penalties,
++                    mode="emit_only",
++                )
++                cands = st.candidates
++                after_tok = _top1_token(cands)
++                after_score = cands.get(before_tok).score if before_tok in cands else None
++                if after_tok is None:
++                    after_tok = before_tok
++                if (
++                    before_tok is not None
++                    and after_tok is not None
++                    and (
++                        after_tok != before_tok
++                        or (before_score is None)
++                        or (after_score is None)
++                        or abs(float(after_score) - float(before_score)) > 1e-12
++                    )
++                ):
++                    rr_hits.append(str(rr.id))
++                top_tok = after_tok
++            if record_trace:
++                trace_rewrite_rule_hit_ids.append(rr_hits)
++                trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
++            return cands
++
++        def _select_next(
++            cands: Dict[str, Candidate], *, context: Sequence[str], penalties: Dict[str, Any]
++        ) -> Optional[str]:
++            if not cands:
++                return None
++
++            nxt0: Optional[str] = None
++            if mode == "greedy" and self._selector is not None:
++                st = self.vm.run(
++                    self._selector,
++                    context=context,
++                    tables=self._tables,
++                    vocab=self.vocab(),
++                    initial_candidates=cands,
++                    penalties=penalties,
++                    mode="select",
++                )
++                nxt0 = st.selected
++
++            if nxt0 is None:
++                ordered = sorted(cands.values(), key=lambda c: (-c.score, c.token, c.source_act))
++                if mode == "greedy":
++                    nxt0 = ordered[0].token
++                else:
++                    mx = ordered[0].score
++                    exps = [math.exp(min(60.0, c.score - mx)) for c in ordered]
++                    s = sum(exps)
++                    r = self.rng.random() * s
++                    acc = 0.0
++                    nxt0 = ordered[-1].token
++                    for c, e in zip(ordered, exps):
++                        acc += e
++                        if acc >= r:
++                            nxt0 = c.token
++                            break
++            return nxt0
++
+         for i in range(int(max_new_tokens)):
+*** End Patch

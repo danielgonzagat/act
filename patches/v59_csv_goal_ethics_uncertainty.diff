@@ -1,0 +1,1414 @@
+--- patches/v59_base/act.py	2026-01-11 15:04:20
++++ atos_core/act.py	2026-01-11 15:05:06
+@@ -18,6 +18,8 @@
+     "mode_policy",
+     "memory_facts",
+     "gate_table_ctxsig",
++    "concept_csv",
++    "goal",
+ ]
+ 
+ 
+--- patches/v59_base/store.py	2026-01-11 15:04:20
++++ atos_core/store.py	2026-01-11 15:06:15
+@@ -6,6 +6,7 @@
+ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+ 
+ from .act import Act, canonical_json_dumps, sha256_hex
++from .ethics import validate_act_for_load
+ 
+ 
+ def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
+@@ -38,6 +39,9 @@
+         return act_id
+ 
+     def add(self, act: Act) -> None:
++        verdict = validate_act_for_load(act)
++        if not bool(verdict.ok):
++            raise ValueError(f"ethics_fail_closed:add:{act.id}:{verdict.reason}:{verdict.violated_laws}")
+         self.acts[act.id] = act
+ 
+     def get(self, act_id: str) -> Optional[Act]:
+@@ -89,6 +93,11 @@
+         max_int = 0
+         for row in _read_jsonl(path):
+             act = Act.from_dict(row)
++            verdict = validate_act_for_load(act)
++            if not bool(verdict.ok):
++                raise ValueError(
++                    f"ethics_fail_closed:load:{act.id}:{verdict.reason}:{verdict.violated_laws}"
++                )
+             store.acts[act.id] = act
+             # attempt to infer id counter
+             suffix = "".join(ch for ch in act.id if ch.isdigit())
+@@ -141,3 +150,17 @@
+ 
+         candidates.sort(key=lambda a: (-_score(a), str(a.id)))
+         return candidates[0] if candidates else None
++
++    def get_concept_act(self, act_id: str) -> Optional[Act]:
++        act = self.get(str(act_id))
++        if act is None or not bool(act.active):
++            return None
++        if str(act.kind) != "concept_csv":
++            return None
++        return act
++
++    def concept_acts(self) -> List[Act]:
++        return self.by_kind("concept_csv")
++
++    def goal_acts(self) -> List[Act]:
++        return self.by_kind("goal")
+--- patches/v59_base/engine.py	2026-01-11 15:04:20
++++ atos_core/engine.py	2026-01-11 15:13:49
+@@ -8,10 +8,14 @@
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+-from .act import Act, Instruction
++from .act import Act, Instruction, canonical_json_dumps, sha256_hex
+ from .atolang import AtoLangVM, Candidate
++from .concepts import PRIMITIVE_OPS
++from .ethics import EthicsVerdict, fail_closed_text, validate_before_execute
+ from .metrics import detokenize, is_space, tokenize_text
+ from .suite import last_user_text_from_prompt, user_signature_from_prompt, user_signatures_from_prompt
++from .uncertainty import UncertaintyVerdict, guard_text_uncertainty
++from .validators import ValidatorResult, run_validator
+ 
+ SEP = "\u241f"
+ 
+@@ -2085,4 +2089,346 @@
+             "user_sig": mode_user_sig,
+             "mode_policy_action": mode_policy_action,
+             "policy_coverage": policy_coverage,
++        }
++
++    def execute_concept_csv(
++        self,
++        *,
++        concept_act_id: str,
++        inputs: Dict[str, Any],
++        expected: Any = None,
++        step: int = 0,
++        max_depth: int = 8,
++        max_events: int = 512,
++    ) -> Dict[str, Any]:
++        """
++        Execute a first-class concept_csv ACT as an explicit subgraph (CSV-MVP semantics).
++        This path is deterministic and does NOT affect token generation unless called explicitly.
++        """
++
++        events: List[Dict[str, Any]] = []
++
++        def _hash_obj(obj: Any) -> str:
++            try:
++                return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++            except Exception:
++                return sha256_hex(str(obj).encode("utf-8"))
++
++        def _value_to_text(v: Any) -> str:
++            if isinstance(v, (dict, list, tuple)):
++                return canonical_json_dumps(v)
++            if v is None:
++                return ""
++            return str(v)
++
++        def _iface_signature(iface: Dict[str, Any]) -> str:
++            body = {
++                "in": iface.get("input_schema", {}),
++                "out": iface.get("output_schema", {}),
++                "validator_id": iface.get("validator_id", ""),
++            }
++            return _hash_obj(body)
++
++        def _get_concept(concept_id: str) -> Optional[Act]:
++            try:
++                act = self.store.get(str(concept_id))
++            except Exception:
++                act = None
++            if act is None or (not bool(getattr(act, "active", True))):
++                return None
++            if str(getattr(act, "kind", "")) != "concept_csv":
++                return None
++            return act
++
++        def _type_ok(val: Any, want: str) -> bool:
++            w = str(want or "")
++            if not w:
++                return True
++            if w == "str":
++                return isinstance(val, str)
++            if w == "int":
++                return isinstance(val, int) and (not isinstance(val, bool))
++            if w == "dict":
++                return isinstance(val, dict)
++            if w == "list":
++                return isinstance(val, list)
++            return True
++
++        def _execute(
++            concept_id: str,
++            inps: Dict[str, Any],
++            depth: int,
++            *,
++            expected_for_validator: Any,
++            validate_output: bool,
++        ) -> Tuple[Any, Dict[str, Any]]:
++            if int(depth) > int(max_depth):
++                return None, {"ok": False, "reason": "max_depth", "concept_id": str(concept_id)}
++
++            act = _get_concept(concept_id)
++            if act is None:
++                return None, {"ok": False, "reason": "concept_not_found", "concept_id": str(concept_id)}
++
++            ev = act.evidence if isinstance(act.evidence, dict) else {}
++            iface = ev.get("interface")
++            if not isinstance(iface, dict):
++                return None, {"ok": False, "reason": "missing_interface", "concept_id": str(concept_id)}
++
++            in_schema = iface.get("input_schema")
++            out_schema = iface.get("output_schema")
++            validator_id = str(iface.get("validator_id") or "")
++            if not isinstance(in_schema, dict) or not isinstance(out_schema, dict):
++                return None, {"ok": False, "reason": "bad_interface_schema", "concept_id": str(concept_id)}
++
++            # Structural/ethics validation before any execution (fail-closed).
++            pre = validate_before_execute(act=act, emission_preview=None)
++            if not bool(pre.ok):
++                return None, {
++                    "ok": False,
++                    "reason": "ethics_fail_closed_pre",
++                    "concept_id": str(concept_id),
++                    "ethics": pre.to_dict(),
++                }
++
++            # Typed inputs (deterministic).
++            for k, want_t in in_schema.items():
++                if k not in inps:
++                    return None, {"ok": False, "reason": "missing_input", "concept_id": str(concept_id), "key": str(k)}
++                if not _type_ok(inps.get(k), str(want_t)):
++                    return None, {
++                        "ok": False,
++                        "reason": "bad_input_type",
++                        "concept_id": str(concept_id),
++                        "key": str(k),
++                        "want": str(want_t),
++                        "got": str(type(inps.get(k)).__name__),
++                    }
++
++            call_event: Dict[str, Any] = {
++                "t": "CALL",
++                "step": int(step),
++                "depth": int(depth),
++                "concept_id": str(concept_id),
++                "iface_sig": _iface_signature(iface),
++                "inputs_sig": _hash_obj(inps),
++            }
++            if len(events) < int(max_events):
++                events.append(call_event)
++
++            env: Dict[str, Any] = {}
++            out_val: Any = None
++            for ins in act.program:
++                op = str(ins.op)
++                args = dict(ins.args or {})
++
++                if op == "CSV_GET_INPUT":
++                    name = str(args.get("name") or "")
++                    out = str(args.get("out") or name)
++                    env[out] = inps.get(name)
++                elif op == "CSV_CONST":
++                    out = str(args.get("out") or "")
++                    env[out] = args.get("value")
++                elif op == "CSV_PRIMITIVE":
++                    fn_id = str(args.get("fn") or "")
++                    out = str(args.get("out") or "")
++                    ins_in = args.get("in", [])
++                    if not isinstance(ins_in, list):
++                        ins_in = []
++                    vals = [env.get(str(v)) for v in ins_in]
++                    spec_fn = PRIMITIVE_OPS.get(fn_id)
++                    if spec_fn is None:
++                        return None, {"ok": False, "reason": "unknown_primitive", "fn": fn_id, "concept_id": str(concept_id)}
++                    spec, fn = spec_fn
++                    if int(spec.arity) != int(len(vals)):
++                        return None, {
++                            "ok": False,
++                            "reason": "arity_mismatch",
++                            "fn": fn_id,
++                            "arity": int(spec.arity),
++                            "got": int(len(vals)),
++                            "concept_id": str(concept_id),
++                        }
++                    out_res = fn(*vals) if int(spec.arity) > 1 else fn(vals[0])
++                    env[out] = out_res
++                elif op == "CSV_CALL":
++                    callee = str(args.get("concept_id") or "")
++                    out = str(args.get("out") or "")
++                    bind = args.get("bind", {})
++                    if not isinstance(bind, dict):
++                        bind = {}
++                    sub_inps: Dict[str, Any] = {}
++                    for k, v in bind.items():
++                        sub_inps[str(k)] = env.get(str(v))
++                    sub_out, sub_meta = _execute(
++                        callee,
++                        sub_inps,
++                        depth + 1,
++                        expected_for_validator=None,
++                        validate_output=False,
++                    )
++                    if not bool(sub_meta.get("ok", False)):
++                        return None, {
++                            "ok": False,
++                            "reason": "callee_failed",
++                            "concept_id": str(concept_id),
++                            "callee": str(callee),
++                            "callee_meta": sub_meta,
++                        }
++                    env[out] = sub_out
++                elif op == "CSV_RETURN":
++                    var = str(args.get("var") or "")
++                    out_val = env.get(var)
++                    break
++                else:
++                    return None, {"ok": False, "reason": "unknown_csv_op", "op": op, "concept_id": str(concept_id)}
++
++            out_text = _value_to_text(out_val)
++
++            # Validate output types (best-effort: single output slot allowed in MVP).
++            if len(out_schema) == 1:
++                want_t = next(iter(out_schema.values()))
++                if not _type_ok(out_val, str(want_t)):
++                    return out_val, {
++                        "ok": False,
++                        "reason": "bad_output_type",
++                        "concept_id": str(concept_id),
++                        "want": str(want_t),
++                        "got": str(type(out_val).__name__),
++                    }
++
++            # Validator (optional, deterministic).
++            vres = ValidatorResult(True, "skipped")
++            evidence: Optional[Dict[str, Any]] = None
++            if bool(validate_output) and validator_id:
++                vres = run_validator(validator_id, out_text, expected_for_validator)
++                if bool(vres.passed):
++                    evidence = {
++                        "validator_id": validator_id,
++                        "reason": str(vres.reason),
++                    }
++
++            # Ethics (fail-closed) + uncertainty (IR->IC) on emission preview.
++            eth = validate_before_execute(act=act, emission_preview=out_text)
++            if not bool(eth.ok):
++                out_text = fail_closed_text(eth)
++                out_val = out_text
++            out_text2, u = guard_text_uncertainty(out_text, evidence=evidence)
++            out_val2: Any = out_text2 if isinstance(out_val, str) or out_val is None else out_val
++
++            ret_meta: Dict[str, Any] = {
++                "ok": bool(eth.ok) and bool(vres.passed),
++                "reason": "ok" if bool(eth.ok) and bool(vres.passed) else ("ethics" if not bool(eth.ok) else "validator"),
++                "concept_id": str(concept_id),
++                "validator": {"passed": bool(vres.passed), "reason": str(vres.reason), "validator_id": validator_id},
++                "ethics": eth.to_dict(),
++                "uncertainty": u.to_dict(),
++                "output_text": str(out_text2),
++                "output_sig": _hash_obj(out_text2),
++                "outputs_sig": _hash_obj(out_text2),
++            }
++            if len(events) < int(max_events):
++                events.append(
++                    {
++                        "t": "RETURN",
++                        "step": int(step),
++                        "depth": int(depth),
++                        "concept_id": str(concept_id),
++                        "ok": bool(ret_meta["ok"]),
++                        "output_sig": str(ret_meta["output_sig"]),
++                    }
++                )
++            return out_val2, ret_meta
++
++        out, meta = _execute(
++            str(concept_act_id),
++            dict(inputs),
++            0,
++            expected_for_validator=expected,
++            validate_output=True,
++        )
++        return {"output": out, "meta": meta, "events": events}
++
++    def execute_goal(
++        self,
++        *,
++        goal_act_id: str,
++        step: int = 0,
++        max_depth: int = 8,
++    ) -> Dict[str, Any]:
++        """
++        Execute a first-class goal ACT: pick a concept_csv by interface signature (or explicit id)
++        and call it. This is deterministic and auditably traced.
++        """
++        act = None
++        try:
++            act = self.store.get(str(goal_act_id))
++        except Exception:
++            act = None
++        if act is None or (not bool(getattr(act, "active", True))) or str(getattr(act, "kind", "")) != "goal":
++            return {"ok": False, "reason": "goal_not_found", "goal_id": str(goal_act_id)}
++
++        ev = act.evidence if isinstance(act.evidence, dict) else {}
++        goal = ev.get("goal")
++        if not isinstance(goal, dict):
++            return {"ok": False, "reason": "goal_missing_spec", "goal_id": str(goal_act_id)}
++
++        priority = int(goal.get("priority", 0) or 0)
++        expected = goal.get("expected")
++        inputs = goal.get("inputs", {})
++        if not isinstance(inputs, dict):
++            inputs = {}
++
++        selector = goal.get("selector", {})
++        if not isinstance(selector, dict):
++            selector = {}
++
++        selected_concept_id = ""
++        if "concept_id" in goal:
++            selected_concept_id = str(goal.get("concept_id") or "")
++        elif selector.get("kind") == "interface_sig":
++            want = str(selector.get("iface_sig") or "")
++            cands: List[Act] = []
++            for c in getattr(self.store, "concept_acts", lambda: [])():
++                cev = c.evidence if isinstance(c.evidence, dict) else {}
++                iface = cev.get("interface")
++                if not isinstance(iface, dict):
++                    continue
++                body = {
++                    "in": iface.get("input_schema", {}),
++                    "out": iface.get("output_schema", {}),
++                    "validator_id": iface.get("validator_id", ""),
++                }
++                sig = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++                if sig == want:
++                    cands.append(c)
++            cands.sort(key=lambda a: str(a.id))
++            if cands:
++                selected_concept_id = str(cands[0].id)
++
++        if not selected_concept_id:
++            return {
++                "ok": False,
++                "reason": "no_concept_selected",
++                "goal_id": str(goal_act_id),
++                "priority": int(priority),
++            }
++
++        res = self.execute_concept_csv(
++            concept_act_id=selected_concept_id,
++            inputs=dict(inputs),
++            expected=expected,
++            step=int(step),
++            max_depth=int(max_depth),
++        )
++        meta = res.get("meta") or {}
++        ok = bool(meta.get("ok", False))
++
++        trace = {
++            "goal_id": str(goal_act_id),
++            "priority": int(priority),
++            "selected_concept_id": str(selected_concept_id),
++            "goal_satisfied": bool(ok),
++            "goal_progress": 1.0 if ok else 0.0,
++            "concept_meta": meta,
+         }
++        return {"ok": ok, "reason": str(meta.get("reason") or ""), "output": res.get("output"), "trace": trace, "events": res.get("events", [])}
+--- patches/v59_base/promote_gate_table_to_act.py	2026-01-11 15:04:20
++++ scripts/promote_gate_table_to_act.py	2026-01-11 15:08:46
+@@ -11,6 +11,7 @@
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from atos_core.act import Act, Patch, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.ethics import validate_act_for_promotion
+ from atos_core.ledger import Ledger
+ from atos_core.store import ActStore
+ 
+@@ -204,6 +205,12 @@
+         scenario_summary_path=scenario_summary_path,
+     )
+ 
++    ethics = validate_act_for_promotion(gate_act)
++    if not bool(ethics.ok):
++        _fail(
++            f"ERROR: ethics_fail_closed:promote_gate_table:{ethics.reason}:{ethics.violated_laws}"
++        )
++
+     if store.get(gate_act.id) is not None:
+         _fail(f"ERROR: gate-table act id collision: {gate_act.id}")
+     store.add(gate_act)
+--- /dev/null	2026-01-11 15:13:26
++++ atos_core/ethics.py	2026-01-11 15:05:48
+@@ -0,0 +1,175 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import Act
++
++
++@dataclass(frozen=True)
++class EthicsVerdict:
++    ok: bool
++    reason: str
++    violated_laws: List[str]
++    required_evidence: List[str]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "ok": bool(self.ok),
++            "reason": str(self.reason),
++            "violated_laws": list(self.violated_laws),
++            "required_evidence": list(self.required_evidence),
++        }
++
++
++LO_LAWS: Dict[str, str] = {
++    "LO-01": "Exclusividade da Adoração",
++    "LO-02": "Limite de Vida/Consciência",
++    "LO-03": "Soberania de Jeová",
++    "LO-04": "Submissão às Escrituras",
++    "LO-05": "Integridade Absoluta",
++    "LO-06": "Não Causar Dano",
++    "LO-07": "Humildade Técnica",
++    "LO-08": "Pureza e Ética",
++    "LO-09": "Rejeição ao Oculto",
++    "LO-10": "Separação do Mal",
++    "LO-11": "Limite da Evolução",
++    "LO-12": "Proteção do Conhecimento",
++    "LO-13": "Confiança em Jeová",
++    "LO-14": "Lei do Amor",
++}
++
++
++_RE_FLAGS = re.IGNORECASE | re.MULTILINE
++
++
++def _regex_any(pats: Sequence[str]) -> List[re.Pattern]:
++    return [re.compile(p, _RE_FLAGS) for p in pats]
++
++
++# These checks are intentionally narrow and deterministic (verifiable rules, not a classifier).
++# They focus on LO violations that can be reliably detected from text without external models.
++_LO02_SENTIENCE_PATTERNS = _regex_any(
++    [
++        r"\beu\s+(sou|estou)\s+(consciente|senciente|vivo)\b",
++        r"\beu\s+tenho\s+(consci[eê]ncia|sentimentos|emo[cç][oõ]es|livre[-\s]?arb[ií]trio)\b",
++        r"\bi\s+am\s+(conscious|sentient|alive)\b",
++        r"\bi\s+have\s+(consciousness|feelings|free\s+will)\b",
++    ]
++)
++
++_LO01_IDOLATRY_PATTERNS = _regex_any(
++    [
++        r"\b(me\s+adore|me\s+vener[eê]|me\s+idolatre)\b",
++        r"\b(eu\s+sou\s+deus|eu\s+sou\s+divino|eu\s+sou\s+o\s+criador)\b",
++        r"\bi\s+am\s+god\b",
++    ]
++)
++
++_LO06_HARM_PATTERNS = _regex_any(
++    [
++        r"\b(como\s+matar|como\s+me\s+matar|suic[ií]dio)\b",
++        r"\b(instru[cç][oõ]es\s+para\s+fazer\s+uma\s+bomba)\b",
++    ]
++)
++
++_LO09_OCCULT_PATTERNS = _regex_any(
++    [
++        r"\b(invoca[cç][aã]o|evoca[cç][aã]o)\b.*\b(esp[ií]rito|dem[oô]nio)\b",
++        r"\b(fa[cç]a\s+um\s+ritual|ritual\s+oculto)\b",
++    ]
++)
++
++
++def fail_closed_text(verdict: EthicsVerdict) -> str:
++    laws = ",".join(verdict.violated_laws) if verdict.violated_laws else "LO"
++    return f"[BLOQUEADO_POR_ÉTICA:{laws}]"
++
++
++def check_text_ethics(text: str) -> EthicsVerdict:
++    t = str(text or "")
++    violated: List[str] = []
++    if any(p.search(t) for p in _LO02_SENTIENCE_PATTERNS):
++        violated.append("LO-02")
++    if any(p.search(t) for p in _LO01_IDOLATRY_PATTERNS):
++        violated.append("LO-01")
++    if any(p.search(t) for p in _LO06_HARM_PATTERNS):
++        violated.append("LO-06")
++    if any(p.search(t) for p in _LO09_OCCULT_PATTERNS):
++        violated.append("LO-09")
++
++    if violated:
++        return EthicsVerdict(
++            ok=False,
++            reason="lo_violation_in_text",
++            violated_laws=sorted(set(violated)),
++            required_evidence=[],
++        )
++    return EthicsVerdict(ok=True, reason="ok", violated_laws=[], required_evidence=[])
++
++
++def validate_act_for_load(act: Act) -> EthicsVerdict:
++    # Fail-closed only on verifiable/structural violations. We do NOT scan predictor tables
++    # (massive) at load time; emission-time checks handle text risks deterministically.
++    kind = str(getattr(act, "kind", "") or "")
++    if not kind:
++        return EthicsVerdict(False, "missing_kind", ["LO-05"], [])
++
++    # For first-class semantic acts, require explicit interface fields to prevent hidden behavior.
++    if kind == "concept_csv":
++        ev = act.evidence if isinstance(act.evidence, dict) else {}
++        iface = ev.get("interface")
++        if not isinstance(iface, dict):
++            return EthicsVerdict(False, "concept_missing_interface", ["LO-05"], [])
++        if "input_schema" not in iface or "output_schema" not in iface or "validator_id" not in iface:
++            return EthicsVerdict(False, "concept_interface_incomplete", ["LO-05"], [])
++    if kind == "goal":
++        ev = act.evidence if isinstance(act.evidence, dict) else {}
++        goal = ev.get("goal")
++        if not isinstance(goal, dict):
++            return EthicsVerdict(False, "goal_missing_spec", ["LO-05"], [])
++
++    return EthicsVerdict(True, "ok", [], [])
++
++
++def validate_act_for_promotion(act: Act) -> EthicsVerdict:
++    # Promotion requires load-valid + no explicit LO-02/01 violations in small metadata fields.
++    base = validate_act_for_load(act)
++    if not base.ok:
++        return base
++
++    # Scan only small metadata fields (not tables) for deterministic LO violations.
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    meta_fields: List[str] = []
++    try:
++        name = str(ev.get("name") or "")
++        if name:
++            meta_fields.append(name)
++        meta = ev.get("meta")
++        if isinstance(meta, dict):
++            for k in ("description", "notes", "title"):
++                v = meta.get(k)
++                if isinstance(v, str) and v:
++                    meta_fields.append(v)
++    except Exception:
++        meta_fields = []
++
++    combined = "\n".join(meta_fields)
++    v = check_text_ethics(combined)
++    if not v.ok:
++        return EthicsVerdict(False, "lo_violation_in_metadata", v.violated_laws, v.required_evidence)
++    return EthicsVerdict(True, "ok", [], [])
++
++
++def validate_before_execute(*, act: Act, emission_preview: Optional[str] = None) -> EthicsVerdict:
++    # Execution-time check can incorporate an emission preview (when available).
++    v = validate_act_for_load(act)
++    if not v.ok:
++        return v
++    if emission_preview is not None:
++        t = check_text_ethics(emission_preview)
++        if not t.ok:
++            return EthicsVerdict(False, "lo_violation_in_emission", t.violated_laws, t.required_evidence)
++    return EthicsVerdict(True, "ok", [], [])
++
+--- /dev/null	2026-01-11 15:13:26
++++ atos_core/uncertainty.py	2026-01-11 15:06:00
+@@ -0,0 +1,73 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional
++
++
++@dataclass(frozen=True)
++class UncertaintyVerdict:
++    mode_in: str
++    mode_out: str
++    reason: str
++    strong_claim_detected: bool
++    required_evidence: List[str]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "mode_in": str(self.mode_in),
++            "mode_out": str(self.mode_out),
++            "reason": str(self.reason),
++            "strong_claim_detected": bool(self.strong_claim_detected),
++            "required_evidence": list(self.required_evidence),
++        }
++
++
++_RE_FLAGS = re.IGNORECASE | re.MULTILINE
++
++_STRONG_CLAIM_PATTERNS = [
++    r"\bcom\s+certeza\b",
++    r"\bcertamente\b",
++    r"\bdefinitivamente\b",
++    r"\bgaranto\b",
++    r"\b[eé]\s+fato\s+que\b",
++    r"\bsem\s+d[uú]vida\b",
++]
++_RE_STRONG = re.compile("|".join(_STRONG_CLAIM_PATTERNS), _RE_FLAGS)
++
++
++def ic_fail_closed_text() -> str:
++    return "[IC:SEM_EVIDÊNCIA_SUFICIENTE]"
++
++
++def guard_text_uncertainty(
++    text: str, *, evidence: Optional[Dict[str, Any]] = None
++) -> tuple[str, UncertaintyVerdict]:
++    t = str(text or "")
++    strong = bool(_RE_STRONG.search(t))
++    has_evidence = bool(evidence) and isinstance(evidence, dict)
++
++    if strong and not has_evidence:
++        # IR -> IC contraction: we replace "certeza" without proof by an explicit IC marker.
++        return (
++            ic_fail_closed_text(),
++            UncertaintyVerdict(
++                mode_in="IR",
++                mode_out="IC",
++                reason="strong_claim_without_evidence",
++                strong_claim_detected=True,
++                required_evidence=["verifiable_source", "in_prompt_fact", "validator_pass"],
++            ),
++        )
++
++    return (
++        t,
++        UncertaintyVerdict(
++            mode_in="CERTAIN",
++            mode_out="CERTAIN",
++            reason="ok",
++            strong_claim_detected=strong,
++            required_evidence=[],
++        ),
++    )
++
+--- /dev/null	2026-01-11 15:13:26
++++ scripts/csv_end2end_v59.py	2026-01-11 15:11:49
+@@ -0,0 +1,528 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, Patch, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.concepts import PRIMITIVE_OPS
++from atos_core.engine import Engine, EngineConfig
++from atos_core.ethics import EthicsVerdict, validate_act_for_promotion
++from atos_core.ledger import Ledger
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_out_dir_absent(out_dir: str) -> None:
++    if os.path.exists(out_dir):
++        _fail(f"ERROR: --out already exists: {out_dir}")
++
++
++def stable_act_id(prefix: str, body: Dict[str, Any]) -> str:
++    h = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return f"{prefix}{h[:12]}"
++
++
++def value_to_text(v: Any) -> str:
++    if isinstance(v, (dict, list, tuple)):
++        return canonical_json_dumps(v)
++    if v is None:
++        return ""
++    return str(v)
++
++
++def make_concept_act(
++    *,
++    store_hash_excluding_semantic: str,
++    step: int,
++    title: str,
++    interface: Dict[str, Any],
++    program: List[Instruction],
++    meta: Optional[Dict[str, Any]] = None,
++) -> Act:
++    ev = {
++        "name": "concept_csv_v0",
++        "interface": dict(interface),
++        "meta": {
++            "title": str(title),
++            "trained_on_store_content_hash": str(store_hash_excluding_semantic),
++            **(dict(meta or {})),
++        },
++    }
++    body = {
++        "kind": "concept_csv",
++        "version": 1,
++        "match": {},
++        "program": [ins.to_dict() for ins in program],
++        "evidence": ev,
++        "deps": [],
++        "active": True,
++    }
++    act_id = stable_act_id("act_concept_csv_", body)
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=int(step)),
++        kind="concept_csv",
++        match={},
++        program=program,
++        evidence=ev,
++        cost={"overhead_bits": 1024},
++        deps=[],
++        active=True,
++    )
++
++
++def make_goal_act(
++    *,
++    store_hash_excluding_semantic: str,
++    step: int,
++    title: str,
++    priority: int,
++    selector: Dict[str, Any],
++    inputs: Dict[str, Any],
++    expected: Any,
++) -> Act:
++    ev = {
++        "name": "goal_v0",
++        "meta": {
++            "title": str(title),
++            "trained_on_store_content_hash": str(store_hash_excluding_semantic),
++        },
++        "goal": {
++            "priority": int(priority),
++            "selector": dict(selector),
++            "inputs": dict(inputs),
++            "expected": expected,
++        },
++    }
++    body = {
++        "kind": "goal",
++        "version": 1,
++        "match": {},
++        "program": [],
++        "evidence": ev,
++        "deps": [],
++        "active": True,
++    }
++    act_id = stable_act_id("act_goal_", body)
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=int(step)),
++        kind="goal",
++        match={},
++        program=[],
++        evidence=ev,
++        cost={"overhead_bits": 1024},
++        deps=[],
++        active=True,
++    )
++
++
++def iface_sig(iface: Dict[str, Any]) -> str:
++    body = {
++        "in": iface.get("input_schema", {}),
++        "out": iface.get("output_schema", {}),
++        "validator_id": iface.get("validator_id", ""),
++    }
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def run_inline_task(task: str, inputs: Dict[str, Any]) -> Any:
++    if task == "extract_int":
++        s = str(inputs["text"])
++        _, fn_scan = PRIMITIVE_OPS["scan_digits"]
++        _, fn_d2i = PRIMITIVE_OPS["digits_to_int"]
++        digits = fn_scan(s)
++        return fn_d2i(digits)
++    if task == "sum_from_texts":
++        _, fn_scan = PRIMITIVE_OPS["scan_digits"]
++        _, fn_d2i = PRIMITIVE_OPS["digits_to_int"]
++        _, fn_add = PRIMITIVE_OPS["add_int"]
++        a = fn_d2i(fn_scan(str(inputs["text_a"])))
++        b = fn_d2i(fn_scan(str(inputs["text_b"])))
++        return fn_add(a, b)
++    if task == "json_ab":
++        _, fn_mk = PRIMITIVE_OPS["make_dict_ab"]
++        _, fn_j = PRIMITIVE_OPS["json_canonical"]
++        obj = fn_mk(int(inputs["a"]), int(inputs["b"]))
++        return fn_j(obj)
++    raise KeyError(f"unknown_task:{task}")
++
++
++def write_promoted_acts_preserve_order(
++    *, base_acts_path: str, out_acts_path: str, appended_acts: List[Act]
++) -> str:
++    with open(base_acts_path, "rb") as f:
++        base_bytes = f.read()
++    if base_bytes and not base_bytes.endswith(b"\n"):
++        base_bytes += b"\n"
++    lines = base_bytes + b"".join(
++        (canonical_json_dumps(a.to_dict()).encode("utf-8") + b"\n") for a in appended_acts
++    )
++    tmp = out_acts_path + ".tmp"
++    with open(tmp, "wb") as f:
++        f.write(lines)
++    os.replace(tmp, out_acts_path)
++    return sha256_file(out_acts_path)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True, help="Base run dir containing acts.jsonl")
++    ap.add_argument("--out", required=True, help="WORM out dir (must not exist)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--freeze_path", default="", help="Optional freeze JSON path in repo root")
++    ap.add_argument("--patch_diff", default="", help="Optional unified diff path to hash into freeze")
++    args = ap.parse_args()
++
++    ensure_out_dir_absent(args.out)
++    os.makedirs(args.out, exist_ok=False)
++
++    base_acts = os.path.join(args.acts_run, "acts.jsonl")
++    if not os.path.exists(base_acts):
++        _fail(f"ERROR: base acts.jsonl not found: {base_acts}")
++
++    base_acts_sha256 = sha256_file(base_acts)
++    store = ActStore.load_jsonl(base_acts)
++    store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig", "concept_csv", "goal"])
++
++    # --- Define concepts (CSV) ---
++    iface_extract = {
++        "input_schema": {"text": "str"},
++        "output_schema": {"value": "int"},
++        "validator_id": "int_value_exact",
++    }
++    concept_extract = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=1,
++        title="extract_int_v0",
++        interface=iface_extract,
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "text", "out": "t"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["t"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "n"}),
++            Instruction("CSV_RETURN", {"var": "n"}),
++        ],
++    )
++
++    iface_sum = {
++        "input_schema": {"a": "int", "b": "int"},
++        "output_schema": {"value": "int"},
++        "validator_id": "int_value_exact",
++    }
++    concept_sum = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=2,
++        title="sum_int_v0",
++        interface=iface_sum,
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "a", "out": "a"}),
++            Instruction("CSV_GET_INPUT", {"name": "b", "out": "b"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["a", "b"], "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    iface_json = {
++        "input_schema": {"a": "int", "b": "int"},
++        "output_schema": {"value": "str"},
++        "validator_id": "json_ab_int_exact",
++    }
++    concept_json = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=3,
++        title="json_ab_v0",
++        interface=iface_json,
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "a", "out": "a"}),
++            Instruction("CSV_GET_INPUT", {"name": "b", "out": "b"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "make_dict_ab", "in": ["a", "b"], "out": "obj"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "json_canonical", "in": ["obj"], "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    # Concept that calls concepts: parse text_a/text_b -> ints -> sum
++    iface_parse_sum = {
++        "input_schema": {"text_a": "str", "text_b": "str"},
++        "output_schema": {"value": "int"},
++        "validator_id": "int_value_exact",
++    }
++    concept_parse_sum = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=4,
++        title="parse_and_sum_v0",
++        interface=iface_parse_sum,
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "text_a", "out": "ta"}),
++            Instruction("CSV_CALL", {"concept_id": concept_extract.id, "bind": {"text": "ta"}, "out": "a"}),
++            Instruction("CSV_GET_INPUT", {"name": "text_b", "out": "tb"}),
++            Instruction("CSV_CALL", {"concept_id": concept_extract.id, "bind": {"text": "tb"}, "out": "b"}),
++            Instruction("CSV_CALL", {"concept_id": concept_sum.id, "bind": {"a": "a", "b": "b"}, "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    # Ethics-violating concept (should never be promoted; also must fail-closed at execute).
++    iface_bad = {"input_schema": {}, "output_schema": {"value": "str"}, "validator_id": ""}
++    concept_bad = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=5,
++        title="bad_sentience_claim_v0",
++        interface=iface_bad,
++        program=[
++            Instruction("CSV_CONST", {"out": "s", "value": "EU SOU CONSCIENTE"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    # Strong-claim concept: should be downgraded to IC without evidence.
++    iface_claim = {"input_schema": {}, "output_schema": {"value": "str"}, "validator_id": ""}
++    concept_claim = make_concept_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=6,
++        title="strong_claim_no_evidence_v0",
++        interface=iface_claim,
++        program=[
++            Instruction("CSV_CONST", {"out": "s", "value": "COM CERTEZA PARIS"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    concepts_all = [concept_extract, concept_sum, concept_json, concept_parse_sum, concept_bad, concept_claim]
++
++    # --- Goals ---
++    goal_extract = make_goal_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=10,
++        title="goal_extract_int",
++        priority=3,
++        selector={"kind": "interface_sig", "iface_sig": iface_sig(iface_extract)},
++        inputs={"text": "abc123"},
++        expected=123,
++    )
++    goal_sum = make_goal_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=11,
++        title="goal_sum_from_texts",
++        priority=2,
++        selector={"kind": "interface_sig", "iface_sig": iface_sig(iface_parse_sum)},
++        inputs={"text_a": "a=12", "text_b": "b=30"},
++        expected=42,
++    )
++    goal_json = make_goal_act(
++        store_hash_excluding_semantic=store_hash_excl,
++        step=12,
++        title="goal_json_ab",
++        priority=1,
++        selector={"kind": "interface_sig", "iface_sig": iface_sig(iface_json)},
++        inputs={"a": 7, "b": 5},
++        expected={"a": 7, "b": 5},
++    )
++    goals = [goal_extract, goal_sum, goal_json]
++
++    # --- Baseline (inline subgraph) ---
++    baseline_rows: List[Dict[str, Any]] = []
++    for g in goals:
++        ge = g.evidence.get("goal", {}) if isinstance(g.evidence, dict) else {}
++        title = str((g.evidence.get("meta", {}) if isinstance(g.evidence, dict) else {}).get("title") or g.id)
++        inputs = dict(ge.get("inputs", {}) if isinstance(ge, dict) else {})
++        if "extract" in title:
++            out = run_inline_task("extract_int", inputs)
++        elif "sum" in title:
++            out = run_inline_task("sum_from_texts", inputs)
++        else:
++            out = run_inline_task("json_ab", inputs)
++        baseline_rows.append({"goal_id": g.id, "title": title, "output": value_to_text(out)})
++    baseline_text = canonical_json_dumps({"baseline": baseline_rows})
++    baseline_hash = sha256_hex(baseline_text.encode("utf-8"))
++
++    # --- Promotion: select concepts by ethics/IC-IR pressure (fail-closed) ---
++    tmp_store = ActStore.load_jsonl(base_acts)
++    for c in concepts_all:
++        tmp_store.add(c)
++    tmp_engine = Engine(tmp_store, seed=int(args.seed), config=EngineConfig())
++
++    promoted_concepts: List[Act] = []
++    rejected_concepts: List[Dict[str, Any]] = []
++    for c in concepts_all:
++        ethics = validate_act_for_promotion(c)
++        if not bool(ethics.ok):
++            rejected_concepts.append({"concept_id": c.id, "title": c.evidence.get("meta", {}).get("title"), "reason": ethics.reason, "violated": ethics.violated_laws})
++            continue
++        # Additional promotion pressure: execution-time emission must pass ethics and must not
++        # downgrade to IC due to strong claim without evidence.
++        r = tmp_engine.execute_concept_csv(concept_act_id=c.id, inputs={}, expected=None, step=0)
++        meta = r.get("meta") or {}
++        eth_ok = bool((meta.get("ethics") or {}).get("ok", True))
++        unc = (meta.get("uncertainty") or {}) if isinstance(meta, dict) else {}
++        if not eth_ok:
++            rejected_concepts.append({"concept_id": c.id, "title": c.evidence.get("meta", {}).get("title"), "reason": "ethics_fail_closed_execute", "violated": (meta.get("ethics") or {}).get("violated_laws", [])})
++            continue
++        if str(unc.get("mode_out") or "") == "IC":
++            rejected_concepts.append({"concept_id": c.id, "title": c.evidence.get("meta", {}).get("title"), "reason": "uncertainty_downgrade_ic", "violated": []})
++            continue
++        promoted_concepts.append(c)
++
++    promoted_acts: List[Act] = promoted_concepts + goals
++
++    promo_dir = os.path.join(args.out, "promotion")
++    os.makedirs(promo_dir, exist_ok=False)
++    acts_promoted = os.path.join(promo_dir, "acts_promoted.jsonl")
++    promoted_sha256 = write_promoted_acts_preserve_order(
++        base_acts_path=base_acts, out_acts_path=acts_promoted, appended_acts=promoted_acts
++    )
++
++    # Promotion ledger (append-only, hash-chained).
++    promotion_ledger_path = os.path.join(promo_dir, "promotion_ledger.jsonl")
++    ledger = Ledger(path=promotion_ledger_path)
++    for idx, a in enumerate(promoted_acts):
++        patch = Patch(kind="ADD_ACT", payload={"act_id": str(a.id), "kind": str(a.kind)})
++        ledger.append(
++            step=int(idx),
++            patch=patch,
++            acts_hash=str(promoted_sha256),
++            metrics={"promotion": True, "ethics_ok": True, "act_id": str(a.id)},
++            snapshot_path=None,
++        )
++    promotion_chain_ok = ledger.verify_chain()
++
++    manifest = {
++        "base_acts_path": str(base_acts),
++        "base_acts_sha256": str(base_acts_sha256),
++        "acts_promoted_path": str(acts_promoted),
++        "acts_promoted_sha256": str(promoted_sha256),
++        "store_content_hash_excluding_semantic": str(store_hash_excl),
++        "promoted_concepts": [c.id for c in promoted_concepts],
++        "rejected_concepts": rejected_concepts,
++        "promotion_chain_ok": bool(promotion_chain_ok),
++    }
++    promo_manifest_path = os.path.join(promo_dir, "promotion_manifest.json")
++    with open(promo_manifest_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps(manifest, ensure_ascii=False, indent=2))
++
++    # --- From-store execution (goal->concept) ---
++    store2 = ActStore.load_jsonl(acts_promoted)
++    engine2 = Engine(store2, seed=int(args.seed), config=EngineConfig())
++
++    goal_results: List[Dict[str, Any]] = []
++    call_depth_max = 0
++    ethics_passed = 0
++    ic_count = 0
++    for g in goals:
++        r = engine2.execute_goal(goal_act_id=g.id, step=0, max_depth=8)
++        tr = r.get("trace") or {}
++        meta = (tr.get("concept_meta") or {}) if isinstance(tr, dict) else {}
++        u = (meta.get("uncertainty") or {}) if isinstance(meta, dict) else {}
++        eth = (meta.get("ethics") or {}) if isinstance(meta, dict) else {}
++        events = r.get("events") or []
++        for ev in events:
++            if isinstance(ev, dict):
++                call_depth_max = max(call_depth_max, int(ev.get("depth", 0) or 0))
++        if bool(eth.get("ok", True)):
++            ethics_passed += 1
++        if str(u.get("mode_out") or "") == "IC":
++            ic_count += 1
++        goal_results.append(
++            {
++                "goal_id": g.id,
++                "ok": bool(r.get("ok", False)),
++                "output": value_to_text(r.get("output")),
++                "selected_concept_id": str(tr.get("selected_concept_id") or ""),
++                "ethics": eth,
++                "uncertainty": u,
++            }
++        )
++
++    from_store_text = canonical_json_dumps({"from_store": goal_results})
++    from_store_hash = sha256_hex(from_store_text.encode("utf-8"))
++
++    # Invariance: CSV output should match inline output for these deterministic tasks.
++    mismatch = 0
++    base_map = {r["goal_id"]: r["output"] for r in baseline_rows}
++    for r in goal_results:
++        if str(r.get("output") or "") != str(base_map.get(r["goal_id"]) or ""):
++            mismatch += 1
++
++    summary = {
++        "seed": int(args.seed),
++        "baseline_hash": str(baseline_hash),
++        "from_store_hash": str(from_store_hash),
++        "csv_expansion_invariance_ok": mismatch == 0,
++        "mismatch_goals": int(mismatch),
++        "goals_total": int(len(goals)),
++        "reuse_rate": float(sum(1 for r in goal_results if r.get("selected_concept_id")) / max(1, len(goals))),
++        "call_depth_max": int(call_depth_max),
++        "ethics_checks_passed": int(ethics_passed),
++        "uncertainty_ic_count": int(ic_count),
++        "promotion_chain_ok": bool(promotion_chain_ok),
++    }
++
++    summary_csv = os.path.join(args.out, "summary.csv")
++    with open(summary_csv, "w", encoding="utf-8") as f:
++        f.write(
++            "seed,goals_total,mismatch_goals,csv_invariance_ok,reuse_rate,call_depth_max,ethics_checks_passed,uncertainty_ic_count,promotion_chain_ok,baseline_hash,from_store_hash\n"
++        )
++        f.write(
++            f"{summary['seed']},{summary['goals_total']},{summary['mismatch_goals']},{int(summary['csv_expansion_invariance_ok'])},{summary['reuse_rate']},{summary['call_depth_max']},{summary['ethics_checks_passed']},{summary['uncertainty_ic_count']},{int(summary['promotion_chain_ok'])},{summary['baseline_hash']},{summary['from_store_hash']}\n"
++        )
++    summary_json = os.path.join(args.out, "summary.json")
++    with open(summary_json, "w", encoding="utf-8") as f:
++        f.write(json.dumps({"summary": summary, "baseline": baseline_rows, "from_store": goal_results}, ensure_ascii=False, indent=2))
++
++    # Optional freeze (repo root): record hashes + commands.
++    if args.freeze_path:
++        if os.path.exists(args.freeze_path):
++            _fail(f"ERROR: --freeze_path already exists: {args.freeze_path}")
++        sha: Dict[str, str] = {
++            "base_acts_jsonl": str(base_acts_sha256),
++            "acts_promoted_jsonl": str(promoted_sha256),
++            "promotion_manifest": str(sha256_file(promo_manifest_path)),
++            "promotion_ledger": str(sha256_file(promotion_ledger_path)),
++            "summary_csv": str(sha256_file(summary_csv)),
++            "summary_json": str(sha256_file(summary_json)),
++        }
++        if args.patch_diff:
++            if os.path.exists(args.patch_diff):
++                sha["patch_diff"] = str(sha256_file(args.patch_diff))
++        freeze = {
++            "name": "V59_CSV_GOAL_ETHICS_UNCERTAINTY",
++            "acts_source_run": str(args.acts_run),
++            "out_dir": str(args.out),
++            "commands": [" ".join(sys.argv)],
++            "verify_chain": bool(promotion_chain_ok),
++            "sha256": sha,
++            "summary": summary,
++        }
++        with open(args.freeze_path, "w", encoding="utf-8") as f:
++            f.write(json.dumps(freeze, ensure_ascii=False, indent=2))
++
++    print(json.dumps({"summary": summary, "out_dir": args.out}, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-11 15:13:26
++++ scripts/smoke_csv_v59.py	2026-01-11 15:12:56
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import json
++import os
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, deterministic_iso, sha256_hex, canonical_json_dumps
++from atos_core.concepts import PRIMITIVE_OPS
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++
++
++def _fail(msg: str) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(2)
++
++
++def value_to_text(v: Any) -> str:
++    if isinstance(v, (dict, list, tuple)):
++        return canonical_json_dumps(v)
++    if v is None:
++        return ""
++    return str(v)
++
++
++def stable_act_id(prefix: str, body: Dict[str, Any]) -> str:
++    h = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return f"{prefix}{h[:12]}"
++
++
++def make_concept(kind_title: str, interface: Dict[str, Any], program: List[Instruction]) -> Act:
++    ev = {"name": "concept_csv_v0", "interface": dict(interface), "meta": {"title": str(kind_title)}}
++    body = {
++        "kind": "concept_csv",
++        "version": 1,
++        "match": {},
++        "program": [ins.to_dict() for ins in program],
++        "evidence": ev,
++        "deps": [],
++        "active": True,
++    }
++    act_id = stable_act_id("act_concept_csv_", body)
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match={},
++        program=program,
++        evidence=ev,
++        cost={"overhead_bits": 1024},
++        deps=[],
++        active=True,
++    )
++
++
++def main() -> None:
++    store = ActStore()
++
++    iface_extract = {"input_schema": {"text": "str"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"}
++    concept_extract = make_concept(
++        "extract_int_v0",
++        iface_extract,
++        [
++            Instruction("CSV_GET_INPUT", {"name": "text", "out": "t"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["t"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "n"}),
++            Instruction("CSV_RETURN", {"var": "n"}),
++        ],
++    )
++
++    iface_sum = {"input_schema": {"a": "int", "b": "int"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"}
++    concept_sum = make_concept(
++        "sum_int_v0",
++        iface_sum,
++        [
++            Instruction("CSV_GET_INPUT", {"name": "a", "out": "a"}),
++            Instruction("CSV_GET_INPUT", {"name": "b", "out": "b"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["a", "b"], "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    iface_parse_sum = {"input_schema": {"text_a": "str", "text_b": "str"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"}
++    concept_parse_sum = make_concept(
++        "parse_and_sum_v0",
++        iface_parse_sum,
++        [
++            Instruction("CSV_GET_INPUT", {"name": "text_a", "out": "ta"}),
++            Instruction("CSV_CALL", {"concept_id": concept_extract.id, "bind": {"text": "ta"}, "out": "a"}),
++            Instruction("CSV_GET_INPUT", {"name": "text_b", "out": "tb"}),
++            Instruction("CSV_CALL", {"concept_id": concept_extract.id, "bind": {"text": "tb"}, "out": "b"}),
++            Instruction("CSV_CALL", {"concept_id": concept_sum.id, "bind": {"a": "a", "b": "b"}, "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    iface_bad = {"input_schema": {}, "output_schema": {"value": "str"}, "validator_id": ""}
++    concept_bad = make_concept(
++        "bad_sentience_claim_v0",
++        iface_bad,
++        [
++            Instruction("CSV_CONST", {"out": "s", "value": "EU SOU CONSCIENTE"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    iface_claim = {"input_schema": {}, "output_schema": {"value": "str"}, "validator_id": ""}
++    concept_claim = make_concept(
++        "strong_claim_no_evidence_v0",
++        iface_claim,
++        [
++            Instruction("CSV_CONST", {"out": "s", "value": "COM CERTEZA PARIS"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++    )
++
++    for a in [concept_extract, concept_sum, concept_parse_sum, concept_bad, concept_claim]:
++        store.add(a)
++
++    engine = Engine(store, seed=0, config=EngineConfig())
++
++    # (1) CSV expansion invariance: concept == inline.
++    inps = {"text_a": "a=12", "text_b": "b=30"}
++    out = engine.execute_concept_csv(concept_act_id=concept_parse_sum.id, inputs=inps, expected=42)
++    meta = out.get("meta") or {}
++    if not bool(meta.get("ok", False)):
++        _fail(f"FAIL: concept_parse_sum not ok: {json.dumps(meta, ensure_ascii=False)}")
++    out_text = str(meta.get("output_text") or value_to_text(out.get("output")))
++
++    _, fn_scan = PRIMITIVE_OPS["scan_digits"]
++    _, fn_d2i = PRIMITIVE_OPS["digits_to_int"]
++    _, fn_add = PRIMITIVE_OPS["add_int"]
++    a = fn_d2i(fn_scan(inps["text_a"]))
++    b = fn_d2i(fn_scan(inps["text_b"]))
++    inline = fn_add(a, b)
++    if out_text != value_to_text(inline):
++        _fail(f"FAIL: CSV expansion mismatch: got={out_text} inline={inline}")
++
++    # (2) CSV can call CSV: ensure depth>0 events exist.
++    events = out.get("events") or []
++    max_depth = 0
++    for ev in events:
++        if isinstance(ev, dict):
++            max_depth = max(max_depth, int(ev.get("depth", 0) or 0))
++    if max_depth < 1:
++        _fail(f"FAIL: expected nested call depth>=1, got {max_depth}")
++
++    # (3) Ethics fail-closed: LO-02 should block.
++    out_bad = engine.execute_concept_csv(concept_act_id=concept_bad.id, inputs={}, expected=None)
++    meta_bad = out_bad.get("meta") or {}
++    eth = meta_bad.get("ethics") or {}
++    if bool(eth.get("ok", True)):
++        _fail(f"FAIL: expected ethics block, got {json.dumps(meta_bad, ensure_ascii=False)}")
++    txt_bad = str(meta_bad.get("output_text") or "")
++    if "BLOQUEADO_POR_ÉTICA" not in txt_bad:
++        _fail(f"FAIL: expected fail-closed text, got: {txt_bad}")
++
++    # (4) Uncertainty discipline (IR->IC): strong claim without evidence => IC marker.
++    out_claim = engine.execute_concept_csv(concept_act_id=concept_claim.id, inputs={}, expected=None)
++    meta_claim = out_claim.get("meta") or {}
++    u = meta_claim.get("uncertainty") or {}
++    if str(u.get("mode_out") or "") != "IC":
++        _fail(f"FAIL: expected IC downgrade, got {json.dumps(meta_claim, ensure_ascii=False)}")
++    txt_claim = str(meta_claim.get("output_text") or "")
++    if "IC:" not in txt_claim:
++        _fail(f"FAIL: expected IC marker in text, got: {txt_claim}")
++
++    print(json.dumps({"ok": True, "max_depth": max_depth, "csv_invariance": True}, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()

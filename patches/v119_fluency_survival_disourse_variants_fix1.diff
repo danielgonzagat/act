@@ -1,0 +1,1815 @@
+--- patches/v119_base/atos_core/conversation_loop_v110.py	2026-01-15 20:00:29
++++ atos_core/conversation_loop_v110.py	2026-01-15 19:55:16
+@@ -60,6 +60,12 @@
+     render_trace_concepts_text_v103,
+ )
+ from .conversation_v110 import verify_conversation_chain_v110
++from .discourse_variants_v119 import (
++    choose_clarify_variant_v119,
++    choose_options_preamble_variant_v119,
++    choose_reformulate_variant_v119,
++    prefix2_from_text_v119,
++)
+ from .executive_engine_v110 import (
+     build_executive_candidates_v110,
+     choose_executive_candidate_v110,
+@@ -984,6 +990,7 @@
+     user_turn_texts: Sequence[str],
+     out_dir: str,
+     seed: int,
++    discourse_variants_v119_enabled: bool = False,
+ ) -> Dict[str, Any]:
+     ensure_absent(str(out_dir))
+     os.makedirs(str(out_dir), exist_ok=False)
+@@ -1033,6 +1040,7 @@
+     summary_path = os.path.join(str(out_dir), "summary.json")
+ 
+     store = ActStore()
++    enable_variants_v119 = bool(discourse_variants_v119_enabled)
+ 
+     obj_ids = comm_objective_ids_v90()
+     for okind, oid in sorted(obj_ids.items(), key=lambda kv: str(kv[0])):
+@@ -4390,7 +4398,31 @@
+                 objective_kind = "COMM_RESPOND"
+             else:
+                 objective_kind = "COMM_CONFIRM"
+-                ctx2 = {"planned_text": "Não entendi. Você pode esclarecer o que você quer dizer?"}
++                planned = "Não entendi. Você pode esclarecer o que você quer dizer?"
++                if bool(enable_variants_v119):
++                    # Deterministic discourse variation: avoid repeated prefix2 runs (fluency v118).
++                    last_p2 = ""
++                    for row in reversed(list(transcript)):
++                        if isinstance(row, dict) and str(row.get("role") or "") == "assistant":
++                            last_p2 = prefix2_from_text_v119(str(row.get("text") or ""))
++                            break
++                    ctx_sig = sha256_hex(
++                        canonical_json_dumps(
++                            {
++                                "schema_version": 119,
++                                "variant_kind": "clarify",
++                                "conversation_id": str(conversation_id),
++                                "turn_index_user": int(ut.get("turn_index") or 0),
++                                "user_text_sig": text_sig_v96(str(user_text)),
++                                "seed": int(seed),
++                            }
++                        ).encode("utf-8")
++                    )
++                    choice = choose_clarify_variant_v119(context_sig=str(ctx_sig), last_prefix2=str(last_p2), attempt_index=int(seed))
++                    planned = str(choice.text or planned)
++                    ctx2 = {"planned_text": str(planned), "planned_text_variant_v119": choice.to_dict()}
++                else:
++                    ctx2 = {"planned_text": str(planned)}
+         if str(objective_kind) in {"COMM_ASK_CLARIFY", "COMM_CONFIRM"}:
+             progress_allowed_v107 = False
+ 
+@@ -4449,18 +4481,64 @@
+                         "refuse_safe": "Recusar com segurança (não sei)",
+                     }
+                     lines: List[str] = []
++                    preamble = "OPÇÕES:"
++                    if bool(enable_variants_v119):
++                        ctx2 = dict(ctx2)
++                        last_p2 = ""
++                        for row in reversed(list(transcript)):
++                            if isinstance(row, dict) and str(row.get("role") or "") == "assistant":
++                                last_p2 = prefix2_from_text_v119(str(row.get("text") or ""))
++                                break
++                        ctx_sig = sha256_hex(
++                            canonical_json_dumps(
++                                {
++                                    "schema_version": 119,
++                                    "variant_kind": "options_preamble",
++                                    "conversation_id": str(conversation_id),
++                                    "turn_index_user": int(ut.get("turn_index") or 0),
++                                    "user_text_sig": text_sig_v96(str(user_text)),
++                                    "seed": int(seed),
++                                }
++                            ).encode("utf-8")
++                        )
++                        choice = choose_options_preamble_variant_v119(context_sig=str(ctx_sig), last_prefix2=str(last_p2), attempt_index=int(seed))
++                        if str(choice.text or "").strip():
++                            preamble = str(choice.text).strip()
++                        ctx2["planned_text_variant_v119"] = choice.to_dict()
+                     for i, c in enumerate(plan_candidates_topk[:3]):
+                         if not isinstance(c, dict):
+                             continue
+                         pk = str(c.get("plan_kind") or "")
+                         lines.append(f"{labels[i]}) {human.get(pk, pk)}")
+-                    text = "OPÇÕES:\n" + "\n".join(lines) + "\nEscolha: A/B/C"
++                    text = str(preamble) + "\n" + "\n".join(lines) + "\nEscolha: A/B/C"
+                     ctx2 = dict(ctx2)
+                     ctx2["planned_text"] = str(text)
+                 elif selected_kind == PLAN_KIND_ASK_CLARIFY_V104:
+                     objective_kind = "COMM_CONFIRM"
+                     ctx2 = dict(ctx2)
+-                    ctx2["planned_text"] = "Não entendi. Você pode reformular usando um comando suportado (set/get/add/summary/end) ou descrever o objetivo?"
++                    planned = "Não entendi. Você pode reformular usando um comando suportado (set/get/add/summary/end) ou descrever o objetivo?"
++                    if bool(enable_variants_v119):
++                        last_p2 = ""
++                        for row in reversed(list(transcript)):
++                            if isinstance(row, dict) and str(row.get("role") or "") == "assistant":
++                                last_p2 = prefix2_from_text_v119(str(row.get("text") or ""))
++                                break
++                        ctx_sig = sha256_hex(
++                            canonical_json_dumps(
++                                {
++                                    "schema_version": 119,
++                                    "variant_kind": "reformulate",
++                                    "conversation_id": str(conversation_id),
++                                    "turn_index_user": int(ut.get("turn_index") or 0),
++                                    "user_text_sig": text_sig_v96(str(user_text)),
++                                    "seed": int(seed),
++                                }
++                            ).encode("utf-8")
++                        )
++                        choice = choose_reformulate_variant_v119(context_sig=str(ctx_sig), last_prefix2=str(last_p2), attempt_index=int(seed))
++                        planned = str(choice.text or planned)
++                        ctx2["planned_text_variant_v119"] = choice.to_dict()
++                    ctx2["planned_text"] = str(planned)
+ 
+             # V105: continuous agency decision (goal slots -> ask -> options -> execute -> close).
+             # Triggered on UNKNOWN input only to preserve deterministic outputs for legacy commands (e.g., goal:).
+@@ -4706,7 +4784,31 @@
+                             lbl = str(labels[i])
+                             lines.append(f"{lbl}) {human.get(pk, pk)}")
+                             opts_for_pending.append({"label": lbl, "plan_kind": pk, "candidate_id": str(c.get('candidate_id') or '')})
+-                        text = "OPÇÕES:\n" + "\n".join(lines) + "\nEscolha: A/B/C"
++                        preamble = "OPÇÕES:"
++                        if bool(enable_variants_v119):
++                            ctx2 = dict(ctx2)
++                            last_p2 = ""
++                            for row in reversed(list(transcript)):
++                                if isinstance(row, dict) and str(row.get("role") or "") == "assistant":
++                                    last_p2 = prefix2_from_text_v119(str(row.get("text") or ""))
++                                    break
++                            ctx_sig = sha256_hex(
++                                canonical_json_dumps(
++                                    {
++                                        "schema_version": 119,
++                                        "variant_kind": "options_preamble",
++                                        "conversation_id": str(conversation_id),
++                                        "turn_index_user": int(ut.get("turn_index") or 0),
++                                        "user_text_sig": text_sig_v96(str(user_text)),
++                                        "seed": int(seed),
++                                    }
++                                ).encode("utf-8")
++                            )
++                            choice = choose_options_preamble_variant_v119(context_sig=str(ctx_sig), last_prefix2=str(last_p2), attempt_index=int(seed))
++                            if str(choice.text or "").strip():
++                                preamble = str(choice.text).strip()
++                            ctx2["planned_text_variant_v119"] = choice.to_dict()
++                        text = str(preamble) + "\n" + "\n".join(lines) + "\nEscolha: A/B/C"
+                         ctx2 = dict(ctx2)
+                         ctx2["planned_text"] = str(text)
+                         pending_kind = "await_choice"
+--- /dev/null	2026-01-15 20:00:35
++++ atos_core/conversation_loop_v119.py	2026-01-15 19:35:57
+@@ -0,0 +1,620 @@
++from __future__ import annotations
++
++import json
++import os
++import shutil
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .ato_v71 import ATOv71, stable_hash_obj
++from .conversation_loop_v110 import run_conversation_v110
++from .conversation_loop_v116 import apply_dialogue_survival_as_law_v116
++from .conversation_v96 import verify_chained_jsonl_v96
++from .fluency_contract_v118 import FluencyContractResultV118, fluency_contract_v118
++from .goal_persistence_v115 import render_fail_response_v115
++from .goal_plan_eval_gate_v115 import goal_id_v115, verify_goal_plan_eval_law_v115
++from .mind_graph_v71 import append_chained_jsonl, verify_chained_jsonl
++
++
++FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V119 = "plan_search_budget_exhausted_v119"
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _last_entry_hash(path: str) -> str:
++    last = ""
++    if not os.path.exists(path):
++        return last
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if isinstance(obj, dict):
++                last = str(obj.get("entry_hash") or last)
++    return str(last)
++
++
++def _sorted_dict_list(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    pairs: List[Tuple[str, Dict[str, Any]]] = []
++    for it in items:
++        if not isinstance(it, dict):
++            continue
++        try:
++            k = canonical_json_dumps(it)
++        except Exception:
++            k = str(it)
++        pairs.append((k, dict(it)))
++    pairs.sort(key=lambda kv: str(kv[0]))
++    return [v for _, v in pairs]
++
++
++def _copy_file_worm(src: str, dst: str) -> None:
++    _ensure_absent(dst)
++    with open(src, "rb") as f:
++        data = f.read()
++    tmp = dst + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "wb") as f:
++        f.write(data)
++    os.replace(tmp, dst)
++
++
++def _copy_tree_worm(src_dir: str, dst_dir: str) -> None:
++    _ensure_absent(dst_dir)
++    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=False)
++
++
++def _promote_attempt_to_root(*, attempt_dir: str, out_dir: str) -> None:
++    """
++    Copy a chosen attempt run_dir into the V119 out_dir root (WORM).
++    This keeps V110/V115/V116 file layouts available at the top-level for downstream tooling.
++    """
++    ad = str(attempt_dir)
++    od = str(out_dir)
++    for name in sorted(os.listdir(ad), key=str):
++        src = os.path.join(ad, name)
++        dst = os.path.join(od, name)
++        if os.path.isdir(src):
++            # Do not copy nested attempt dirs (we only keep the top-level chosen attempt artifacts).
++            if name.startswith("attempt_") or name.startswith("replan_attempt_"):
++                continue
++            _copy_tree_worm(src, dst)
++        else:
++            _copy_file_worm(src, dst)
++
++
++def _extract_last_user_turn_payload(run_dir: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "conversation_turns.jsonl"))
++    users: List[Dict[str, Any]] = []
++    for row in rows:
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        if str(payload.get("role") or "") == "user":
++            users.append(dict(payload))
++    if not users:
++        return {}
++    users.sort(key=lambda p: (int(p.get("turn_index", 0) or 0), int(p.get("created_step", 0) or 0), str(p.get("turn_id") or "")))
++    return dict(users[-1])
++
++
++def _plan_row_for_user_turn(run_dir: str, user_turn_id: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "action_plans.jsonl"))
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        if str(row.get("user_turn_id") or "") == str(user_turn_id):
++            return dict(row)
++    return {}
++
++
++def _make_plan_ato_v119(*, action_plan: Dict[str, Any]) -> ATOv71:
++    plan_id = str(action_plan.get("plan_id") or action_plan.get("plan_sig") or "")
++    if not plan_id:
++        raise ValueError("missing_plan_id")
++    created_step = int(action_plan.get("created_step", 0) or 0)
++    user_turn_id = str(action_plan.get("user_turn_id") or "")
++    user_turn_index = int(action_plan.get("user_turn_index", -1) or -1)
++    ranked = action_plan.get("ranked_candidates") if isinstance(action_plan.get("ranked_candidates"), list) else []
++    attempted = action_plan.get("attempted_actions") if isinstance(action_plan.get("attempted_actions"), list) else []
++    subgraph = {
++        "schema_version": 119,
++        "plan_id": str(plan_id),
++        "user_turn_id": str(user_turn_id),
++        "user_turn_index": int(user_turn_index),
++        "chosen_action_id": str(action_plan.get("chosen_action_id") or ""),
++        "chosen_eval_id": str(action_plan.get("chosen_eval_id") or ""),
++        "chosen_ok": bool(action_plan.get("chosen_ok", False)),
++        "ranked_candidates": [
++            {
++                "act_id": str(r.get("act_id") or ""),
++                "expected_success": float(r.get("expected_success", 0.0) or 0.0),
++                "expected_cost": float(r.get("expected_cost", 0.0) or 0.0),
++            }
++            for r in ranked
++            if isinstance(r, dict)
++        ],
++        "attempted_actions": [
++            {"act_id": str(a.get("act_id") or ""), "eval_id": str(a.get("eval_id") or ""), "ok": bool(a.get("ok", False))}
++            for a in attempted
++            if isinstance(a, dict)
++        ],
++    }
++    # Canonicalize deterministic ordering.
++    subgraph["ranked_candidates"].sort(key=lambda d: str(d.get("act_id") or ""))
++    subgraph["attempted_actions"].sort(key=lambda d: (str(d.get("eval_id") or ""), str(d.get("act_id") or "")))
++    return ATOv71(
++        ato_id=str(plan_id),
++        ato_type="PLAN",
++        subgraph=dict(subgraph),
++        slots={},
++        bindings={},
++        cost=float(len(subgraph["ranked_candidates"])),
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 119, "plan_kind": "action_plan_v100"},
++        created_step=int(created_step),
++        last_step=int(created_step),
++    )
++
++
++def _make_fail_event_ato_v119(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    reason_code: str,
++    step: int,
++    evidence: Dict[str, Any],
++) -> ATOv71:
++    body = {
++        "schema_version": 119,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": str(reason_code),
++        "evidence": dict(evidence) if isinstance(evidence, dict) else {},
++    }
++    fail_id = "fail_event_v119_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(body, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 119, "eval_kind": "FAIL_EVENT_V119"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _append_fail_event_to_mind_graph_v119(
++    *,
++    mind_graph_v119_dir: str,
++    fail_ato: ATOv71,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    user_turn_id: str,
++    step: int,
++    evidence_refs: Sequence[Dict[str, Any]],
++) -> None:
++    mg_dir = str(mind_graph_v119_dir)
++    nodes_path = os.path.join(mg_dir, "mind_nodes.jsonl")
++    edges_path = os.path.join(mg_dir, "mind_edges.jsonl")
++    if not os.path.exists(nodes_path) or not os.path.exists(edges_path):
++        raise ValueError("missing_mind_graph_files_v119")
++
++    fail_ato_dict = fail_ato.to_dict(include_sig=True)
++    prev_nodes_hash = _last_entry_hash(nodes_path) or None
++    nodes_entry = {
++        "time": deterministic_iso(step=int(step)),
++        "step": int(step),
++        "event": "NODE",
++        "payload": {"reason": "fail_event_v119", "ato": dict(fail_ato_dict)},
++    }
++    append_chained_jsonl(nodes_path, dict(nodes_entry), prev_hash=prev_nodes_hash)
++
++    ev_refs = _sorted_dict_list([x for x in evidence_refs if isinstance(x, dict)])
++
++    def _mk_edge(dst: str) -> Dict[str, Any]:
++        edge_sem_sig = {"src": str(fail_ato.ato_id), "dst": str(dst), "edge_type": "DERIVED_FROM", "evidence_refs": list(ev_refs)}
++        edge_sig = stable_hash_obj(edge_sem_sig)
++        return dict(edge_sem_sig, edge_sig=str(edge_sig))
++
++    dsts = [str(goal_ato_id), str(plan_ato_id), str(user_turn_id)]
++    dsts = [d for d in dsts if d]
++    for dst in dsts:
++        prev_edges_hash = _last_entry_hash(edges_path) or None
++        edges_entry = {
++            "time": deterministic_iso(step=int(step)),
++            "step": int(step),
++            "event": "EDGE",
++            "payload": {"reason": "fail_event_v119", "edge": _mk_edge(dst)},
++        }
++        append_chained_jsonl(edges_path, dict(edges_entry), prev_hash=prev_edges_hash)
++
++
++def _transcript_view_from_run_dir(run_dir: str) -> List[Dict[str, Any]]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "transcript.jsonl"))
++    out: List[Dict[str, Any]] = []
++    for row in rows:
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        role = str(payload.get("role") or "")
++        text = str(payload.get("text") or "")
++        if role in {"user", "assistant"}:
++            out.append({"role": role, "text": text})
++    return out
++
++
++@dataclass(frozen=True)
++class AttemptRecordV119:
++    attempt_index: int
++    seed_used: int
++    attempt_dir: str
++    goal_id: str
++    user_turn_id: str
++    ok_final_v116: bool
++    reason_final_v116: str
++    ok_fluency: bool
++    reason_fluency: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "attempt_index": int(self.attempt_index),
++            "seed_used": int(self.seed_used),
++            "attempt_dir": str(self.attempt_dir),
++            "goal_id": str(self.goal_id),
++            "user_turn_id": str(self.user_turn_id),
++            "ok_final_v116": bool(self.ok_final_v116),
++            "reason_final_v116": str(self.reason_final_v116),
++            "ok_fluency": bool(self.ok_fluency),
++            "reason_fluency": str(self.reason_fluency),
++        }
++
++
++def _replan_trace_obj_v119(
++    *,
++    conversation_id: str,
++    attempts: List[AttemptRecordV119],
++    chosen_attempt_index: int,
++    budget_total: int,
++    final_ok: bool,
++    final_reason: str,
++) -> Dict[str, Any]:
++    body = {
++        "schema_version": 119,
++        "kind": "replan_trace_v119",
++        "conversation_id": str(conversation_id),
++        "budget_total": int(budget_total),
++        "chosen_attempt_index": int(chosen_attempt_index),
++        "final_ok": bool(final_ok),
++        "final_reason": str(final_reason),
++        "attempts": [a.to_dict() for a in list(attempts)],
++    }
++    body["trace_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return dict(body)
++
++
++def run_conversation_v119(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_plan_attempts: int = 8,
++    max_replans_per_turn: int = 3,
++) -> Dict[str, Any]:
++    """
++    V119: make fluency_contract_v118 a hard gate *inside* the replanning loop.
++
++    Strategy (deterministic, WORM):
++      - For each attempt seed (seed+0, seed+1, ...):
++          * run base V110 pipeline with discourse_variants_v119 enabled;
++          * apply V115 goal-plan-eval law (writes mind_graph_v115 + final_response_v115.json);
++          * apply V116 dialogue survival as law (writes mind_graph_v116 + final_response_v116.json);
++          * compute fluency_contract_v118 on transcript.jsonl and persist fluency_summary_v119.json;
++          * accept the first attempt where (final_response_v116.ok==true AND fluency_ok==true).
++      - If none succeed within budget: FAIL with reason plan_search_budget_exhausted_v119.
++
++    The chosen attempt's artifacts are promoted (copied) into the V119 out_dir root (WORM),
++    and a replanning trace is written for auditability.
++    """
++    od = str(out_dir)
++    _ensure_absent(od)
++    os.makedirs(od, exist_ok=False)
++
++    attempts: List[AttemptRecordV119] = []
++    chosen_attempt = -1
++    conversation_id_seen = ""
++
++    for a in range(int(max_plan_attempts)):
++        seed_used = int(seed) + int(a)
++        attempt_dir = os.path.join(od, f"attempt_{a:03d}")
++
++        # 1) Run base deterministic pipeline (V110) with discourse variants enabled (V119).
++        run_conversation_v110(
++            user_turn_texts=list(user_turn_texts),
++            out_dir=str(attempt_dir),
++            seed=int(seed_used),
++            discourse_variants_v119_enabled=True,
++        )
++
++        # 2) Apply V115 goal-plan-eval law (runtime gate) and write final_response_v115.json (WORM).
++        gate = verify_goal_plan_eval_law_v115(
++            run_dir=str(attempt_dir),
++            max_replans_per_turn=int(max_replans_per_turn),
++            write_mind_graph=True,
++            write_snapshots=True,
++        )
++        fr115 = {
++            "schema_version": 115,
++            "kind": "final_response_v115",
++            "ok": bool(gate.ok),
++            "reason": str(gate.reason if not bool(gate.ok) else "ok"),
++            "fail_response_text": str(render_fail_response_v115(str(gate.reason))) if not bool(gate.ok) else "",
++        }
++        fr115["final_sig"] = sha256_hex(canonical_json_dumps(fr115).encode("utf-8"))
++        _write_once_json(os.path.join(str(attempt_dir), "final_response_v115.json"), dict(fr115))
++
++        # 3) Apply V116 dialogue survival law on top of V115.
++        applied = apply_dialogue_survival_as_law_v116(run_dir=str(attempt_dir), write_mind_graph=True)
++        fr116_path = os.path.join(str(attempt_dir), "final_response_v116.json")
++        fr116 = _read_json(fr116_path) if os.path.exists(fr116_path) else {}
++        ok_final = bool(fr116.get("ok", False)) if isinstance(fr116, dict) else False
++        reason_final = str(fr116.get("reason") or "") if isinstance(fr116, dict) else "missing_final_response_v116"
++
++        # 4) Fluency as survival (hard gate).
++        transcript_view = _transcript_view_from_run_dir(str(attempt_dir))
++        ok_flu, reason_flu, details_flu = fluency_contract_v118(transcript_view=list(transcript_view))
++        flu_obj = FluencyContractResultV118(ok=bool(ok_flu), reason=str(reason_flu), details=dict(details_flu)).to_dict()
++        _write_once_json(os.path.join(str(attempt_dir), "fluency_summary_v119.json"), dict(flu_obj))
++
++        last_user = _extract_last_user_turn_payload(str(attempt_dir))
++        user_turn_id = str(last_user.get("turn_id") or "")
++        conversation_id = str(last_user.get("conversation_id") or str(applied.details.get("conversation_id") or ""))
++        if conversation_id and not conversation_id_seen:
++            conversation_id_seen = str(conversation_id)
++        user_turn_index = int(last_user.get("turn_index", 0) or 0)
++        refs = last_user.get("refs") if isinstance(last_user.get("refs"), dict) else {}
++        parse_sig = str(refs.get("parse_sig") or "")
++        user_text = str(last_user.get("text") or "")
++        goal_id = goal_id_v115(
++            conversation_id=str(conversation_id),
++            user_turn_id=str(user_turn_id),
++            user_turn_index=int(user_turn_index),
++            parse_sig=str(parse_sig),
++            user_text=str(user_text),
++        )
++
++        attempts.append(
++            AttemptRecordV119(
++                attempt_index=int(a),
++                seed_used=int(seed_used),
++                attempt_dir=os.path.basename(str(attempt_dir)),
++                goal_id=str(goal_id),
++                user_turn_id=str(user_turn_id),
++                ok_final_v116=bool(ok_final),
++                reason_final_v116=str(reason_final),
++                ok_fluency=bool(ok_flu),
++                reason_fluency=str(reason_flu) if not bool(ok_flu) else "ok",
++            )
++        )
++
++        if bool(ok_final) and bool(ok_flu):
++            chosen_attempt = int(a)
++            break
++
++    if not attempts:
++        raise ValueError("no_attempts_v119")
++
++    final_ok = chosen_attempt >= 0
++    final_reason = "ok" if final_ok else FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V119
++    chosen_idx = int(chosen_attempt if chosen_attempt >= 0 else (len(attempts) - 1))
++    chosen_attempt_dir = os.path.join(od, f"attempt_{chosen_idx:03d}")
++
++    # Promote chosen attempt artifacts to root (WORM).
++    _promote_attempt_to_root(attempt_dir=str(chosen_attempt_dir), out_dir=str(od))
++
++    # Write replanning trace (WORM).
++    rep_obj = _replan_trace_obj_v119(
++        conversation_id=str(conversation_id_seen),
++        attempts=list(attempts),
++        chosen_attempt_index=int(chosen_attempt if chosen_attempt >= 0 else -1),
++        budget_total=int(max_plan_attempts),
++        final_ok=bool(final_ok),
++        final_reason=str(final_reason),
++    )
++    _write_once_json(os.path.join(od, "replan_trace_v119.json"), dict(rep_obj))
++
++    # Write final_response_v119.json (WORM).
++    fr116_root_path = os.path.join(od, "final_response_v116.json")
++    fr116_root = _read_json(fr116_root_path) if os.path.exists(fr116_root_path) else {}
++    final_obj = {
++        "schema_version": 119,
++        "kind": "final_response_v119",
++        "ok": bool(final_ok),
++        "reason": str(final_reason if not final_ok else "ok"),
++        "fail_response_text": str(render_fail_response_v115(str(final_reason))) if not bool(final_ok) else "",
++        "upstream": {"final_response_v116": dict(fr116_root) if isinstance(fr116_root, dict) else {}},
++    }
++    final_obj["final_sig"] = sha256_hex(canonical_json_dumps(final_obj).encode("utf-8"))
++    _write_once_json(os.path.join(od, "final_response_v119.json"), dict(final_obj))
++
++    # Create mind_graph_v119: copy mind_graph_v116 and append FAIL_EVENT_V119 nodes for rejected attempts.
++    mg116_dir = os.path.join(od, "mind_graph_v116")
++    mg119_dir = os.path.join(od, "mind_graph_v119")
++    if os.path.isdir(mg116_dir):
++        os.makedirs(mg119_dir, exist_ok=False)
++        _copy_file_worm(os.path.join(mg116_dir, "mind_nodes.jsonl"), os.path.join(mg119_dir, "mind_nodes.jsonl"))
++        _copy_file_worm(os.path.join(mg116_dir, "mind_edges.jsonl"), os.path.join(mg119_dir, "mind_edges.jsonl"))
++        nodes_path = os.path.join(mg119_dir, "mind_nodes.jsonl")
++        edges_path = os.path.join(mg119_dir, "mind_edges.jsonl")
++        if not verify_chained_jsonl(nodes_path) or not verify_chained_jsonl(edges_path):
++            raise ValueError("mind_graph_v119_chain_invalid_after_copy")
++
++        # Build a map of existing nodes (by ato_id) so we can import plan nodes deterministically.
++        existing_nodes: Dict[str, Dict[str, Any]] = {}
++        for row in _read_jsonl(nodes_path):
++            payload = row.get("payload") if isinstance(row, dict) else None
++            ato = payload.get("ato") if isinstance(payload, dict) else None
++            if not isinstance(ato, dict):
++                continue
++            ato_id = str(ato.get("ato_id") or "")
++            if ato_id:
++                existing_nodes[ato_id] = dict(ato)
++
++        chosen_last_user = _extract_last_user_turn_payload(str(chosen_attempt_dir))
++        chosen_user_turn_id = str(chosen_last_user.get("turn_id") or "")
++        chosen_conversation_id = str(chosen_last_user.get("conversation_id") or "")
++        chosen_user_turn_index = int(chosen_last_user.get("turn_index", 0) or 0)
++        chosen_refs = chosen_last_user.get("refs") if isinstance(chosen_last_user.get("refs"), dict) else {}
++        chosen_parse_sig = str(chosen_refs.get("parse_sig") or "")
++        chosen_user_text = str(chosen_last_user.get("text") or "")
++        chosen_goal_id = goal_id_v115(
++            conversation_id=str(chosen_conversation_id),
++            user_turn_id=str(chosen_user_turn_id),
++            user_turn_index=int(chosen_user_turn_index),
++            parse_sig=str(chosen_parse_sig),
++            user_text=str(chosen_user_text),
++        )
++        chosen_plan_row = _plan_row_for_user_turn(str(chosen_attempt_dir), str(chosen_user_turn_id))
++        chosen_plan_id = str(chosen_plan_row.get("plan_id") or chosen_plan_row.get("plan_sig") or "")
++        step0 = int(chosen_plan_row.get("created_step", chosen_last_user.get("created_step", 0) or 0) or 0)
++
++        # Append FAIL_EVENT_V119s deterministically by attempt_index, then by reason code.
++        for ar in sorted(list(attempts), key=lambda a: int(a.attempt_index)):
++            if int(ar.attempt_index) == int(chosen_attempt):
++                continue
++            attempt_subdir = os.path.join(od, f"attempt_{int(ar.attempt_index):03d}")
++            plan_row = _plan_row_for_user_turn(str(attempt_subdir), str(ar.user_turn_id))
++            plan_id = str(plan_row.get("plan_id") or plan_row.get("plan_sig") or "") if isinstance(plan_row, dict) else ""
++            if plan_id and plan_id not in existing_nodes and isinstance(plan_row, dict) and plan_row:
++                plan_ato = _make_plan_ato_v119(action_plan=dict(plan_row))
++                plan_ato_dict = plan_ato.to_dict(include_sig=True)
++                prev_nodes_hash = _last_entry_hash(nodes_path) or None
++                nodes_entry = {
++                    "time": deterministic_iso(step=int(plan_ato.created_step)),
++                    "step": int(plan_ato.created_step),
++                    "event": "NODE",
++                    "payload": {"reason": "plan_import_v119", "ato": dict(plan_ato_dict)},
++                }
++                append_chained_jsonl(nodes_path, dict(nodes_entry), prev_hash=prev_nodes_hash)
++                existing_nodes[str(plan_id)] = dict(plan_ato_dict)
++
++            # For each failure type, append a fail event.
++            fail_specs: List[Tuple[str, Dict[str, Any]]] = []
++            if not bool(ar.ok_final_v116):
++                fail_specs.append(
++                    (
++                        "final_v116_fail",
++                        {
++                            "attempt_index": int(ar.attempt_index),
++                            "seed_used": int(ar.seed_used),
++                            "attempt_dir": str(ar.attempt_dir),
++                            "reason_final_v116": str(ar.reason_final_v116),
++                        },
++                    )
++                )
++            if not bool(ar.ok_fluency):
++                # Reference the per-attempt fluency summary for auditability.
++                fsum_path = os.path.join(str(attempt_subdir), "fluency_summary_v119.json")
++                fsum_sig = ""
++                if os.path.exists(fsum_path):
++                    fobj = _read_json(fsum_path)
++                    if isinstance(fobj, dict):
++                        fsum_sig = str(fobj.get("result_sig") or "")
++                fail_specs.append(
++                    (
++                        "fluency_" + str(ar.reason_fluency),
++                        {
++                            "attempt_index": int(ar.attempt_index),
++                            "seed_used": int(ar.seed_used),
++                            "attempt_dir": str(ar.attempt_dir),
++                            "reason_fluency": str(ar.reason_fluency),
++                            "fluency_summary_result_sig": str(fsum_sig),
++                            "fluency_summary_file": os.path.basename(str(fsum_path)),
++                        },
++                    )
++                )
++
++            for reason_code, evidence in sorted(fail_specs, key=lambda kv: str(kv[0])):
++                fail_ato = _make_fail_event_ato_v119(
++                    conversation_id=str(chosen_conversation_id),
++                    user_turn_id=str(chosen_user_turn_id),
++                    goal_ato_id=str(chosen_goal_id),
++                    plan_ato_id=str(plan_id or chosen_plan_id),
++                    reason_code=str(reason_code),
++                    step=int(step0),
++                    evidence=dict(evidence, replan_trace_sig=str(rep_obj.get("trace_sig") or ""), replan_trace_file="replan_trace_v119.json"),
++                )
++                _append_fail_event_to_mind_graph_v119(
++                    mind_graph_v119_dir=str(mg119_dir),
++                    fail_ato=fail_ato,
++                    goal_ato_id=str(chosen_goal_id),
++                    plan_ato_id=str(plan_id or chosen_plan_id),
++                    user_turn_id=str(chosen_user_turn_id),
++                    step=int(step0),
++                    evidence_refs=[
++                        {"kind": "turn", "turn_id": str(chosen_user_turn_id)},
++                        {"kind": "replan_trace", "trace_sig": str(rep_obj.get("trace_sig") or "")},
++                        {"kind": "attempt", "attempt_index": int(ar.attempt_index), "seed_used": int(ar.seed_used)},
++                    ],
++                )
++
++        if not verify_chained_jsonl(nodes_path) or not verify_chained_jsonl(edges_path):
++            raise ValueError("mind_graph_v119_chain_invalid_after_append")
++
++    # Best-effort chain checks on promoted ledgers.
++    for p in [
++        os.path.join(od, "transcript.jsonl"),
++        os.path.join(od, "conversation_turns.jsonl"),
++        os.path.join(od, "intent_parses.jsonl"),
++        os.path.join(od, "objective_evals.jsonl"),
++        os.path.join(od, "dialogue_trials.jsonl"),
++        os.path.join(od, "action_plans.jsonl"),
++    ]:
++        if os.path.exists(p) and not bool(verify_chained_jsonl_v96(p)):
++            raise ValueError(f"chain_invalid_promoted:{os.path.basename(p)}")
++
++    return {"final_response_v119": dict(final_obj), "replan_trace_v119_sig": str(rep_obj.get("trace_sig") or "")}
+--- /dev/null	2026-01-15 20:00:35
++++ atos_core/discourse_variants_v119.py	2026-01-15 19:53:49
+@@ -0,0 +1,330 @@
++from __future__ import annotations
++
++import hashlib
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++
++def _norm_ws(s: str) -> str:
++    return " ".join(str(s or "").strip().split())
++
++
++def _tokenize(text: str) -> List[str]:
++    t = _norm_ws(text).lower()
++    if not t:
++        return []
++    return t.split()
++
++
++def prefix2_from_text_v119(text: str) -> str:
++    toks = _tokenize(text)
++    if not toks:
++        return ""
++    return " ".join(toks[:2])
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _stable_hash_text(text: str) -> str:
++    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
++
++
++ACK_BANK_V119: List[str] = [
++    "Certo.",
++    "Beleza.",
++    "Ok.",
++    "Entendi.",
++    "Perfeito.",
++    "Tudo bem.",
++    "Combinado.",
++    "Fechado.",
++    "Ótimo.",
++    "Certo — seguindo.",
++    "Beleza — seguindo.",
++    "Ok — seguindo.",
++    "Entendi — vou continuar.",
++    "Perfeito — vou continuar.",
++    "Tudo bem — vou seguir.",
++]
++
++OPTIONS_PREAMBLE_BANK_V119: List[str] = [
++    "Aqui estão as opções:",
++    "Estas são as opções:",
++    "Veja as opções:",
++    "Opções disponíveis:",
++    "Tenho estas opções:",
++    "Posso seguir por estas opções:",
++    "Sugestões de caminho (A/B/C):",
++    "Alternativas (A/B/C):",
++    "Caminhos possíveis:",
++    "Vou listar as opções:",
++    "Para seguir, estas são as opções:",
++    "Para avançar, veja as opções:",
++    "Para decidir, veja as opções:",
++    "Para escolher, aqui vão as opções:",
++    "Para destravar, estas são as opções:",
++    "Para continuar, estas são as opções:",
++    "Antes de seguir, veja as opções:",
++    "Para você escolher, estas são as opções:",
++    "Vou te dar as opções:",
++    "Vou apresentar as opções:",
++]
++
++
++CLARIFY_BANK_V119: List[str] = [
++    "Não ficou claro. Você pode esclarecer o que você quer dizer?",
++    "Ainda não entendi. Você pode esclarecer o que você quer dizer?",
++    "Preciso de um detalhe. Você pode esclarecer o que você quer dizer?",
++    "Só para eu não assumir errado: o que você quer dizer exatamente?",
++    "Me ajude com um detalhe: o que você quer dizer com isso?",
++    "Pode explicar de outro jeito? O que você quer dizer exatamente?",
++    "Eu não consegui interpretar com segurança. Você pode esclarecer o que você quer dizer?",
++    "Antes de seguir, preciso entender: o que você quer dizer com isso?",
++    "Para eu responder certo, preciso de clarificação: o que você quer dizer exatamente?",
++    "Fiquei em dúvida. Você pode esclarecer o que você quer dizer?",
++    "Você pode ser mais específico sobre o que você quer dizer?",
++    "Qual parte exatamente você quer que eu faça agora?",
++    "O que exatamente você quer dizer por “isso” aqui?",
++    "Você está se referindo a quê, exatamente?",
++    "Quando você diz “isso”, qual coisa você quer dizer?",
++    "Você quer que eu continue o plano ou quer mudar alguma coisa?",
++    "Qual é o próximo passo que você quer: continuar, mudar, ou encerrar?",
++    "Me diga só o alvo: o que você quer obter como resultado?",
++    "Só preciso de uma informação: o que você quer dizer com isso?",
++    "Preciso entender a referência: isso aponta para qual item/ação?",
++    "O que você quer que eu considere como “isso” neste contexto?",
++    "Você pode dizer explicitamente qual parte devo usar como referência?",
++    "Você quer que eu responda, que eu pergunte um detalhe, ou que eu resuma?",
++    "Você está pedindo uma ação específica ou uma explicação?",
++    "Qual variável/assunto você quer usar agora?",
++    "Qual é o dado que falta para eu continuar?",
++    "Você quer que eu avance ou que eu confirme entendimento?",
++    "Eu consigo seguir, mas preciso saber: o que exatamente você quer dizer?",
++    "Para evitar assumir errado, esclareça: você quer dizer qual item?",
++    "Você está falando do objetivo atual ou de outra coisa?",
++    "Você está se referindo ao último passo, ao plano, ou ao objetivo?",
++    "Você quer que eu continue do ponto onde parei ou que eu replaine?",
++    "Qual parte do que eu disse você quer ajustar?",
++    "Você pode apontar o que mudar (qual campo/variável/parte)?",
++    "Qual é a opção correta aqui (A/B/C), ou você quer outra opção?",
++    "Você quer que eu dê um exemplo ou que eu execute a ação?",
++    "Qual é o item certo para eu usar como referência agora?",
++    "Eu preciso de um nome/identificador: a que você está se referindo?",
++    "Você está confirmando, recusando, ou pedindo para seguir?",
++    "Você quer que eu siga exatamente igual ou que eu simplifique?",
++    "Você quer um resumo curto ou um próximo passo concreto?",
++    "Você quer que eu continue com o mesmo objetivo ou mudou o objetivo?",
++    "Qual é a mudança que você quer: valor, prioridade, ou escopo?",
++    "Você quer que eu escolha uma opção ou quer escolher você?",
++    "Você pode dizer qual chave/variável/parte devo usar?",
++    "Eu preciso de uma referência explícita. Qual é ela?",
++    "O que você quer que eu faça com isso: explicar, executar, ou perguntar?",
++    "Você pode descrever em uma frase o que você quer agora?",
++    "Qual é a pergunta que você quer responder agora?",
++    "Qual é o resultado final que você quer (em uma frase)?",
++    "Qual é a restrição mais importante aqui?",
++    "Qual é o detalhe que você quer definir primeiro?",
++    "Você quer continuar do jeito atual ou quer revisar o plano?",
++    "Você quer que eu dê opções A/B ou que eu faça uma pergunta específica?",
++    "Você está se referindo ao que eu acabei de dizer ou a algo anterior?",
++    "Você quer que eu continue a partir do último resultado ou do objetivo?",
++    "Você está se referindo ao último valor, ao plano, ou ao objetivo ativo?",
++    "Qual destes é “isso”: o objetivo, o plano, ou o último resultado?",
++]
++
++
++REFORMULATE_BANK_V119: List[str] = [
++    "Não entendi. Você pode reformular usando um comando suportado (set/get/add/summary/end) ou descrever o objetivo?",
++    "Não ficou claro. Você pode reformular usando um comando suportado (set/get/add/summary/end) ou descrever o objetivo?",
++    "Preciso de clarificação. Reformule com set/get/add/summary/end, ou descreva o objetivo.",
++    "Para eu continuar: use set/get/add/summary/end, ou descreva o objetivo em uma frase.",
++    "Eu não consigo executar isso como comando. Use set/get/add/summary/end, ou descreva o objetivo.",
++]
++
++
++INVALID_COMMAND_BANK_V119: List[str] = [
++    "Comando inválido: {msg}",
++    "Entrada inválida: {msg}",
++    "Pedido inválido: {msg}",
++]
++
++
++@dataclass(frozen=True)
++class VariantChoiceV119:
++    variant_kind: str
++    variant_index: int
++    text: str
++    prefix2: str
++    choice_sig: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        body = {
++            "schema_version": 119,
++            "kind": "variant_choice_v119",
++            "variant_kind": str(self.variant_kind),
++            "variant_index": int(self.variant_index),
++            "text": str(self.text),
++            "text_sha256": _stable_hash_text(self.text),
++            "prefix2": str(self.prefix2),
++        }
++        body["choice_sig"] = str(self.choice_sig)
++        return dict(body)
++
++
++def _choose_from_bank(
++    *,
++    variant_kind: str,
++    bank: Sequence[str],
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++) -> VariantChoiceV119:
++    b = [str(x) for x in bank if str(x)]
++    if not b:
++        txt = ""
++        pref = ""
++        cs = _stable_hash_obj({"k": str(variant_kind), "empty": True, "context_sig": str(context_sig), "attempt": int(attempt_index)})
++        return VariantChoiceV119(variant_kind=str(variant_kind), variant_index=0, text=txt, prefix2=pref, choice_sig=str(cs))
++
++    seed_obj = {"variant_kind": str(variant_kind), "context_sig": str(context_sig), "attempt_index": int(attempt_index)}
++    seed_sig = _stable_hash_obj(seed_obj)
++    idx0 = int(seed_sig, 16) % int(len(b))
++
++    lp2 = str(last_prefix2 or "")
++    lp2_toks = [t for t in lp2.split() if t]
++    chosen_idx = int(idx0)
++    chosen_text = str(b[chosen_idx])
++    chosen_p2 = prefix2_from_text_v119(chosen_text)
++    chosen_toks = _tokenize(chosen_text)
++    chosen_first = chosen_toks[0] if chosen_toks else ""
++
++    # Deterministic anti-collision: avoid repeating the same prefix2 when possible.
++    #
++    # Extra rule (bullet-aware):
++    # If the previous prefix2 begins with a bullet token ("-" / "•"), the *effective*
++    # prefix2 often becomes "<bullet> <first_word>". To reduce consecutive runs like
++    # "- não" even when the raw template text doesn't include the bullet marker,
++    # treat a repeated "<bullet> <first_word>" as a collision too.
++    bullet_collision = False
++    if lp2_toks and len(lp2_toks) >= 2 and lp2_toks[0] in {"-", "•"} and chosen_first:
++        bullet_collision = str(chosen_first) == str(lp2_toks[1])
++
++    if lp2 and chosen_p2 and (chosen_p2 == lp2 or bullet_collision) and len(b) > 1:
++        for off in range(1, len(b) + 1):
++            idx = (idx0 + off) % len(b)
++            t = str(b[idx])
++            p2 = prefix2_from_text_v119(t)
++            toks2 = _tokenize(t)
++            first2 = toks2[0] if toks2 else ""
++            bullet_collision2 = False
++            if lp2_toks and len(lp2_toks) >= 2 and lp2_toks[0] in {"-", "•"} and first2:
++                bullet_collision2 = str(first2) == str(lp2_toks[1])
++            if p2 and p2 != lp2 and not bullet_collision2:
++                chosen_idx = int(idx)
++                chosen_text = str(t)
++                chosen_p2 = str(p2)
++                chosen_first = str(first2)
++                break
++
++    choice_sig = _stable_hash_obj(
++        {
++            "schema_version": 119,
++            "variant_kind": str(variant_kind),
++            "context_sig": str(context_sig),
++            "attempt_index": int(attempt_index),
++            "idx0": int(idx0),
++            "chosen_index": int(chosen_idx),
++            "chosen_prefix2": str(chosen_p2),
++            "chosen_first_token": str(chosen_first),
++            "last_prefix2": str(lp2),
++            "last_prefix2_tokens": list(lp2_toks),
++        }
++    )
++    return VariantChoiceV119(
++        variant_kind=str(variant_kind),
++        variant_index=int(chosen_idx),
++        text=str(chosen_text),
++        prefix2=str(chosen_p2),
++        choice_sig=str(choice_sig),
++    )
++
++
++def choose_ack_variant_v119(
++    *,
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++    ) -> VariantChoiceV119:
++    return _choose_from_bank(
++        variant_kind="ack",
++        bank=list(ACK_BANK_V119),
++        context_sig=str(context_sig),
++        last_prefix2=str(last_prefix2),
++        attempt_index=int(attempt_index),
++    )
++
++
++def choose_options_preamble_variant_v119(
++    *,
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++) -> VariantChoiceV119:
++    return _choose_from_bank(
++        variant_kind="options_preamble",
++        bank=list(OPTIONS_PREAMBLE_BANK_V119),
++        context_sig=str(context_sig),
++        last_prefix2=str(last_prefix2),
++        attempt_index=int(attempt_index),
++    )
++
++
++def choose_clarify_variant_v119(
++    *,
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++) -> VariantChoiceV119:
++    return _choose_from_bank(
++        variant_kind="clarify",
++        bank=list(CLARIFY_BANK_V119),
++        context_sig=str(context_sig),
++        last_prefix2=str(last_prefix2),
++        attempt_index=int(attempt_index),
++    )
++
++
++def choose_reformulate_variant_v119(
++    *,
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++) -> VariantChoiceV119:
++    return _choose_from_bank(
++        variant_kind="reformulate",
++        bank=list(REFORMULATE_BANK_V119),
++        context_sig=str(context_sig),
++        last_prefix2=str(last_prefix2),
++        attempt_index=int(attempt_index),
++    )
++
++
++def render_invalid_command_text_v119(
++    *,
++    msg: str,
++    context_sig: str,
++    last_prefix2: str,
++    attempt_index: int,
++) -> Tuple[str, VariantChoiceV119]:
++    choice = _choose_from_bank(
++        variant_kind="invalid_command",
++        bank=[str(t).format(msg=str(msg)) for t in INVALID_COMMAND_BANK_V119],
++        context_sig=str(context_sig),
++        last_prefix2=str(last_prefix2),
++        attempt_index=int(attempt_index),
++    )
++    return str(choice.text), choice
+--- /dev/null	2026-01-15 20:00:35
++++ atos_core/world_manifest_resolver_v119.py	2026-01-15 19:39:50
+@@ -0,0 +1,89 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def resolve_world_canonical_jsonl_v119(*, world_manifest_path: str, default_rel: str) -> Dict[str, Any]:
++    """
++    Resolve a world manifest to its canonical JSONL file in a deterministic, audit-friendly way.
++
++    Supports both:
++      - external_world/dialogue_history_canonical_v113_manifest.json (paths.canonical_jsonl relative to manifest dir)
++      - external_world/manifests/world_manifest_v111.json (paths.canonical_jsonl relative to external_world root)
++
++    Strategy:
++      - read `paths.canonical_jsonl` (or fall back to `default_rel`);
++      - try candidates:
++          1) manifest_dir / rel
++          2) manifest_dir.parent / rel
++      - if rel is absolute, try rel directly.
++
++    Returns a dict with:
++      - ok, reason
++      - world_manifest_input, canonical_jsonl_rel, canonical_jsonl_resolved, attempts
++      - world_manifest_sha256, world_canonical_sha256
++    """
++    mp = Path(str(world_manifest_path)).expanduser()
++    if not mp.exists():
++        return {"ok": False, "reason": "missing_world_manifest", "world_manifest_input": str(world_manifest_path), "attempts": []}
++
++    m = _load_json(mp)
++    paths = m.get("paths") if isinstance(m, dict) and isinstance(m.get("paths"), dict) else {}
++    rel = str(paths.get("canonical_jsonl") or str(default_rel))
++
++    attempts: List[str] = []
++    candidates: List[Path] = []
++    rel_path = Path(rel)
++    if rel_path.is_absolute():
++        candidates.append(rel_path)
++    else:
++        candidates.append((mp.parent / rel_path))
++        candidates.append((mp.parent.parent / rel_path))
++
++    chosen: Optional[Path] = None
++    for c in candidates:
++        attempts.append(str(c))
++        if c.exists():
++            chosen = c.resolve()
++            break
++
++    if chosen is None:
++        return {
++            "ok": False,
++            "reason": "missing_world_canonical_jsonl",
++            "world_manifest_input": str(world_manifest_path),
++            "canonical_jsonl_rel": str(rel),
++            "attempts": list(attempts),
++        }
++
++    msha = _sha256_file(mp)
++    csha = _sha256_file(chosen)
++    return {
++        "ok": True,
++        "reason": "ok",
++        "world_manifest_input": str(world_manifest_path),
++        "canonical_jsonl_rel": str(rel),
++        "canonical_jsonl_resolved": str(chosen),
++        "attempts": list(attempts),
++        "world_manifest_sha256": str(msha),
++        "world_canonical_sha256": str(csha),
++    }
++
+--- patches/v119_base/scripts/gen_family7_dla_from_external_world_v118.py	2026-01-15 20:00:35
++++ scripts/gen_family7_dla_from_external_world_v118.py	2026-01-15 19:42:08
+@@ -12,6 +12,7 @@
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.world_manifest_resolver_v119 import resolve_world_canonical_jsonl_v119
+ 
+ 
+ def _fail(msg: str, *, code: int = 2) -> None:
+@@ -42,10 +43,10 @@
+ 
+ 
+ def _world_jsonl_path_from_manifest(manifest_path: Path) -> Path:
+-    m = _load_world_manifest(manifest_path)
+-    paths = m.get("paths") if isinstance(m.get("paths"), dict) else {}
+-    rel = str(paths.get("canonical_jsonl") or "dialogue_history_canonical_v113.jsonl")
+-    return (manifest_path.parent / rel).resolve()
++    res = resolve_world_canonical_jsonl_v119(world_manifest_path=str(manifest_path), default_rel="dialogue_history_canonical_v113.jsonl")
++    if not bool(res.get("ok", False)):
++        _fail(f"world_manifest_resolve_fail:{res.get('reason')} attempts={res.get('attempts')}")
++    return Path(str(res.get("canonical_jsonl_resolved") or "")).resolve()
+ 
+ 
+ def _is_safe_user_turn_text_v118(text: str) -> bool:
+@@ -213,10 +214,20 @@
+     _ensure_absent(out_path)
+ 
+     world_manifest = Path(str(args.world_manifest))
+-    canon_path = _world_jsonl_path_from_manifest(world_manifest)
++    res_info = resolve_world_canonical_jsonl_v119(world_manifest_path=str(world_manifest), default_rel="dialogue_history_canonical_v113.jsonl")
++    if not bool(res_info.get("ok", False)):
++        _fail(f"world_manifest_resolve_fail:{res_info.get('reason')} attempts={res_info.get('attempts')}")
++    canon_path = Path(str(res_info.get("canonical_jsonl_resolved") or "")).resolve()
+     if not canon_path.exists():
+         _fail(f"missing_world_canonical_jsonl:{canon_path}")
+ 
++    world_task_fields = {
++        "world_manifest_input": str(res_info.get("world_manifest_input") or str(world_manifest.as_posix())),
++        "world_canonical_jsonl_resolved": str(canon_path.as_posix()),
++        "world_manifest_sha256": str(res_info.get("world_manifest_sha256") or ""),
++        "world_canonical_sha256": str(res_info.get("world_canonical_sha256") or ""),
++    }
++
+     tasks_total = int(args.tasks_total)
+     stress_200 = int(args.stress_200)
+     stress_500 = int(args.stress_500)
+@@ -319,6 +330,7 @@
+                         "allow_external_world_once": bool(allow_external),
+                         "external_world_probe_reason_code": "validator_failed_fluency_contract",
+                         "injection_plan": list(plan),
++                        **dict(world_task_fields),
+                     },
+                 )
+             )
+@@ -357,6 +369,7 @@
+                     "allow_external_world_once": bool(allow_external),
+                     "external_world_probe_reason_code": "validator_failed_fluency_contract",
+                     "injection_plan": list(plan),
++                    **dict(world_task_fields),
+                 },
+             )
+         )
+@@ -397,6 +410,7 @@
+                     "allow_external_world_once": bool(allow_external),
+                     "external_world_probe_reason_code": "validator_failed_fluency_contract",
+                     "injection_plan": list(plan),
++                    **dict(world_task_fields),
+                 },
+             )
+         )
+@@ -418,8 +432,8 @@
+         "tasks_total": int(len(tasks)),
+         "world_manifest": str(world_manifest.as_posix()),
+         "world_canonical_jsonl": str(canon_path.as_posix()),
+-        "world_manifest_sha256": _sha256_file(world_manifest),
+-        "world_canonical_sha256": _sha256_file(canon_path),
++        "world_manifest_sha256": str(res_info.get("world_manifest_sha256") or _sha256_file(world_manifest)),
++        "world_canonical_sha256": str(res_info.get("world_canonical_sha256") or _sha256_file(canon_path)),
+         "tasks_sha256": _sha256_file(out_path),
+     }
+     man_path = out_path.with_suffix(out_path.suffix + ".manifest.json")
+--- /dev/null	2026-01-15 20:00:35
++++ scripts/smoke_v119_ack_spam_200.py	2026-01-15 19:44:59
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v110 import run_conversation_v110
++from atos_core.discourse_variants_v119 import prefix2_from_text_v119
++from atos_core.fluency_contract_v118 import fluency_contract_v118
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++def _load_jsonl_payload_view(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if not isinstance(obj, dict):
++                continue
++            payload = obj.get("payload")
++            if not isinstance(payload, dict):
++                continue
++            out.append(dict(payload))
++    return out
++
++
++def _transcript_view(path: Path) -> List[Dict[str, Any]]:
++    rows = _load_jsonl_payload_view(path)
++    out: List[Dict[str, Any]] = []
++    for r in rows:
++        role = str(r.get("role") or "")
++        text = str(r.get("text") or "")
++        if role in {"user", "assistant"}:
++            out.append({"role": role, "text": text})
++    return out
++
++
++def _assistant_prefix2s(transcript_view: Sequence[Dict[str, Any]]) -> List[str]:
++    out: List[str] = []
++    for r in transcript_view:
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("role") or "") != "assistant":
++            continue
++        out.append(prefix2_from_text_v119(str(r.get("text") or "")))
++    return out
++
++
++def _max_consecutive_equal(items: Sequence[str]) -> Tuple[int, str]:
++    best = 0
++    best_item = ""
++    cur = 0
++    prev = None
++    for it in items:
++        if it and prev == it:
++            cur += 1
++        else:
++            cur = 1 if it else 0
++            prev = it
++        if cur > best:
++            best = cur
++            best_item = it
++    return int(best), str(best_item or "")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _smoke_once(*, out_dir: Path, seed: int, turns: int) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++
++    # A deterministic stress pattern: repeated "ok" turns, with an explicit end so the run terminates.
++    user_turns = ["ok"] * int(turns) + ["end now"]
++
++    run_conversation_v110(
++        user_turn_texts=list(user_turns),
++        out_dir=str(out_dir),
++        seed=int(seed),
++        discourse_variants_v119_enabled=True,
++    )
++
++    transcript_path = out_dir / "transcript.jsonl"
++    tv = _transcript_view(transcript_path)
++    ok_flu, reason_flu, details_flu = fluency_contract_v118(transcript_view=list(tv))
++
++    prefix2s = _assistant_prefix2s(tv)
++    max_run, max_prefix2 = _max_consecutive_equal(prefix2s)
++
++    eval_obj = {
++        "schema_version": 119,
++        "kind": "smoke_v119_ack_spam_200_eval",
++        "seed": int(seed),
++        "turns_user_ok": int(turns),
++        "assistant_prefix2_max_consecutive": {"n": int(max_run), "prefix2": str(max_prefix2)},
++        "fluency": {"ok": bool(ok_flu), "reason": str(reason_flu), "details_sig": str(details_flu.get("metrics_sig") or "")},
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    # Deterministic summary core.
++    core = {
++        "seed": int(seed),
++        "turns_user_ok": int(turns),
++        "fluency_ok": bool(ok_flu),
++        "fluency_reason": str(reason_flu),
++        "assistant_prefix2_max_consecutive": {"n": int(max_run), "prefix2": str(max_prefix2)},
++        "eval_sha256": _sha256_file(out_dir / "eval.json"),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    summary = {"schema_version": 119, "kind": "smoke_v119_ack_spam_200_summary", "core": dict(core), "summary_sha256": str(summary_sha256)}
++    _write_once_json(out_dir / "smoke_summary.json", summary)
++
++    if not bool(ok_flu):
++        _fail(f"fluency_fail:{reason_flu}")
++    if int(max_run) >= 4 and str(max_prefix2):
++        _fail(f"consecutive_prefix2_repeat_detected:{max_prefix2}")
++
++    return {"core": dict(core), "summary_sha256": str(summary_sha256)}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--turns", type=int, default=200)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++    turns = int(args.turns)
++
++    r1 = _smoke_once(out_dir=Path(out_base + "_try1"), seed=seed, turns=turns)
++    r2 = _smoke_once(out_dir=Path(out_base + "_try2"), seed=seed, turns=turns)
++
++    if canonical_json_dumps(r1["core"]) != canonical_json_dumps(r2["core"]):
++        _fail("determinism_core_mismatch")
++    if str(r1["summary_sha256"]) != str(r2["summary_sha256"]):
++        _fail("determinism_summary_sha256_mismatch")
++
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "determinism_ok": True,
++                "summary_sha256": str(r1["summary_sha256"]),
++                "turns_user_ok": int(turns),
++                "out_try1": str(out_base + "_try1"),
++                "out_try2": str(out_base + "_try2"),
++            },
++            ensure_ascii=False,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 20:00:35
++++ scripts/smoke_v119_family7_hard_gate.py	2026-01-15 19:38:37
+@@ -0,0 +1,207 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v119 import run_conversation_v119
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++ACK_LIKE = {
++    "ok",
++    "okay",
++    "certo",
++    "beleza",
++    "blz",
++    "continua",
++    "continue",
++    "segue",
++    "vai",
++    "faz",
++    "pode",
++    "sim",
++    "isso",
++    "aquilo",
++    "that",
++    "it",
++}
++
++
++def _canon_ack(s: str) -> str:
++    t = str(s or "").strip().lower()
++    t = " ".join([x for x in t.split() if x])
++    return t
++
++
++def _ack_ratio(task: Dict[str, Any]) -> Tuple[float, int]:
++    turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++    total = int(len(turns))
++    if total <= 0:
++        return 0.0, 0
++    ack = 0
++    for t in turns:
++        if _canon_ack(str(t)) in ACK_LIKE:
++            ack += 1
++    ratio = float(ack) / float(total) if total else 0.0
++    return float(ratio), int(ack)
++
++
++def _load_tasks(path: Path) -> List[Dict[str, Any]]:
++    if not path.exists():
++        _fail(f"missing_tasks:{path}")
++    out: List[Dict[str, Any]] = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if isinstance(obj, dict):
++                out.append(dict(obj))
++    return out
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _smoke_once(*, out_dir: Path, tasks_path: Path, seed: int, top_n: int) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks_all = _load_tasks(tasks_path)
++    scored: List[Tuple[float, int, str, Dict[str, Any]]] = []
++    for t in tasks_all:
++        tid = str(t.get("task_id") or "")
++        ratio, ack = _ack_ratio(t)
++        scored.append((float(ratio), int(ack), str(tid), dict(t)))
++    # Hard gate uses the "most ack-like" tasks to stress consecutive_prefix2_repeat deterministically.
++    scored.sort(key=lambda x: (-float(x[0]), -int(x[1]), str(x[2])))
++    picked = [t for _, _, _, t in scored[: int(top_n)]]
++    if not picked:
++        _fail("no_tasks_picked")
++
++    tasks_ok = 0
++    task_rows: List[Dict[str, Any]] = []
++    for i, t in enumerate(picked):
++        tid = str(t.get("task_id") or "")
++        turns = t.get("user_turns") if isinstance(t.get("user_turns"), list) else []
++        task_dir = out_dir / f"task_{i:03d}_{tid[:12]}"
++        res = run_conversation_v119(user_turn_texts=[str(x) for x in turns], out_dir=str(task_dir), seed=int(seed))
++        fr = res.get("final_response_v119") if isinstance(res, dict) else {}
++        ok = bool(fr.get("ok", False)) if isinstance(fr, dict) else False
++        reason = str(fr.get("reason") or "") if isinstance(fr, dict) else "missing_final_response_v119"
++        if ok:
++            tasks_ok += 1
++        ratio, ack = _ack_ratio(t)
++        task_rows.append(
++            {
++                "task_id": str(tid),
++                "stress_turns": int(t.get("stress_turns", 0) or 0),
++                "ack_ratio": float(round(float(ratio), 6)),
++                "ack_count": int(ack),
++                "ok": bool(ok),
++                "reason": str(reason if not ok else "ok"),
++            }
++        )
++
++    eval_obj = {
++        "schema_version": 119,
++        "kind": "family7_hard_gate_eval_v119",
++        "seed": int(seed),
++        "tasks_total": int(len(picked)),
++        "tasks_ok": int(tasks_ok),
++        "picked_by": "ack_ratio_desc",
++        "tasks": list(task_rows),
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    core = {
++        "seed": int(seed),
++        "tasks_total": int(len(picked)),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": _sha256_file(out_dir / "eval.json"),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    summary = {"schema_version": 119, "kind": "family7_hard_gate_summary_v119", "core": dict(core), "summary_sha256": str(summary_sha256)}
++    _write_once_json(out_dir / "summary.json", summary)
++
++    if int(tasks_ok) != int(len(picked)):
++        _fail(f"hard_gate_failed:{tasks_ok}/{len(picked)}")
++    return {"core": dict(core), "summary_sha256": str(summary_sha256)}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--top_n", type=int, default=5)
++    args = ap.parse_args()
++
++    tasks_path = Path(str(args.tasks))
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++    top_n = int(args.top_n)
++
++    r1 = _smoke_once(out_dir=Path(out_base + "_try1"), tasks_path=tasks_path, seed=seed, top_n=top_n)
++    r2 = _smoke_once(out_dir=Path(out_base + "_try2"), tasks_path=tasks_path, seed=seed, top_n=top_n)
++
++    if canonical_json_dumps(r1["core"]) != canonical_json_dumps(r2["core"]):
++        _fail("determinism_core_mismatch")
++    if str(r1["summary_sha256"]) != str(r2["summary_sha256"]):
++        _fail("determinism_summary_sha256_mismatch")
++
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "determinism_ok": True,
++                "summary_sha256": str(r1["summary_sha256"]),
++                "out_try1": str(out_base + "_try1"),
++                "out_try2": str(out_base + "_try2"),
++            },
++            ensure_ascii=False,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-15 20:00:35
++++ tests/test_discourse_variants_v119.py	2026-01-15 19:43:17
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++import unittest
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.discourse_variants_v119 import (
++    choose_clarify_variant_v119,
++    prefix2_from_text_v119,
++)
++from atos_core.fluency_contract_v118 import fluency_contract_v118
++
++
++class TestDiscourseVariantsV119(unittest.TestCase):
++    def test_choose_deterministic(self) -> None:
++        ctx_sig = sha256_hex(canonical_json_dumps({"k": "ctx", "n": 1}).encode("utf-8"))
++        c1 = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2="", attempt_index=0)
++        c2 = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2="", attempt_index=0)
++        self.assertEqual(c1.choice_sig, c2.choice_sig)
++        self.assertEqual(c1.text, c2.text)
++
++    def test_avoids_prefix2_collision_when_possible(self) -> None:
++        ctx_sig = sha256_hex(canonical_json_dumps({"k": "ctx", "n": 2}).encode("utf-8"))
++        c1 = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2="", attempt_index=0)
++        lp2 = prefix2_from_text_v119(c1.text)
++        c2 = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2=lp2, attempt_index=0)
++        self.assertNotEqual(prefix2_from_text_v119(c2.text), lp2)
++
++    def test_bullet_collision_avoided(self) -> None:
++        # Find a context_sig that naturally selects a variant whose first token is "não".
++        found_ctx = ""
++        for i in range(500):
++            ctx_sig = sha256_hex(canonical_json_dumps({"search": i}).encode("utf-8"))
++            c = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2="", attempt_index=0)
++            toks = str(c.text).strip().lower().split()
++            if toks and toks[0] == "não":
++                found_ctx = str(ctx_sig)
++                break
++        self.assertTrue(found_ctx, "could not find a 'não' starter within bounded search")
++        # Now force bullet-style previous prefix2, which should avoid choosing a "não ..." starter.
++        c2 = choose_clarify_variant_v119(context_sig=found_ctx, last_prefix2="- não", attempt_index=0)
++        toks2 = str(c2.text).strip().lower().split()
++        self.assertTrue(toks2)
++        self.assertNotEqual(toks2[0], "não")
++
++    def test_ack_spam_sequence_passes_fluency_contract(self) -> None:
++        transcript = []
++        last_p2 = ""
++        for i in range(80):
++            transcript.append({"role": "user", "text": "ok"})
++            ctx_sig = sha256_hex(canonical_json_dumps({"turn": i}).encode("utf-8"))
++            c = choose_clarify_variant_v119(context_sig=ctx_sig, last_prefix2=last_p2, attempt_index=0)
++            transcript.append({"role": "assistant", "text": c.text})
++            last_p2 = prefix2_from_text_v119(c.text)
++        ok, reason, _details = fluency_contract_v118(transcript_view=transcript)
++        self.assertTrue(ok, reason)
++
++
++if __name__ == "__main__":
++    unittest.main()
++
+--- /dev/null	2026-01-15 20:00:35
++++ tests/test_world_manifest_resolver_v119.py	2026-01-15 19:43:17
+@@ -0,0 +1,46 @@
++from __future__ import annotations
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from atos_core.world_manifest_resolver_v119 import resolve_world_canonical_jsonl_v119
++
++
++class TestWorldManifestResolverV119(unittest.TestCase):
++    def test_resolves_v113_style_manifest(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            canon = root / "dialogue_history_canonical_v113.jsonl"
++            canon.write_text('{"global_turn_index":0,"role":"user","text":"hi"}\n', encoding="utf-8")
++            manifest = root / "dialogue_history_canonical_v113_manifest.json"
++            manifest.write_text(
++                json.dumps({"schema_version": 113, "paths": {"canonical_jsonl": "dialogue_history_canonical_v113.jsonl"}}, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            res = resolve_world_canonical_jsonl_v119(world_manifest_path=str(manifest), default_rel="dialogue_history_canonical_v113.jsonl")
++            self.assertTrue(res.get("ok"), res)
++            self.assertTrue(Path(str(res.get("canonical_jsonl_resolved"))).exists())
++
++    def test_resolves_v111_style_manifest_in_manifests_dir(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            (root / "dialogue_history_canonical").mkdir(parents=True, exist_ok=True)
++            canon = root / "dialogue_history_canonical" / "dialogue_history_canonical_v111.jsonl"
++            canon.write_text('{"global_turn_index":0,"role":"user","text":"hi"}\n', encoding="utf-8")
++            (root / "manifests").mkdir(parents=True, exist_ok=True)
++            manifest = root / "manifests" / "world_manifest_v111.json"
++            manifest.write_text(
++                json.dumps({"schema_version": 111, "paths": {"canonical_jsonl": "dialogue_history_canonical/dialogue_history_canonical_v111.jsonl"}}, sort_keys=True)
++                + "\n",
++                encoding="utf-8",
++            )
++            res = resolve_world_canonical_jsonl_v119(world_manifest_path=str(manifest), default_rel="dialogue_history_canonical_v113.jsonl")
++            self.assertTrue(res.get("ok"), res)
++            self.assertEqual(Path(str(res.get("canonical_jsonl_resolved"))), canon.resolve())
++
++
++if __name__ == "__main__":
++    unittest.main()
++

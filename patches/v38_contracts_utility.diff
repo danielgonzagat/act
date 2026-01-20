@@ -1,0 +1,20 @@
+--- patches/v38_base/engine.py	2026-01-10 21:25:51
++++ atos_core/engine.py	2026-01-10 21:28:51
+@@ -921,7 +921,7 @@
+                         m = re.search(r"(?i)\binclua\s+([A-Za-z0-9_-]+)\b", u)
+                         if m:
+                             tok = _strip_edge_punct(m.group(1))
+-                            if tok:
++                            if tok and re.fullmatch(r"[A-Z0-9_-]{2,}", tok) is not None:
+                                 contract_tokens = tokenize_text(tok)
+                                 contract_kind = "contains_token"
+                                 contract_reason = "include_token"
+@@ -929,6 +929,8 @@
+                                 contract_meta["kind"] = contract_kind
+                                 contract_meta["parsed_args"] = {"token": tok}
+                                 contract_meta["reason"] = contract_reason
++                            elif tok:
++                                contract_meta["reason"] = "include_token_rejected"
+ 
+         contract_active = bool(contract_tokens)
+ 

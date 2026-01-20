@@ -1,0 +1,87 @@
+--- /tmp/arc_inverse_v129_old.py	2026-01-17 16:54:07
++++ atos_core/arc_inverse_v129.py	2026-01-17 16:38:52
+@@ -392,6 +392,50 @@
+     return [InverseCandidateV129(op_name="tile", steps=(st,), cost_bits=int(cost), evidence=(("reps_h", int(reps_h)), ("reps_w", int(reps_w))),)]
+ 
+ 
++def inverse_propose_crop_bbox_v129(
++    *, inp: GridV124, out: GridV124, delta: DeltaEvidenceV129, bbox_exprs: Sequence[BboxExprV129]
++) -> List[InverseCandidateV129]:
++    if not delta.shape_changed:
++        return []
++    hi, wi = grid_shape_v124(inp)
++    ho, wo = grid_shape_v124(out)
++    if hi == 0 or wi == 0 or ho == 0 or wo == 0:
++        return []
++    if ho > hi or wo > wi:
++        return []
++    out_cands: List[InverseCandidateV129] = []
++    for expr in bbox_exprs:
++        try:
++            bb = _apply_steps_bbox_v129(expr.steps, inp)
++        except Exception:
++            continue
++        try:
++            patch = _apply_steps_v129(steps=list(expr.steps) + [{"op_id": "crop_bbox", "in_vars": ["gC", str(expr.bbox_var)], "out_var": "g1", "args": {}}], g_cur=inp)
++        except Exception:
++            continue
++        if not isinstance(patch, tuple):
++            continue
++        if not grid_equal_v124(patch, out):
++            continue
++        st = {"op_id": "crop_bbox", "in_vars": ["gC", str(expr.bbox_var)], "out_var": "g1", "args": {}}
++        steps = list(expr.steps) + [st]
++        cost = _program_cost_bits_v129(steps)
++        out_cands.append(
++            InverseCandidateV129(
++                op_name="crop_bbox",
++                steps=tuple(steps),
++                cost_bits=int(cost),
++                evidence=(
++                    ("bbox_expr_sig", str(expr.expr_sig())),
++                    ("in_shape", [int(hi), int(wi)]),
++                    ("out_shape", [int(ho), int(wo)]),
++                    ("bbox", list(bb.to_tuple())),
++                ),
++            )
++        )
++    out_cands.sort(key=lambda c: (int(c.cost_bits), str(c.candidate_sig())))
++    return out_cands
++
+ 
+ def inverse_propose_fill_rect_v129(
+     *, inp: GridV124, out: GridV124, delta: DeltaEvidenceV129, bbox_exprs: Sequence[BboxExprV129]
+@@ -738,6 +782,7 @@
+     cands.extend(inverse_propose_symmetry_v129(inp=inp, out=out))
+     cands.extend(inverse_propose_scale_up_v129(inp=inp, out=out))
+     cands.extend(inverse_propose_tile_v129(inp=inp, out=out))
++    cands.extend(inverse_propose_crop_bbox_v129(inp=inp, out=out, delta=delta, bbox_exprs=bbox_exprs))
+     cands.extend(inverse_propose_map_colors_v129(inp=inp, out=out))
+     cands.extend(inverse_propose_translate_v129(inp=inp, out=out, bg_candidates=bg_candidates))
+     cands.extend(inverse_propose_fill_rect_v129(inp=inp, out=out, delta=delta, bbox_exprs=bbox_exprs))
+
+--- /tmp/test_arc_inverse_v129_old.py	2026-01-17 16:54:07
++++ tests/test_arc_inverse_v129.py	2026-01-17 16:39:07
+@@ -68,6 +68,22 @@
+         got = _apply_steps_v129(list(cands[0].steps), inp)
+         self.assertTrue(grid_equal_v124(got, out))
+ 
++    def test_inverse_crop_bbox(self) -> None:
++        inp = grid_from_list_v124(
++            [
++                [0, 0, 0, 0],
++                [0, 1, 1, 0],
++                [0, 1, 1, 0],
++                [0, 0, 0, 0],
++            ]
++        )
++        out = grid_from_list_v124([[1, 1], [1, 1]])
++        cands, _trace = build_inverse_candidates_v129(inp=inp, out=out, selector_hypotheses=[])
++        crop = [c for c in cands if c.op_name == "crop_bbox"]
++        self.assertTrue(crop)
++        got = _apply_steps_v129(list(crop[0].steps), inp)
++        self.assertTrue(grid_equal_v124(got, out))
+ 
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,1385 @@
+--- /dev/null	2026-01-13 08:27:22
++++ atos_core/conversation_actions_v90.py	2026-01-13 08:18:57
+@@ -0,0 +1,180 @@
++from __future__ import annotations
++
++from typing import Any, Dict, List, Sequence
++
++from .act import Act, Instruction, deterministic_iso
++
++
++def make_action_concept_v90(
++    *,
++    act_id: str,
++    input_schema: Dict[str, str],
++    output_schema: Dict[str, str],
++    program: List[Instruction],
++    supports_goals_v89: Sequence[Dict[str, Any]],
++    created_step: int = 0,
++) -> Act:
++    return Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=int(created_step)),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence={
++            "interface": {
++                "input_schema": dict(input_schema),
++                "output_schema": dict(output_schema),
++                "validator_id": "",
++            },
++            "supports_goals_v89": [dict(x) for x in supports_goals_v89 if isinstance(x, dict)],
++            "action_v90": {"schema_version": 1, "action_id": str(act_id)},
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def action_concepts_for_dsl_v90(*, goal_ids: Dict[str, str]) -> List[Act]:
++    """
++    Deterministic set of language-as-action concepts for the V90 DSL harness.
++    goal_ids maps COMM_* -> goal_id string used in supports(G).
++    """
++    respond_gid = str(goal_ids.get("COMM_RESPOND") or "COMM_RESPOND")
++    ask_gid = str(goal_ids.get("COMM_ASK_CLARIFY") or "COMM_ASK_CLARIFY")
++    confirm_gid = str(goal_ids.get("COMM_CONFIRM") or "COMM_CONFIRM")
++    correct_gid = str(goal_ids.get("COMM_CORRECT") or "COMM_CORRECT")
++    summarize_gid = str(goal_ids.get("COMM_SUMMARIZE") or "COMM_SUMMARIZE")
++    admit_gid = str(goal_ids.get("COMM_ADMIT_UNKNOWN") or "COMM_ADMIT_UNKNOWN")
++    end_gid = str(goal_ids.get("COMM_END") or "COMM_END")
++
++    def _support(goal_id: str, *, prior_success: float, prior_cost: float, note: str = "") -> Dict[str, Any]:
++        return {
++            "goal_id": str(goal_id),
++            "prior_success": float(prior_success),
++            "prior_strength": 2,
++            "prior_cost": float(prior_cost),
++            "note": str(note),
++        }
++
++    acts: List[Act] = []
++
++    # EmitTextCSV_V90: out=text
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_emit_text_v0",
++            input_schema={"text": "str"},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "text", "out": "text"}),
++                Instruction("CSV_RETURN", {"var": "text"}),
++            ],
++            supports_goals_v89=[
++                _support(respond_gid, prior_success=0.9, prior_cost=2.0, note="emit"),
++                _support(summarize_gid, prior_success=0.9, prior_cost=2.0, note="emit"),
++                _support(confirm_gid, prior_success=0.9, prior_cost=2.0, note="emit"),
++            ],
++        )
++    )
++
++    # Confirm SET: "OK: " + k + "=" + v
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_confirm_set_v0",
++            input_schema={"k": "str", "v": "str"},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "k", "out": "k"}),
++                Instruction("CSV_GET_INPUT", {"name": "v", "out": "v"}),
++                Instruction("CSV_CONST", {"value": "OK: ", "out": "p"}),
++                Instruction("CSV_CONST", {"value": "=", "out": "eq"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["p", "k"], "out": "t0"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["t0", "eq"], "out": "t1"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["t1", "v"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(respond_gid, prior_success=0.9, prior_cost=8.0, note="set")],
++        )
++    )
++
++    # Emit SUM: "SUM=" + sum
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_emit_sum_v0",
++            input_schema={"sum": "str"},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "sum", "out": "sum"}),
++                Instruction("CSV_CONST", {"value": "SUM=", "out": "p"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["p", "sum"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(respond_gid, prior_success=0.9, prior_cost=4.0, note="sum")],
++        )
++    )
++
++    # AskClarification: "Qual é o valor de " + k + "?"
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_ask_clarify_v0",
++            input_schema={"k": "str"},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "k", "out": "k"}),
++                Instruction("CSV_CONST", {"value": "Qual é o valor de ", "out": "p"}),
++                Instruction("CSV_CONST", {"value": "?", "out": "q"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["p", "k"], "out": "t0"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["t0", "q"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(ask_gid, prior_success=0.9, prior_cost=6.0, note="clarify")],
++        )
++    )
++
++    # CorrectUser: "Comando inválido: " + msg
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_correct_user_v0",
++            input_schema={"msg": "str"},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "msg", "out": "msg"}),
++                Instruction("CSV_CONST", {"value": "Comando inválido: ", "out": "p"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["p", "msg"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(correct_gid, prior_success=0.9, prior_cost=4.0, note="correct")],
++        )
++    )
++
++    # AdmitUnknown: "Não sei."
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_admit_unknown_v0",
++            input_schema={},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_CONST", {"value": "Não sei.", "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(admit_gid, prior_success=0.9, prior_cost=2.0, note="unknown")],
++        )
++    )
++
++    # EndConversation: "Encerrado."
++    acts.append(
++        make_action_concept_v90(
++            act_id="concept_v90_end_conversation_v0",
++            input_schema={},
++            output_schema={"out": "str"},
++            program=[
++                Instruction("CSV_CONST", {"value": "Encerrado.", "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++            supports_goals_v89=[_support(end_gid, prior_success=0.9, prior_cost=2.0, note="end")],
++        )
++    )
++
++    return list(acts)
++
+--- /dev/null	2026-01-13 08:27:22
++++ atos_core/conversation_loop_v90.py	2026-01-13 08:25:42
+@@ -0,0 +1,690 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .conversation_actions_v90 import action_concepts_for_dsl_v90
++from .conversation_objectives_v90 import COMM_OBJECTIVES_V90, comm_objective_ids_v90, make_comm_objective_eq_text_v90
++from .conversation_v90 import (
++    ConversationStateV90,
++    TurnV90,
++    append_chained_jsonl_v90,
++    compute_state_chain_hash_v90,
++    compute_transcript_hash_v90,
++    normalize_text_v90,
++    text_sig_v90,
++    verify_chained_jsonl_v90,
++    verify_conversation_chain_v90,
++)
++from .goal_supports_v89 import (
++    SupportClaimV89,
++    fold_support_stats_v89,
++    list_supporting_concepts_for_goal_v89,
++    make_goal_support_evidence_event_v89,
++)
++from .objective_v88 import execute_objective_csv_v88
++from .engine_v80 import EngineV80
++from .store import ActStore
++
++
++def _fail(msg: str) -> None:
++    raise ValueError(msg)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"path_exists:{path}")
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return _sha256_canon(obj)
++
++
++TAIL_K_V90 = 6
++
++
++def _parse_user_command_v90(text: str) -> Dict[str, Any]:
++    """
++    Deterministic micro-DSL parser:
++      SET <k> <v>
++      GET <k>
++      ADD <a> <b>
++      SUMMARY
++      END
++    """
++    t = normalize_text_v90(text)
++    toks = [x for x in t.split(" ") if x]
++    if not toks:
++        return {"ok": False, "reason": "empty", "op": ""}
++    op = str(toks[0]).upper()
++    if op == "SET" and len(toks) >= 3:
++        return {"ok": True, "op": "SET", "k": str(toks[1]), "v": str(toks[2])}
++    if op == "GET" and len(toks) >= 2:
++        return {"ok": True, "op": "GET", "k": str(toks[1])}
++    if op == "ADD" and len(toks) >= 3:
++        return {"ok": True, "op": "ADD", "a": str(toks[1]), "b": str(toks[2])}
++    if op == "SUMMARY" and len(toks) == 1:
++        return {"ok": True, "op": "SUMMARY"}
++    if op == "END" and len(toks) == 1:
++        return {"ok": True, "op": "END"}
++    return {"ok": False, "reason": "bad_syntax", "op": str(op)}
++
++
++def _is_int_literal(s: str) -> bool:
++    ss = str(s or "")
++    return bool(ss) and ss.isdigit()
++
++
++def _get_int_from_binding(*, vars_map: Dict[str, Any], key: str, last_answer: Any) -> Tuple[Optional[int], str]:
++    k = str(key or "")
++    if _is_int_literal(k):
++        return int(k), "ok"
++    if k == "last_answer":
++        if isinstance(last_answer, bool) or last_answer is None:
++            return None, "missing_last_answer"
++        try:
++            return int(last_answer), "ok"
++        except Exception:
++            return None, "bad_last_answer"
++    if k in vars_map:
++        v = vars_map.get(k)
++        if isinstance(v, bool) or v is None:
++            return None, "missing_var"
++        try:
++            return int(v), "ok"
++        except Exception:
++            return None, "bad_var_type"
++    return None, "missing_key"
++
++
++def _summarize_bindings_v90(*, vars_map: Dict[str, Any], last_answer: Any) -> str:
++    parts: List[str] = []
++    for k in sorted(vars_map.keys(), key=str):
++        v = vars_map.get(k)
++        parts.append(f"{str(k)}={str(v)}")
++    if last_answer is not None and last_answer != "":
++        parts.append(f"last_answer={str(last_answer)}")
++    return "Resumo: " + "; ".join(parts)
++
++
++def _choose_objective_kind_v90(*, parsed: Dict[str, Any], vars_map: Dict[str, Any], last_answer: Any) -> Tuple[str, Dict[str, Any]]:
++    """
++    Deterministic objective selection (Rule 0..6).
++    Returns (objective_kind, ctx).
++    """
++    if not bool(parsed.get("ok", False)):
++        return "COMM_CORRECT", {"reason": str(parsed.get("reason") or "parse_fail"), "missing_key": ""}
++
++    op = str(parsed.get("op") or "")
++    if op == "SUMMARY":
++        return "COMM_SUMMARIZE", {"missing_key": ""}
++    if op == "END":
++        return "COMM_END", {"missing_key": ""}
++    if op == "GET":
++        k = str(parsed.get("k") or "")
++        if k not in vars_map:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(k)}
++        return "COMM_RESPOND", {"missing_key": ""}
++    if op == "SET":
++        return "COMM_RESPOND", {"missing_key": ""}
++    if op == "ADD":
++        a = str(parsed.get("a") or "")
++        b = str(parsed.get("b") or "")
++        va, ra = _get_int_from_binding(vars_map=vars_map, key=a, last_answer=last_answer)
++        if va is None:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(a), "reason": str(ra)}
++        vb, rb = _get_int_from_binding(vars_map=vars_map, key=b, last_answer=last_answer)
++        if vb is None:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(b), "reason": str(rb)}
++        return "COMM_RESPOND", {"missing_key": ""}
++    return "COMM_ADMIT_UNKNOWN", {"missing_key": "", "reason": "no_rule"}
++
++
++def _build_expected_and_action_inputs_v90(
++    *,
++    objective_kind: str,
++    parsed: Dict[str, Any],
++    vars_map: Dict[str, Any],
++    last_answer: Any,
++    missing_key: str,
++) -> Tuple[str, Dict[str, Any], str]:
++    """
++    Returns (expected_text, action_inputs, preferred_action_id_hint).
++    """
++    ok = bool(parsed.get("ok", False))
++    op = str(parsed.get("op") or "")
++    if objective_kind == "COMM_CORRECT":
++        msg = normalize_text_v90(str(parsed.get("op") or "") + ":" + str(parsed.get("reason") or ""))
++        return f"Comando inválido: {msg}", {"msg": msg}, "concept_v90_correct_user_v0"
++    if objective_kind == "COMM_ADMIT_UNKNOWN":
++        return "Não sei.", {}, "concept_v90_admit_unknown_v0"
++    if objective_kind == "COMM_END":
++        return "Encerrado.", {}, "concept_v90_end_conversation_v0"
++    if objective_kind == "COMM_ASK_CLARIFY":
++        k = str(missing_key or "")
++        return f"Qual é o valor de {k}?", {"k": k}, "concept_v90_ask_clarify_v0"
++    if objective_kind == "COMM_SUMMARIZE":
++        summ = _summarize_bindings_v90(vars_map=vars_map, last_answer=last_answer)
++        return summ, {"text": summ}, "concept_v90_emit_text_v0"
++    if objective_kind == "COMM_CONFIRM":
++        t = normalize_text_v90(str(parsed.get("raw") or ""))
++        return f"Entendi: {t}", {"text": f"Entendi: {t}"}, "concept_v90_emit_text_v0"
++
++    # COMM_RESPOND
++    if ok and op == "SET":
++        k = str(parsed.get("k") or "")
++        v = str(parsed.get("v") or "")
++        return f"OK: {k}={v}", {"k": k, "v": v}, "concept_v90_confirm_set_v0"
++    if ok and op == "GET":
++        k = str(parsed.get("k") or "")
++        v = vars_map.get(k)
++        return f"{k}={v}", {"text": f"{k}={v}"}, "concept_v90_emit_text_v0"
++    if ok and op == "ADD":
++        a = str(parsed.get("a") or "")
++        b = str(parsed.get("b") or "")
++        va, _ = _get_int_from_binding(vars_map=vars_map, key=a, last_answer=last_answer)
++        vb, _ = _get_int_from_binding(vars_map=vars_map, key=b, last_answer=last_answer)
++        s = int(va or 0) + int(vb or 0)
++        return f"SUM={s}", {"sum": str(s)}, "concept_v90_emit_sum_v0"
++    return "Não sei.", {}, "concept_v90_admit_unknown_v0"
++
++
++def _rank_action_candidates_v90(
++    *,
++    candidates: Sequence[Tuple[str, SupportClaimV89]],
++    events: Sequence[Dict[str, Any]],
++    goal_id: str,
++) -> List[Tuple[str, SupportClaimV89, float, float]]:
++    scored: List[Tuple[str, SupportClaimV89, float, float]] = []
++    for act_id, claim in candidates:
++        stats = fold_support_stats_v89(events=events, goal_id=str(goal_id), concept_key=str(act_id), claim=claim)
++        scored.append((str(act_id), claim, float(stats.expected_success), float(stats.expected_cost)))
++    # Deterministic ordering: expected_success desc, expected_cost asc, act_id asc.
++    scored.sort(key=lambda t: (-float(t[2]), float(t[3]), str(t[0])))
++    return scored
++
++
++def run_conversation_v90(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++) -> Dict[str, Any]:
++    ensure_absent(str(out_dir))
++    os.makedirs(str(out_dir), exist_ok=False)
++
++    # Artifacts (WORM write-once; jsonl append-only hash-chained).
++    store_path = os.path.join(str(out_dir), "store.jsonl")
++    turns_path = os.path.join(str(out_dir), "conversation_turns.jsonl")
++    states_path = os.path.join(str(out_dir), "conversation_states.jsonl")
++    trials_path = os.path.join(str(out_dir), "dialogue_trials.jsonl")
++    evals_path = os.path.join(str(out_dir), "objective_evals.jsonl")
++    transcript_path = os.path.join(str(out_dir), "transcript.jsonl")
++    summary_path = os.path.join(str(out_dir), "summary.json")
++    verify_path = os.path.join(str(out_dir), "verify_chain_v90.json")
++    manifest_path = os.path.join(str(out_dir), "freeze_manifest_v90.json")
++
++    store = ActStore()
++
++    # Objective acts (communicative).
++    obj_ids = comm_objective_ids_v90()
++    for okind, oid in sorted(obj_ids.items(), key=lambda kv: str(kv[0])):
++        store.add(make_comm_objective_eq_text_v90(objective_id=str(oid), objective_kind=str(okind), created_step=0))
++
++    # Action concept acts.
++    goal_ids = {k: str(k) for k in COMM_OBJECTIVES_V90}
++    for act in action_concepts_for_dsl_v90(goal_ids=goal_ids):
++        store.add(act)
++
++    # WORM store snapshot.
++    if os.path.exists(store_path):
++        _fail(f"store_path_exists:{store_path}")
++    store.save_jsonl(store_path)
++    store_hash = store.content_hash()
++
++    engine = EngineV80(store, seed=int(seed))
++
++    # Conversation identity (deterministic).
++    conversation_id = f"conv_v90_{sha256_hex(canonical_json_dumps(list(user_turn_texts)).encode('utf-8'))}"
++
++    # Runtime state (explicit bindings).
++    vars_map: Dict[str, Any] = {}
++    last_answer: Any = ""
++
++    turns: List[Dict[str, Any]] = []
++    states: List[Dict[str, Any]] = []
++    transcript: List[Dict[str, Any]] = []
++
++    prev_turns_hash: Optional[str] = None
++    prev_states_hash: Optional[str] = None
++    prev_trials_hash: Optional[str] = None
++    prev_evals_hash: Optional[str] = None
++    prev_transcript_hash: Optional[str] = None
++
++    support_events: List[Dict[str, Any]] = []
++
++    prev_state_id = ""
++    turn_index = 0
++    state_index = 0
++    step = 0
++
++    for user_text in list(user_turn_texts):
++        # (1) observe_turn(user)
++        ut = TurnV90(
++            conversation_id=str(conversation_id),
++            turn_index=int(turn_index),
++            role="user",
++            text=str(user_text),
++            created_step=int(step),
++            offset_us=0,
++        ).to_dict()
++        turn_index += 1
++        step += 1
++        turns.append(dict(ut))
++        prev_turns_hash = append_chained_jsonl_v90(
++            turns_path,
++            {"time": deterministic_iso(step=int(ut["created_step"])), "step": int(ut["created_step"]), "event": "TURN", "payload": dict(ut)},
++            prev_hash=prev_turns_hash,
++        )
++        transcript.append({"role": "user", "text": str(ut.get("text") or ""), "turn_id": str(ut.get("turn_id") or "")})
++        prev_transcript_hash = append_chained_jsonl_v90(
++            transcript_path,
++            {"time": deterministic_iso(step=int(ut["created_step"])), "step": int(ut["created_step"]), "event": "UTTERANCE", "payload": dict(transcript[-1])},
++            prev_hash=prev_transcript_hash,
++        )
++
++        # (2) update bindings deterministically.
++        parsed = _parse_user_command_v90(str(user_text))
++        missing_key = ""
++        if bool(parsed.get("ok", False)) and str(parsed.get("op") or "") == "SET":
++            k = str(parsed.get("k") or "")
++            v = str(parsed.get("v") or "")
++            vars_map[str(k)] = v if not _is_int_literal(v) else int(v)
++        # For ADD/GET missing, we only set missing_key later.
++
++        # (3) choose objective
++        objective_kind, ctx = _choose_objective_kind_v90(parsed=parsed, vars_map=dict(vars_map), last_answer=last_answer)
++        if objective_kind == "COMM_ASK_CLARIFY":
++            missing_key = str(ctx.get("missing_key") or "")
++
++        # (4) choose action concept supporting objective
++        goal_id = str(objective_kind)
++        candidates = list_supporting_concepts_for_goal_v89(store=store, goal_id=str(goal_id))
++        ranked = _rank_action_candidates_v90(candidates=candidates, events=support_events, goal_id=str(goal_id))
++
++        # (5) build expected text and action inputs
++        expected_text, action_inputs, hint_action_id = _build_expected_and_action_inputs_v90(
++            objective_kind=str(objective_kind),
++            parsed=dict(parsed, raw=str(user_text)),
++            vars_map=dict(vars_map),
++            last_answer=last_answer,
++            missing_key=str(missing_key),
++        )
++        expected_sig = text_sig_v90(expected_text)
++
++        # Fallback cascade if no candidates: ask_clarify -> admit_unknown -> end
++        fallback_order = ["COMM_ASK_CLARIFY", "COMM_ADMIT_UNKNOWN", "COMM_END"]
++        tried_objectives: List[str] = []
++
++        def _objective_act_id(okind: str) -> str:
++            return str(obj_ids.get(okind) or "")
++
++        def _execute_action(act_id: str, inputs: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], float]:
++            concept_act = store.get_concept_act(str(act_id))
++            if concept_act is None:
++                return False, "", {"ok": False, "reason": "action_not_found"}, 0.0
++            iface = concept_act.evidence.get("interface") if isinstance(concept_act.evidence, dict) else {}
++            in_schema = iface.get("input_schema") if isinstance(iface, dict) else {}
++            in_schema = in_schema if isinstance(in_schema, dict) else {}
++            inps: Dict[str, Any] = {}
++            for k in sorted(in_schema.keys(), key=str):
++                ks = str(k)
++                val = inputs.get(ks)
++                if isinstance(in_schema.get(k), str) and str(in_schema.get(k)) == "str":
++                    inps[ks] = "" if val is None else str(val)
++                else:
++                    inps[ks] = val
++            exec_res = engine.execute_concept_csv(
++                concept_act_id=str(act_id),
++                inputs=dict(inps),
++                goal_kind=str(objective_kind),
++                expected=None,
++                step=int(step),
++                max_depth=6,
++                max_events=256,
++                validate_output=False,
++            )
++            meta = exec_res.get("meta") if isinstance(exec_res.get("meta"), dict) else {}
++            if not bool(meta.get("ok", False)):
++                return False, "", dict(meta), 0.0
++            out_text = str(meta.get("output_text") or exec_res.get("output") or "")
++            trace = exec_res.get("trace") if isinstance(exec_res.get("trace"), dict) else {}
++            calls = trace.get("concept_calls") if isinstance(trace.get("concept_calls"), list) else []
++            cost_used = 0.0
++            for c in calls:
++                if not isinstance(c, dict):
++                    continue
++                try:
++                    cost_used += float(c.get("cost", 0.0) or 0.0)
++                except Exception:
++                    pass
++            return True, str(out_text), dict(meta), float(cost_used)
++
++        assistant_text = ""
++        chosen_action_id = ""
++        chosen_objective_id = _objective_act_id(str(objective_kind))
++        eval_row: Dict[str, Any] = {}
++        trial_row: Dict[str, Any] = {}
++
++        def _try_objective_and_actions(okind: str) -> bool:
++            nonlocal assistant_text, chosen_action_id, chosen_objective_id, eval_row, trial_row, expected_text, expected_sig, action_inputs, hint_action_id, objective_kind
++            objective_kind = str(okind)
++            chosen_objective_id = _objective_act_id(str(okind))
++            # Rebuild expected/action inputs for fallback objective kinds.
++            expected_text, action_inputs, hint_action_id = _build_expected_and_action_inputs_v90(
++                objective_kind=str(okind),
++                parsed=dict(parsed, raw=str(user_text)),
++                vars_map=dict(vars_map),
++                last_answer=last_answer,
++                missing_key=str(missing_key),
++            )
++            expected_sig = text_sig_v90(expected_text)
++
++            cand2 = list_supporting_concepts_for_goal_v89(store=store, goal_id=str(okind))
++            ranked2 = _rank_action_candidates_v90(candidates=cand2, events=support_events, goal_id=str(okind))
++            # Hint: prefer matching action id first if present.
++            ordered_action_ids: List[str] = []
++            if hint_action_id:
++                ordered_action_ids.append(str(hint_action_id))
++            for aid, _cl, _es, _ec in ranked2:
++                if str(aid) not in set(ordered_action_ids):
++                    ordered_action_ids.append(str(aid))
++
++            for act_id in ordered_action_ids:
++                ok_exec, out_text, meta, cost_used = _execute_action(str(act_id), dict(action_inputs))
++                action_sig = text_sig_v90(out_text)
++                eval_id = _stable_hash_obj(
++                    {
++                        "objective_id": str(chosen_objective_id),
++                        "objective_kind": str(okind),
++                        "act_id": str(act_id),
++                        "expected_sig": str(expected_sig),
++                        "output_sig": str(action_sig),
++                    }
++                )
++                if not ok_exec:
++                    verdict_ok = False
++                    verdict = {"ok": False, "score": 0, "reason": f"action_exec_failed:{str(meta.get('reason') or '')}", "details": {"meta": dict(meta)}}
++                else:
++                    # (6) evaluate assistant_text with objective CSV
++                    verdict_obj = execute_objective_csv_v88(
++                        store=store,
++                        seed=int(seed),
++                        objective_act_id=str(chosen_objective_id),
++                        inputs={"__output": str(out_text), "expected": str(expected_text)},
++                        step=int(step),
++                        goal_kind=str(okind),
++                    )
++                    verdict = verdict_obj.to_dict()
++                    verdict_ok = bool(verdict_obj.ok)
++
++                # (7) record eval + trial (WORM)
++                eval_row = {
++                    "kind": "objective_eval_v90",
++                    "time": deterministic_iso(step=int(step)),
++                    "step": int(step),
++                    "eval_id": str(eval_id),
++                    "objective_kind": str(okind),
++                    "objective_id": str(chosen_objective_id),
++                    "expected_text_sig": str(expected_sig),
++                    "output_text_sig": str(action_sig),
++                    "verdict": dict(verdict),
++                }
++                nonlocal prev_evals_hash
++                prev_evals_hash = append_chained_jsonl_v90(evals_path, dict(eval_row), prev_hash=prev_evals_hash)
++
++                trial_id = _stable_hash_obj(
++                    {
++                        "conversation_id": str(conversation_id),
++                        "step": int(step),
++                        "objective_kind": str(okind),
++                        "objective_id": str(chosen_objective_id),
++                        "act_id": str(act_id),
++                        "eval_id": str(eval_id),
++                    }
++                )
++                trial_row = {
++                    "kind": "dialogue_trial_v90",
++                    "time": deterministic_iso(step=int(step)),
++                    "step": int(step),
++                    "trial_id": str(trial_id),
++                    "conversation_id": str(conversation_id),
++                    "objective_kind": str(okind),
++                    "objective_id": str(chosen_objective_id),
++                    "action_concept_id": str(act_id),
++                    "expected_text": str(expected_text),
++                    "expected_text_sig": str(expected_sig),
++                    "assistant_text": str(out_text),
++                    "assistant_text_sig": str(action_sig),
++                    "ok": bool(verdict_ok),
++                    "cost_used": float(cost_used),
++                }
++                nonlocal prev_trials_hash
++                prev_trials_hash = append_chained_jsonl_v90(trials_path, dict(trial_row), prev_hash=prev_trials_hash)
++
++                # Also append a supports(G) evidence event for scoring (V89-compatible schema).
++                support_ev = make_goal_support_evidence_event_v89(
++                    step=int(step),
++                    goal_id=str(okind),
++                    concept_key=str(act_id),
++                    attempt_id=str(trial_id),
++                    ok=bool(verdict_ok),
++                    cost_used=float(cost_used),
++                    note=str(verdict.get("reason") or ""),
++                )
++                support_events.append(dict(support_ev))
++
++                if verdict_ok and ok_exec:
++                    assistant_text = str(out_text)
++                    chosen_action_id = str(act_id)
++                    return True
++            return False
++
++        ok_done = _try_objective_and_actions(str(objective_kind))
++        tried_objectives.append(str(objective_kind))
++        if not ok_done:
++            for fb in fallback_order:
++                if fb in set(tried_objectives):
++                    continue
++                ok_done = _try_objective_and_actions(str(fb))
++                tried_objectives.append(str(fb))
++                if ok_done:
++                    break
++
++        if not ok_done:
++            # Last resort: end.
++            _try_objective_and_actions("COMM_END")
++
++        # Update last_answer deterministically from ADD success.
++        if bool(parsed.get("ok", False)) and str(parsed.get("op") or "") == "ADD" and assistant_text.startswith("SUM="):
++            try:
++                last_answer = int(assistant_text.split("=", 1)[1])
++            except Exception:
++                pass
++
++        # (9) create assistant turn
++        at = TurnV90(
++            conversation_id=str(conversation_id),
++            turn_index=int(turn_index),
++            role="assistant",
++            text=str(assistant_text),
++            created_step=int(step),
++            offset_us=1,
++            objective_id=str(chosen_objective_id),
++            action_concept_id=str(chosen_action_id),
++            eval_id=str(eval_row.get("eval_id") or ""),
++        ).to_dict()
++        turn_index += 1
++        step += 1
++        turns.append(dict(at))
++        prev_turns_hash = append_chained_jsonl_v90(
++            turns_path,
++            {"time": deterministic_iso(step=int(at["created_step"])), "step": int(at["created_step"]), "event": "TURN", "payload": dict(at)},
++            prev_hash=prev_turns_hash,
++        )
++        transcript.append({"role": "assistant", "text": str(at.get("text") or ""), "turn_id": str(at.get("turn_id") or "")})
++        prev_transcript_hash = append_chained_jsonl_v90(
++            transcript_path,
++            {"time": deterministic_iso(step=int(at["created_step"])), "step": int(at["created_step"]), "event": "UTTERANCE", "payload": dict(transcript[-1])},
++            prev_hash=prev_transcript_hash,
++        )
++
++        # (10) create new conversation state
++        end_idx = int(turn_index) - 1
++        start_idx = max(0, end_idx - (TAIL_K_V90 - 1))
++        tail_turn_ids = [str(turns[i]["turn_id"]) for i in range(start_idx, end_idx + 1)]
++        st = ConversationStateV90(
++            conversation_id=str(conversation_id),
++            state_index=int(state_index),
++            prev_state_id=str(prev_state_id),
++            active_goals=[],
++            bindings={
++                "vars": {str(k): vars_map.get(k) for k in sorted(vars_map.keys(), key=str)},
++                "last_answer": last_answer,
++                "last_command": str(parsed.get("op") or ""),
++                "missing_key": str(missing_key),
++                "last_user_text": normalize_text_v90(str(user_text)),
++                "last_assistant_text": str(assistant_text),
++            },
++            tail_turn_ids=list(tail_turn_ids),
++            last_user_turn_id=str(ut.get("turn_id") or ""),
++            last_assistant_turn_id=str(at.get("turn_id") or ""),
++            created_step=int(step),
++            last_step=int(step),
++        ).to_dict()
++        state_index += 1
++        step += 1
++        prev_state_id = str(st.get("state_id") or "")
++        states.append(dict(st))
++        prev_states_hash = append_chained_jsonl_v90(
++            states_path,
++            {"time": deterministic_iso(step=int(st["created_step"])), "step": int(st["created_step"]), "event": "STATE", "payload": dict(st)},
++            prev_hash=prev_states_hash,
++        )
++
++        if normalize_text_v90(str(user_text)).upper() == "END":
++            break
++
++    # Verify chains and invariants.
++    chains = {
++        "turns_chain_ok": bool(verify_chained_jsonl_v90(turns_path)),
++        "states_chain_ok": bool(verify_chained_jsonl_v90(states_path)),
++        "trials_chain_ok": bool(verify_chained_jsonl_v90(trials_path)),
++        "evals_chain_ok": bool(verify_chained_jsonl_v90(evals_path)),
++        "transcript_chain_ok": bool(verify_chained_jsonl_v90(transcript_path)),
++    }
++    ok_chain, chain_reason, chain_details = verify_conversation_chain_v90(
++        turns=list(turns), states=list(states), tail_k=int(TAIL_K_V90)
++    )
++
++    transcript_hash = compute_transcript_hash_v90(turns)
++    state_chain_hash = compute_state_chain_hash_v90(states)
++
++    verify_obj = {
++        "ok": bool(all(chains.values())) and bool(ok_chain),
++        "chains": dict(chains),
++        "chain_invariants": {"ok": bool(ok_chain), "reason": str(chain_reason), "details": dict(chain_details)},
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++    }
++    tmp = verify_path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(verify_obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, verify_path)
++
++    # Freeze manifest per try (used for determinism checks).
++    manifest_core = {
++        "schema_version": 1,
++        "conversation_id": str(conversation_id),
++        "seed": int(seed),
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "verify_ok": bool(verify_obj.get("ok", False)),
++        "sha256": {
++            "store_jsonl": str(sha256_file(store_path)),
++            "conversation_turns_jsonl": str(sha256_file(turns_path)),
++            "conversation_states_jsonl": str(sha256_file(states_path)),
++            "dialogue_trials_jsonl": str(sha256_file(trials_path)),
++            "objective_evals_jsonl": str(sha256_file(evals_path)),
++            "transcript_jsonl": str(sha256_file(transcript_path)),
++            "verify_chain_v90_json": str(sha256_file(verify_path)),
++        },
++    }
++    tmp2 = manifest_path + ".tmp"
++    with open(tmp2, "w", encoding="utf-8") as f:
++        f.write(json.dumps(manifest_core, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp2, manifest_path)
++    ledger_hash = sha256_file(manifest_path)
++
++    # Summary (deterministic, no paths).
++    core = {
++        "schema_version": 1,
++        "seed": int(seed),
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "ledger_hash": str(ledger_hash),
++        "turns_total": int(len(turns)),
++        "states_total": int(len(states)),
++        "verify_ok": bool(verify_obj.get("ok", False)),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    summary = dict(core, summary_sha256=str(summary_sha256))
++    tmp3 = summary_path + ".tmp"
++    with open(tmp3, "w", encoding="utf-8") as f:
++        f.write(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp3, summary_path)
++
++    return {
++        "schema_version": 1,
++        "out_dir": str(out_dir),
++        "conversation_id": str(conversation_id),
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "ledger_hash": str(ledger_hash),
++        "summary_sha256": str(summary_sha256),
++        "paths": {
++            "store_jsonl": str(store_path),
++            "turns_jsonl": str(turns_path),
++            "states_jsonl": str(states_path),
++            "trials_jsonl": str(trials_path),
++            "evals_jsonl": str(evals_path),
++            "transcript_jsonl": str(transcript_path),
++            "verify_json": str(verify_path),
++            "manifest_json": str(manifest_path),
++            "summary_json": str(summary_path),
++        },
++    }
+--- /dev/null	2026-01-13 08:27:22
++++ atos_core/conversation_objectives_v90.py	2026-01-13 08:18:22
+@@ -0,0 +1,59 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .act import Act, Instruction, deterministic_iso
++from .objective_v88 import OBJECTIVE_KIND_V88, ensure_objective_primitives_registered_v88
++
++
++COMM_OBJECTIVES_V90 = (
++    "COMM_RESPOND",
++    "COMM_ASK_CLARIFY",
++    "COMM_CONFIRM",
++    "COMM_CORRECT",
++    "COMM_SUMMARIZE",
++    "COMM_ADMIT_UNKNOWN",
++    "COMM_END",
++)
++
++
++def make_comm_objective_eq_text_v90(*, objective_id: str, objective_kind: str, created_step: int = 0) -> Act:
++    """
++    Deterministic communicative objective: verify that __output == expected.
++    Returns ObjectiveVerdict-shaped dict via objective_eq_text_v88 primitive.
++    """
++    ensure_objective_primitives_registered_v88()
++    prog = [
++        Instruction("CSV_GET_INPUT", {"name": "__output", "out": "__output"}),
++        Instruction("CSV_GET_INPUT", {"name": "expected", "out": "expected"}),
++        Instruction("CSV_PRIMITIVE", {"fn": "objective_eq_text_v88", "in": ["__output", "expected"], "out": "verdict"}),
++        Instruction("CSV_RETURN", {"var": "verdict"}),
++    ]
++    iface = {
++        "input_schema": {"__output": "str", "expected": "str"},
++        "output_schema": {"verdict": "dict"},
++        "validator_id": "",
++    }
++    return Act(
++        id=str(objective_id),
++        version=1,
++        created_at=deterministic_iso(step=int(created_step)),
++        kind=OBJECTIVE_KIND_V88,  # type: ignore[assignment]
++        match={},
++        program=list(prog),
++        evidence={
++            "interface": dict(iface),
++            "objective_v90": {"schema_version": 1, "objective_kind": str(objective_kind)},
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def comm_objective_ids_v90() -> Dict[str, str]:
++    """
++    Stable mapping objective_kind -> objective_act_id.
++    """
++    return {k: f"objective_v90_{k.lower()}" for k in COMM_OBJECTIVES_V90}
++
+--- /dev/null	2026-01-13 08:27:22
++++ atos_core/conversation_v90.py	2026-01-13 08:18:11
+@@ -0,0 +1,307 @@
++from __future__ import annotations
++
++import copy
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _safe_deepcopy(obj: Any) -> Any:
++    try:
++        return copy.deepcopy(obj)
++    except Exception:
++        if isinstance(obj, dict):
++            return dict(obj)
++        if isinstance(obj, list):
++            return list(obj)
++        return obj
++
++
++def normalize_text_v90(text: str) -> str:
++    # Deterministic normalization without changing meaning for our DSL harness.
++    return str(text or "").replace("\r\n", "\n").strip()
++
++
++def text_sig_v90(text: str) -> str:
++    return sha256_hex(normalize_text_v90(text).encode("utf-8"))
++
++
++def turn_id_v90(*, conversation_id: str, turn_index: int, role: str, text_sig: str) -> str:
++    body = {
++        "conversation_id": str(conversation_id),
++        "turn_index": int(turn_index),
++        "role": str(role),
++        "text_sig": str(text_sig),
++    }
++    return f"turn_v90_{_stable_hash_obj(body)}"
++
++
++@dataclass(frozen=True)
++class TurnV90:
++    conversation_id: str
++    turn_index: int
++    role: str  # "user" | "assistant"
++    text: str
++    created_step: int
++    offset_us: int = 0
++    objective_id: str = ""
++    action_concept_id: str = ""
++    eval_id: str = ""
++
++    def to_dict(self) -> Dict[str, Any]:
++        text_norm = normalize_text_v90(self.text)
++        sig = text_sig_v90(text_norm)
++        tid = turn_id_v90(
++            conversation_id=str(self.conversation_id),
++            turn_index=int(self.turn_index),
++            role=str(self.role),
++            text_sig=str(sig),
++        )
++        return {
++            "kind": "turn_v90",
++            "turn_id": str(tid),
++            "conversation_id": str(self.conversation_id),
++            "turn_index": int(self.turn_index),
++            "role": str(self.role),
++            "text": str(text_norm),
++            "text_sig": str(sig),
++            "created_step": int(self.created_step),
++            "created_at": deterministic_iso(step=int(self.created_step), offset_us=int(self.offset_us)),
++            "refs": {
++                "objective_id": str(self.objective_id or ""),
++                "action_concept_id": str(self.action_concept_id or ""),
++                "eval_id": str(self.eval_id or ""),
++            },
++        }
++
++
++def _canon_bindings(bindings: Any) -> Dict[str, Any]:
++    if not isinstance(bindings, dict):
++        return {}
++    # Deterministic: sort keys, deep-copy JSON-safe leaves.
++    out: Dict[str, Any] = {}
++    for k in sorted(bindings.keys(), key=str):
++        key = str(k)
++        v = bindings.get(k)
++        out[key] = _safe_deepcopy(v)
++    return out
++
++
++def _canon_str_list(items: Any) -> List[str]:
++    if not isinstance(items, list):
++        return []
++    out: List[str] = []
++    for x in items:
++        if isinstance(x, str) and x:
++            out.append(x)
++    # unique+sorted
++    return sorted(set(out))
++
++
++def state_sig_v90(state_sem_sig: Dict[str, Any]) -> str:
++    return sha256_hex(canonical_json_dumps(state_sem_sig).encode("utf-8"))
++
++
++def state_id_v90(state_sig: str) -> str:
++    return f"conversation_state_v90_{str(state_sig)}"
++
++
++@dataclass(frozen=True)
++class ConversationStateV90:
++    conversation_id: str
++    state_index: int
++    prev_state_id: str
++    active_goals: List[str]
++    bindings: Dict[str, Any]
++    tail_turn_ids: List[str]
++    last_user_turn_id: str
++    last_assistant_turn_id: str
++    created_step: int
++    last_step: int
++
++    def to_dict(self) -> Dict[str, Any]:
++        sem = {
++            "schema_version": 1,
++            "conversation_id": str(self.conversation_id),
++            "state_index": int(self.state_index),
++            "prev_state_id": str(self.prev_state_id or ""),
++            "active_goals": _canon_str_list(self.active_goals),
++            "bindings": _canon_bindings(self.bindings),
++            "tail_turn_ids": list(self.tail_turn_ids),
++            "last_user_turn_id": str(self.last_user_turn_id or ""),
++            "last_assistant_turn_id": str(self.last_assistant_turn_id or ""),
++            "created_step": int(self.created_step),
++            "last_step": int(self.last_step),
++            "invariants": {"schema_version": 1, "tail_k_fixed": True},
++        }
++        sig = state_sig_v90(sem)
++        sid = state_id_v90(sig)
++        return dict(sem, state_sig=str(sig), state_id=str(sid))
++
++
++def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
++    if not os.path.exists(path):
++        return iter(())
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            yield json.loads(line)
++
++
++def append_chained_jsonl_v90(path: str, entry: Dict[str, Any], *, prev_hash: Optional[str]) -> str:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    body = dict(entry)
++    body["prev_hash"] = prev_hash
++    entry_hash = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    body["entry_hash"] = entry_hash
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(body))
++        f.write("\n")
++    return entry_hash
++
++
++def verify_chained_jsonl_v90(path: str) -> bool:
++    prev: Optional[str] = None
++    for row in _read_jsonl(path):
++        row = dict(row)
++        entry_hash = row.pop("entry_hash", None)
++        if row.get("prev_hash") != prev:
++            return False
++        expected = sha256_hex(canonical_json_dumps(row).encode("utf-8"))
++        if expected != entry_hash:
++            return False
++        prev = str(entry_hash)
++    return True
++
++
++def compute_transcript_hash_v90(turns: Sequence[Dict[str, Any]]) -> str:
++    # Deterministic: sort by turn_index.
++    items: List[Dict[str, Any]] = []
++    for t in turns:
++        if not isinstance(t, dict):
++            continue
++        items.append({"turn_index": int(t.get("turn_index", 0) or 0), "role": str(t.get("role") or ""), "text": str(t.get("text") or "")})
++    items.sort(key=lambda r: int(r.get("turn_index", 0) or 0))
++    view = [{"role": str(r.get("role") or ""), "text": str(r.get("text") or "")} for r in items]
++    return sha256_hex(canonical_json_dumps(view).encode("utf-8"))
++
++
++def compute_state_chain_hash_v90(states: Sequence[Dict[str, Any]]) -> str:
++    sigs: List[str] = []
++    for s in states:
++        if not isinstance(s, dict):
++            continue
++        sigs.append(str(s.get("state_sig") or ""))
++    return sha256_hex(canonical_json_dumps(sigs).encode("utf-8"))
++
++
++def verify_conversation_chain_v90(
++    *,
++    turns: Sequence[Dict[str, Any]],
++    states: Sequence[Dict[str, Any]],
++    tail_k: int,
++) -> Tuple[bool, str, Dict[str, Any]]:
++    """
++    Verify state-chain invariants (fail-closed, deterministic).
++    Returns (ok, reason, details).
++    """
++    tmap: Dict[str, Dict[str, Any]] = {}
++    by_index: Dict[int, Dict[str, Any]] = {}
++    for t in turns:
++        if not isinstance(t, dict):
++            continue
++        tid = str(t.get("turn_id") or "")
++        if tid:
++            tmap[tid] = dict(t)
++        try:
++            idx = int(t.get("turn_index", 0) or 0)
++            by_index[idx] = dict(t)
++        except Exception:
++            pass
++
++    if not states:
++        return False, "missing_states", {}
++
++    prev_state_id = ""
++    prev_created_step = -1
++    for i, s in enumerate(states):
++        if not isinstance(s, dict):
++            return False, "state_not_dict", {"index": int(i)}
++        if int(s.get("state_index", -1) or -1) != int(i):
++            return False, "state_index_not_incrementing", {"index": int(i), "got": s.get("state_index")}
++        if i == 0:
++            if str(s.get("prev_state_id") or "") not in ("", "None"):
++                return False, "genesis_prev_state_not_empty", {"got": s.get("prev_state_id")}
++        else:
++            if str(s.get("prev_state_id") or "") != str(prev_state_id):
++                return False, "prev_state_id_mismatch", {"index": int(i), "want": str(prev_state_id), "got": s.get("prev_state_id")}
++
++        created_step = int(s.get("created_step", -1) or -1)
++        last_step = int(s.get("last_step", -1) or -1)
++        if created_step < 0 or last_step < 0:
++            return False, "bad_step_fields", {"index": int(i), "created_step": created_step, "last_step": last_step}
++        if created_step < prev_created_step:
++            return False, "created_step_not_monotonic", {"index": int(i), "prev": prev_created_step, "got": created_step}
++        if last_step < created_step:
++            return False, "last_step_before_created_step", {"index": int(i), "created_step": created_step, "last_step": last_step}
++
++        # Verify state_sig.
++        s2 = dict(s)
++        got_sig = str(s2.pop("state_sig", "") or "")
++        got_state_id = str(s2.pop("state_id", "") or "")
++        if not got_sig:
++            return False, "missing_state_sig", {"index": int(i)}
++        if got_state_id != state_id_v90(got_sig):
++            return False, "state_id_mismatch", {"index": int(i), "want": state_id_v90(got_sig), "got": got_state_id}
++        want_sig = state_sig_v90(s2)
++        if want_sig != got_sig:
++            return False, "state_sig_mismatch", {"index": int(i), "want": want_sig, "got": got_sig}
++
++        # Verify tail_turn_ids correspond to last K turns up to assistant turn at 2*i+1.
++        last_user_tid = str(s.get("last_user_turn_id") or "")
++        last_asst_tid = str(s.get("last_assistant_turn_id") or "")
++        if last_user_tid not in tmap or last_asst_tid not in tmap:
++            return False, "missing_last_turn_refs", {"index": int(i), "last_user_turn_id": last_user_tid, "last_assistant_turn_id": last_asst_tid}
++        tu = tmap[last_user_tid]
++        ta = tmap[last_asst_tid]
++        if str(tu.get("role") or "") != "user" or str(ta.get("role") or "") != "assistant":
++            return False, "last_turn_roles_wrong", {"index": int(i)}
++        if int(tu.get("turn_index", -1) or -1) != 2 * int(i):
++            return False, "last_user_turn_index_wrong", {"index": int(i), "got": tu.get("turn_index")}
++        if int(ta.get("turn_index", -1) or -1) != 2 * int(i) + 1:
++            return False, "last_assistant_turn_index_wrong", {"index": int(i), "got": ta.get("turn_index")}
++
++        tail = s.get("tail_turn_ids")
++        tail = tail if isinstance(tail, list) else []
++        tail2 = [str(x) for x in tail if isinstance(x, str) and x]
++        if len(tail2) > int(tail_k):
++            return False, "tail_too_long", {"index": int(i), "len": int(len(tail2)), "tail_k": int(tail_k)}
++        for tid in tail2:
++            if tid not in tmap:
++                return False, "tail_turn_missing", {"index": int(i), "turn_id": tid}
++
++        end_idx = 2 * int(i) + 1
++        start_idx = max(0, end_idx - (int(tail_k) - 1))
++        expected_tail: List[str] = []
++        for j in range(start_idx, end_idx + 1):
++            tj = by_index.get(int(j))
++            if tj is None:
++                return False, "missing_turn_index", {"index": int(i), "missing_turn_index": int(j)}
++            expected_tail.append(str(tj.get("turn_id") or ""))
++        if tail2 != expected_tail:
++            return False, "tail_mismatch", {"index": int(i), "want": expected_tail, "got": tail2}
++
++        prev_state_id = str(got_state_id)
++        prev_created_step = int(created_step)
++
++    return True, "ok", {"states_total": int(len(states)), "turns_total": int(len(turns))}
++
+--- /dev/null	2026-01-13 08:27:22
++++ scripts/smoke_v90_conversation_dialogue_csv.py	2026-01-13 08:21:30
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.conversation_loop_v90 import run_conversation_v90
++from atos_core.conversation_v90 import verify_conversation_chain_v90
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists (WORM): {path}")
++
++
++def _read_payloads(path: str, *, payload_key: str) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            payload = obj.get(payload_key)
++            if isinstance(payload, dict):
++                rows.append(dict(payload))
++    return rows
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    # Fixed deterministic conversation (DSL harness).
++    user_turns = [
++        "SET x 4",
++        "SET y 8",
++        "ADD x y",
++        "ADD last_answer 3",
++        "GET z",
++        "SET z 10",
++        "ADD x z",
++        "SUMMARY",
++        "END",
++    ]
++    res = run_conversation_v90(user_turn_texts=list(user_turns), out_dir=str(out_dir), seed=int(seed))
++
++    # Negative test: corrupt a state field in memory and ensure verify fails.
++    states = _read_payloads(res["paths"]["states_jsonl"], payload_key="payload")  # type: ignore[index]
++    turns = _read_payloads(res["paths"]["turns_jsonl"], payload_key="payload")  # type: ignore[index]
++    if not states or not turns:
++        _fail("ERROR: missing states/turns payloads for negative test")
++    bad_states = [dict(s) for s in states]
++    bad_states[0] = dict(bad_states[0])
++    bad_states[0]["state_index"] = 999  # deterministic corruption
++    ok_bad, reason_bad, _details_bad = verify_conversation_chain_v90(turns=turns, states=bad_states, tail_k=6)
++    if ok_bad:
++        _fail("ERROR: expected verify_conversation_chain_v90 to fail on corrupted state_index")
++
++    core = {
++        "store_hash": str(res.get("store_hash") or ""),
++        "transcript_hash": str(res.get("transcript_hash") or ""),
++        "state_chain_hash": str(res.get("state_chain_hash") or ""),
++        "ledger_hash": str(res.get("ledger_hash") or ""),
++        "summary_sha256": str(res.get("summary_sha256") or ""),
++        "negative_test": {"ok": True, "reason": str(reason_bad)},
++        "sha256_summary_json": sha256_file(res["paths"]["summary_json"]),  # type: ignore[index]
++    }
++    return dict(res, core=core)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    out1 = f"{out_base}_try1"
++    out2 = f"{out_base}_try2"
++    ensure_absent(out1)
++    ensure_absent(out2)
++
++    r1 = smoke_try(out_dir=out1, seed=seed)
++    r2 = smoke_try(out_dir=out2, seed=seed)
++
++    # Determinism: store_hash, transcript_hash, state_chain_hash, ledger_hash must match.
++    keys = ["store_hash", "transcript_hash", "state_chain_hash", "ledger_hash", "summary_sha256"]
++    for k in keys:
++        if str(r1.get(k) or "") != str(r2.get(k) or ""):
++            _fail(f"ERROR: determinism mismatch for {k}: try1={r1.get(k)} try2={r2.get(k)}")
++
++    out = {
++        "ok": True,
++        "seed": int(seed),
++        "determinism": {
++            "ok": True,
++            "store_hash": str(r1.get("store_hash") or ""),
++            "transcript_hash": str(r1.get("transcript_hash") or ""),
++            "state_chain_hash": str(r1.get("state_chain_hash") or ""),
++            "ledger_hash": str(r1.get("ledger_hash") or ""),
++            "summary_sha256": str(r1.get("summary_sha256") or ""),
++        },
++        "negative_test": dict(r1.get("core", {}).get("negative_test", {})),
++        "try1": {"out_dir": str(out1), "summary_sha256": str(r1.get("summary_sha256") or "")},
++        "try2": {"out_dir": str(out2), "summary_sha256": str(r2.get("summary_sha256") or "")},
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

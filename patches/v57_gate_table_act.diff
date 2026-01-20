@@ -1,0 +1,1097 @@
+--- patches/v57_gate_table_act_base/act.py	2026-01-11 13:38:46
++++ atos_core/act.py	2026-01-11 13:40:30
+@@ -17,6 +17,7 @@
+     "mode_selector",
+     "mode_policy",
+     "memory_facts",
++    "gate_table_ctxsig",
+ ]
+ 
+ 
+--- patches/v57_gate_table_act_base/store.py	2026-01-11 13:38:46
++++ atos_core/store.py	2026-01-11 13:40:55
+@@ -3,7 +3,7 @@
+ import json
+ import os
+ from dataclasses import dataclass, field
+-from typing import Any, Dict, Iterable, Iterator, List, Optional
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+ 
+ from .act import Act, canonical_json_dumps, sha256_hex
+ 
+@@ -63,8 +63,18 @@
+         rows = [self.acts[k].to_dict() for k in sorted(self.acts.keys())]
+         return rows
+ 
+-    def content_hash(self) -> str:
+-        blob = "\n".join(canonical_json_dumps(r) for r in self.to_rows()).encode("utf-8")
++    def content_hash(self, *, exclude_kinds: Optional[Sequence[str]] = None) -> str:
++        rows: List[Dict[str, Any]]
++        if exclude_kinds:
++            excluded = {str(k) for k in exclude_kinds if isinstance(k, str) and str(k)}
++            rows = [
++                self.acts[k].to_dict()
++                for k in sorted(self.acts.keys())
++                if str(self.acts[k].kind) not in excluded
++            ]
++        else:
++            rows = self.to_rows()
++        blob = "\n".join(canonical_json_dumps(r) for r in rows).encode("utf-8")
+         return sha256_hex(blob)
+ 
+     def save_jsonl(self, path: str) -> None:
+@@ -90,3 +100,44 @@
+         store.next_id_int = max_int + 1
+         return store
+ 
++    def get_gate_table_act(self, act_id: str) -> Optional[Act]:
++        act = self.get(str(act_id))
++        if act is None or not bool(act.active):
++            return None
++        if str(act.kind) != "gate_table_ctxsig":
++            return None
++        return act
++
++    def best_gate_table_for_hash(self, store_hash: str) -> Optional[Act]:
++        want = str(store_hash or "")
++        candidates: List[Act] = []
++        for act in self.by_kind("gate_table_ctxsig"):
++            ev = act.evidence
++            if not isinstance(ev, dict):
++                continue
++            meta = ev.get("meta")
++            if not isinstance(meta, dict):
++                continue
++            trained = str(
++                meta.get("trained_on_store_content_hash")
++                or meta.get("trained_on_store_hash")
++                or ""
++            )
++            if trained != want:
++                continue
++            candidates.append(act)
++
++        def _score(a: Act) -> float:
++            meta = a.evidence.get("meta") if isinstance(a.evidence, dict) else {}
++            if not isinstance(meta, dict):
++                return 0.0
++            val = meta.get("pct_saved_real")
++            if val is None:
++                val = meta.get("pct_saved")
++            try:
++                return float(val or 0.0)
++            except Exception:
++                return 0.0
++
++        candidates.sort(key=lambda a: (-_score(a), str(a.id)))
++        return candidates[0] if candidates else None
+--- patches/v57_gate_table_act_base/engine.py	2026-01-11 13:38:46
++++ atos_core/engine.py	2026-01-11 13:42:51
+@@ -53,6 +53,10 @@
+     force_predictor_ids_by_ctx_sig: Optional[Dict[str, List[str]]] = None
+     # Deterministic instruction contracts (default OFF).
+     enable_contracts: bool = False
++    # Use a ctx_sig→allowed_predictor_ids gate-table ACT from the ActStore (default OFF).
++    use_gate_table_act: bool = False
++    # If set, load exactly this gate-table ACT id (default OFF).
++    gate_table_act_id: Optional[str] = None
+ 
+ 
+ class Engine:
+@@ -75,6 +79,9 @@
+         self._macro_router_table: Optional[Dict[str, Any]] = None
+         self._instruction_contract: Optional[Act] = None
+         self._fact_memory: Optional[Act] = None
++        self._gate_table_act: Optional[Act] = None
++        self._gate_table_ctxsig_table: Optional[Dict[str, List[str]]] = None
++        self._gate_table_act_status: Dict[str, Any] = {}
+         self.rebuild_cache()
+ 
+     def rebuild_cache(self) -> None:
+@@ -143,7 +150,118 @@
+                 self._macro_router_table = ev.get("table")
+         self._instruction_contract = instruction_contract
+         self._fact_memory = fact_memory
++
++        # Optional: ctx_sig allowlist gate-table ACT (default OFF).
++        self._gate_table_act = None
++        self._gate_table_ctxsig_table = None
++        status: Dict[str, Any] = {
++            "enabled": bool(self.config.use_gate_table_act or self.config.gate_table_act_id),
++            "selection": "",
++            "used": False,
++            "act_id": "",
++            "reason": "disabled",
++            "store_content_hash": "",
++            "trained_on_store_content_hash": "",
++            "builder": "",
++            "top_k": 0,
++            "table_ctx_sigs": 0,
++        }
++        base_hash = ""
++        try:
++            base_hash = str(self.store.content_hash(exclude_kinds=["gate_table_ctxsig"]))  # type: ignore[arg-type]
++        except TypeError:
++            try:
++                base_hash = str(self.store.content_hash())
++            except Exception:
++                base_hash = ""
++        except Exception:
++            base_hash = ""
++        status["store_content_hash"] = str(base_hash)
++
++        want_act_id = str(self.config.gate_table_act_id or "")
++        selected: Optional[Act] = None
++        if want_act_id:
++            status["selection"] = "explicit"
++            try:
++                selected = self.store.get(want_act_id)
++            except Exception:
++                selected = None
++            if selected is None:
++                status["reason"] = "act_not_found"
++            elif (not bool(selected.active)) or str(selected.kind) != "gate_table_ctxsig":
++                status["reason"] = "wrong_kind_or_inactive"
++                selected = None
++        elif bool(self.config.use_gate_table_act):
++            status["selection"] = "auto"
++            try:
++                best = getattr(self.store, "best_gate_table_for_hash", None)
++                if callable(best):
++                    selected = best(base_hash)
++            except Exception:
++                selected = None
++            if selected is None:
++                status["reason"] = "no_compatible_act"
++
++        if selected is not None:
++            ev = selected.evidence if isinstance(selected.evidence, dict) else {}
++            meta = ev.get("meta") if isinstance(ev, dict) else {}
++            if not isinstance(meta, dict):
++                meta = {}
++            trained = str(
++                meta.get("trained_on_store_content_hash")
++                or meta.get("trained_on_store_hash")
++                or ""
++            )
++            status["trained_on_store_content_hash"] = str(trained)
++            status["builder"] = str(meta.get("builder") or "")
++            try:
++                status["top_k"] = int(meta.get("top_k", 0) or 0)
++            except Exception:
++                status["top_k"] = 0
++
++            if trained and base_hash and trained != base_hash:
++                status["reason"] = "hash_mismatch"
++            else:
++                table = ev.get("table") if isinstance(ev, dict) else None
++                if isinstance(table, dict) and table:
++                    filtered: Dict[str, List[str]] = {}
++                    for ctx_sig, ids in table.items():
++                        if not isinstance(ctx_sig, str) or not ctx_sig:
++                            continue
++                        if not isinstance(ids, list) or not ids:
++                            continue
++                        allow = [
++                            str(x)
++                            for x in ids
++                            if isinstance(x, str)
++                            and str(x)
++                            and str(x) in self._predictor_by_id
++                        ]
++                        if not allow:
++                            continue
++                        uniq = sorted(
++                            set(allow),
++                            key=lambda pid: (
++                                int(self._predictor_order.get(pid, 10**9)),
++                                pid,
++                            ),
++                        )
++                        if uniq:
++                            filtered[str(ctx_sig)] = list(uniq)
++                    if filtered:
++                        self._gate_table_act = selected
++                        self._gate_table_ctxsig_table = filtered
++                        status["used"] = True
++                        status["act_id"] = str(selected.id)
++                        status["reason"] = "ok"
++                        status["table_ctx_sigs"] = int(len(filtered))
++                    else:
++                        status["reason"] = "table_empty"
++                else:
++                    status["reason"] = "missing_table"
+ 
++        self._gate_table_act_status = status
++
+     def vocab(self) -> List[str]:
+         if self._unigram is None:
+             return []
+@@ -177,6 +295,17 @@
+             if prev in set(m["prev_not_in"]):
+                 return False
+         return True
++
++    def _effective_force_predictor_ids_by_ctx_sig(self) -> Optional[Dict[str, List[str]]]:
++        by_ctx = self.config.force_predictor_ids_by_ctx_sig
++        if isinstance(by_ctx, dict) and by_ctx:
++            return by_ctx
++        if (
++            self._gate_table_ctxsig_table is not None
++            and bool(self.config.use_gate_table_act or self.config.gate_table_act_id)
++        ):
++            return self._gate_table_ctxsig_table
++        return None
+ 
+     def _best_predictor(self, *, context: Sequence[str]) -> Optional[Act]:
+         for act in self._predictors:
+@@ -353,7 +482,7 @@
+                 if allowed:
+                     pred_list = [a for a in self._predictors if str(a.id) in allowed]
+             else:
+-                by_ctx = self.config.force_predictor_ids_by_ctx_sig
++                by_ctx = self._effective_force_predictor_ids_by_ctx_sig()
+                 if isinstance(by_ctx, dict) and by_ctx:
+                     mode_name = penalties.get("mode") if isinstance(penalties, dict) else None
+                     if not isinstance(mode_name, str) or not mode_name:
+@@ -1279,12 +1408,10 @@
+                     break
+                 continue
+ 
++            by_ctx_effective = self._effective_force_predictor_ids_by_ctx_sig()
+             force_gate_compare = bool(self.config.force_gate_debug_compare) and (
+                 (isinstance(self.config.force_predictor_ids, list) and bool(self.config.force_predictor_ids))
+-                or (
+-                    isinstance(self.config.force_predictor_ids_by_ctx_sig, dict)
+-                    and bool(self.config.force_predictor_ids_by_ctx_sig)
+-                )
++                or (isinstance(by_ctx_effective, dict) and bool(by_ctx_effective))
+             )
+             if force_gate_compare:
+                 allowed_size = 0
+@@ -1303,7 +1430,7 @@
+                                 ),
+                             )
+                     else:
+-                        by_ctx = self.config.force_predictor_ids_by_ctx_sig
++                        by_ctx = by_ctx_effective
+                         if isinstance(by_ctx, dict) and by_ctx:
+                             sig = f"{mode_state}{SEP}{ck}"
+                             ids = by_ctx.get(sig)
+@@ -1589,7 +1716,7 @@
+                             present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
+                             force_allowed_ids = present
+                     else:
+-                        by_ctx = self.config.force_predictor_ids_by_ctx_sig
++                        by_ctx = self._effective_force_predictor_ids_by_ctx_sig()
+                         if isinstance(by_ctx, dict) and by_ctx:
+                             ctx_sig = f"{mode_state}{SEP}{ck}"
+                             ids = by_ctx.get(ctx_sig)
+@@ -1843,6 +1970,7 @@
+                 "router_live_mismatch": trace_router_live_mismatch,
+                 "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
+                 "router_live_debug_gate_token": trace_router_live_debug_gate_token,
++                "gate_table_act": dict(self._gate_table_act_status),
+                 "instruction_contract": contract_meta,
+                 "instruction_contract_used": trace_instruction_contract_used,
+                 "instruction_contract_kind": trace_instruction_contract_kind,
+--- /dev/null	2026-01-11 13:47:01
++++ scripts/promote_gate_table_to_act.py	2026-01-11 13:46:18
+@@ -0,0 +1,282 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Patch, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.ledger import Ledger
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_out_dir_absent(out_dir: str) -> None:
++    if os.path.exists(out_dir):
++        _fail(f"ERROR: --out already exists: {out_dir}")
++
++
++def find_scenario_summary_path(gate_table_json_path: str) -> Optional[str]:
++    cand = os.path.join(os.path.dirname(gate_table_json_path), "scenario_summary.json")
++    return cand if os.path.exists(cand) else None
++
++
++def extract_saved_metrics_from_scenario_summary(
++    scenario_summary_path: Optional[str],
++) -> Tuple[Optional[float], Optional[float]]:
++    if not scenario_summary_path:
++        return None, None
++    try:
++        obj = json.loads(open(scenario_summary_path, "r", encoding="utf-8").read())
++        pct_saved_real = (
++            obj.get("active_real", {})
++            .get("real_cost", {})
++            .get("pct_saved_real")
++        )
++        pct_saved_compare = (
++            obj.get("active_compare", {})
++            .get("force_gate", {})
++            .get("pct_saved")
++        )
++        return (
++            float(pct_saved_real) if pct_saved_real is not None else None,
++            float(pct_saved_compare) if pct_saved_compare is not None else None,
++        )
++    except Exception:
++        return None, None
++
++
++def normalize_gate_table(table: Any) -> Dict[str, List[str]]:
++    if not isinstance(table, dict):
++        return {}
++    out: Dict[str, List[str]] = {}
++    for ctx_sig, ids in table.items():
++        if not isinstance(ctx_sig, str) or not ctx_sig:
++            continue
++        if not isinstance(ids, list) or not ids:
++            continue
++        cleaned: List[str] = []
++        for x in ids:
++            if not isinstance(x, str):
++                continue
++            x = str(x)
++            if not x:
++                continue
++            cleaned.append(x)
++        if not cleaned:
++            continue
++        uniq = sorted(set(cleaned))
++        out[str(ctx_sig)] = uniq
++    return out
++
++
++def gate_table_edge_count(table: Dict[str, List[str]]) -> int:
++    return int(sum(len(v) for v in table.values()))
++
++
++def make_gate_table_act(
++    *,
++    store_hash_excluding_gate_tables: str,
++    base_acts_sha256: str,
++    gate_table_json_path: str,
++    gate_table_json_sha256: str,
++    gate_table_meta: Dict[str, Any],
++    gate_table: Dict[str, List[str]],
++    pct_saved_real: Optional[float],
++    pct_saved_compare: Optional[float],
++    scenario_summary_path: Optional[str],
++) -> Act:
++    meta: Dict[str, Any] = {}
++    meta.update({k: gate_table_meta.get(k) for k in sorted(gate_table_meta.keys())})
++    meta.update(
++        {
++            "builder": str(gate_table_meta.get("builder") or ""),
++            "top_k": int(gate_table_meta.get("top_k", 0) or 0),
++            "min_ctx_occ": int(gate_table_meta.get("min_ctx_occ", 0) or 0),
++            "min_winner_rate": float(gate_table_meta.get("min_winner_rate", 0.0) or 0.0),
++            "topcand_n": int(gate_table_meta.get("topcand_n", 0) or 0),
++            "trained_on_store_content_hash": str(store_hash_excluding_gate_tables),
++            "trained_on_store_content_hash_excluding_kinds": ["gate_table_ctxsig"],
++            "trained_on_acts_jsonl_sha256": str(base_acts_sha256),
++            "gate_table_json_path": str(gate_table_json_path),
++            "gate_table_json_sha256": str(gate_table_json_sha256),
++            "scenario_summary_path": str(scenario_summary_path or ""),
++            "pct_saved_real": pct_saved_real,
++            "pct_saved_compare": pct_saved_compare,
++            "table_ctx_sigs": int(len(gate_table)),
++            "table_edges": int(gate_table_edge_count(gate_table)),
++        }
++    )
++
++    evidence = {
++        "name": "gate_table_ctxsig_v0",
++        "meta": meta,
++        "table": gate_table,
++    }
++
++    body = {
++        "kind": "gate_table_ctxsig",
++        "match": {"type": "always"},
++        "program": [],
++        "evidence": evidence,
++        "deps": [],
++        "active": True,
++    }
++    act_id = "act_gate_table_ctxsig_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))[:12]
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=0, offset_us=570000),
++        kind="gate_table_ctxsig",
++        match={"type": "always"},
++        program=[],
++        evidence=evidence,
++        cost={"overhead_bits": 512},
++        deps=[],
++        active=True,
++    )
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True, help="Run dir containing acts.jsonl (base).")
++    ap.add_argument("--gate_table_json", required=True, help="Path to active gate-table JSON.")
++    ap.add_argument("--out", required=True, help="New WORM run dir to write updated acts.jsonl.")
++    args = ap.parse_args()
++
++    acts_run = str(args.acts_run)
++    gate_table_json_path = str(args.gate_table_json)
++    out_dir = str(args.out)
++
++    ensure_out_dir_absent(out_dir)
++    os.makedirs(out_dir, exist_ok=False)
++
++    acts_jsonl = os.path.join(acts_run, "acts.jsonl")
++    if not os.path.exists(acts_jsonl):
++        _fail(f"ERROR: acts.jsonl not found: {acts_jsonl}")
++    if not os.path.exists(gate_table_json_path):
++        _fail(f"ERROR: gate table JSON not found: {gate_table_json_path}")
++
++    base_acts_sha256 = sha256_file(acts_jsonl)
++    gate_table_json_sha256 = sha256_file(gate_table_json_path)
++
++    store = ActStore.load_jsonl(acts_jsonl)
++    store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig"])
++
++    raw = json.loads(open(gate_table_json_path, "r", encoding="utf-8").read())
++    gate_table_meta = raw.get("meta") if isinstance(raw, dict) else {}
++    gate_table = normalize_gate_table(raw.get("table") if isinstance(raw, dict) else {})
++
++    scenario_summary_path = find_scenario_summary_path(gate_table_json_path)
++    pct_saved_real, pct_saved_compare = extract_saved_metrics_from_scenario_summary(
++        scenario_summary_path
++    )
++
++    gate_act = make_gate_table_act(
++        store_hash_excluding_gate_tables=store_hash_excl,
++        base_acts_sha256=base_acts_sha256,
++        gate_table_json_path=gate_table_json_path,
++        gate_table_json_sha256=gate_table_json_sha256,
++        gate_table_meta=gate_table_meta if isinstance(gate_table_meta, dict) else {},
++        gate_table=gate_table,
++        pct_saved_real=pct_saved_real,
++        pct_saved_compare=pct_saved_compare,
++        scenario_summary_path=scenario_summary_path,
++    )
++
++    if store.get(gate_act.id) is not None:
++        _fail(f"ERROR: gate-table act id collision: {gate_act.id}")
++    store.add(gate_act)
++
++    out_acts_jsonl = os.path.join(out_dir, "acts.jsonl")
++    store.save_jsonl(out_acts_jsonl)
++    out_acts_sha256 = sha256_file(out_acts_jsonl)
++
++    promotion_ledger_path = os.path.join(out_dir, "promotion_ledger.jsonl")
++    ledger = Ledger(path=promotion_ledger_path)
++    patch = Patch(
++        kind="ADD_ACT",
++        payload={
++            "act_id": str(gate_act.id),
++            "act_kind": str(gate_act.kind),
++            "trained_on_store_content_hash": str(store_hash_excl),
++            "source_acts_run": str(acts_run),
++            "source_acts_jsonl_sha256": str(base_acts_sha256),
++            "source_gate_table_json_path": str(gate_table_json_path),
++            "source_gate_table_json_sha256": str(gate_table_json_sha256),
++        },
++    )
++    entry = ledger.append(
++        step=0,
++        patch=patch,
++        acts_hash=store.content_hash(),
++        metrics={
++            "promotion": {
++                "store_content_hash_excluding_gate_tables": str(store_hash_excl),
++                "base_acts_jsonl_sha256": str(base_acts_sha256),
++                "gate_table_json_sha256": str(gate_table_json_sha256),
++                "out_acts_jsonl_sha256": str(out_acts_sha256),
++            }
++        },
++        snapshot_path="acts.jsonl",
++    )
++
++    ok = ledger.verify_chain()
++    manifest = {
++        "name": "PROMOTE_GATE_TABLE_TO_ACT_V57",
++        "out_dir": str(out_dir),
++        "source_acts_run": str(acts_run),
++        "source_gate_table_json": str(gate_table_json_path),
++        "gate_table_act_id": str(gate_act.id),
++        "verify_chain": bool(ok),
++        "promotion_ledger_last_hash": str(entry.get("entry_hash") or ""),
++        "sha256": {
++            "source_acts_jsonl": str(base_acts_sha256),
++            "source_gate_table_json": str(gate_table_json_sha256),
++            "out_acts_jsonl": str(out_acts_sha256),
++            "promotion_ledger_jsonl": str(sha256_file(promotion_ledger_path)),
++        },
++    }
++    manifest_path = os.path.join(out_dir, "promotion_manifest.json")
++    with open(manifest_path + ".tmp", "w", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(manifest))
++        f.write("\n")
++    os.replace(manifest_path + ".tmp", manifest_path)
++
++    print(
++        canonical_json_dumps(
++            {
++                "out_dir": str(out_dir),
++                "gate_table_act_id": str(gate_act.id),
++                "sha256_out_acts_jsonl": str(out_acts_sha256),
++                "sha256_in_gate_table_json": str(gate_table_json_sha256),
++                "verify_chain": bool(ok),
++            }
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+--- /dev/null	2026-01-11 13:47:01
++++ scripts/eval_gate_table_act.py	2026-01-11 13:48:03
+@@ -0,0 +1,302 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
++
++SEP = "\u241f"
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def canonical_json(obj: Any) -> str:
++    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++
++def ensure_out_dir_absent(out_dir: str) -> None:
++    if os.path.exists(out_dir):
++        raise SystemExit(f"ERROR: --out already exists: {out_dir}")
++
++
++def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def compare_transcripts_by_full_text(
++    a: Sequence[Dict[str, Any]], b: Sequence[Dict[str, Any]]
++) -> Tuple[int, int, List[Dict[str, Any]]]:
++    total = min(len(a), len(b))
++    mismatches = 0
++    examples: List[Dict[str, Any]] = []
++    for i in range(total):
++        ta = str(a[i].get("full_text", ""))
++        tb = str(b[i].get("full_text", ""))
++        if ta != tb:
++            mismatches += 1
++            if len(examples) < 3:
++                examples.append(
++                    {
++                        "index": int(i),
++                        "a_sha256": sha256_text(ta),
++                        "b_sha256": sha256_text(tb),
++                        "a_snip": ta[:120],
++                        "b_snip": tb[:120],
++                    }
++                )
++    return mismatches, total, examples
++
++
++def expand_dialogues(
++    dialogues: Sequence[Sequence[str]], *, repeats: int
++) -> Tuple[Tuple[str, ...], ...]:
++    r = max(1, int(repeats))
++    base: List[Tuple[str, ...]] = [tuple(d) for d in dialogues]
++    out: List[Tuple[str, ...]] = []
++    for _ in range(r):
++        out.extend(base)
++    return tuple(out)
++
++
++def extract_gate_act_trace_meta(transcripts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            meta = tr.get("gate_table_act")
++            if isinstance(meta, dict):
++                return dict(meta)
++    return {}
++
++
++def extract_gate_table_from_store(store: ActStore) -> Tuple[Optional[str], Dict[str, List[str]], Dict[str, Any]]:
++    base_hash = store.content_hash(exclude_kinds=["gate_table_ctxsig"])
++    act = store.best_gate_table_for_hash(base_hash)
++    if act is None:
++        return None, {}, {"reason": "no_compatible_gate_table_act", "store_hash": base_hash}
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    table = ev.get("table") if isinstance(ev, dict) else {}
++    meta = ev.get("meta") if isinstance(ev, dict) else {}
++    if not isinstance(table, dict):
++        table = {}
++    out: Dict[str, List[str]] = {}
++    for ctx_sig, ids in table.items():
++        if not isinstance(ctx_sig, str) or not ctx_sig:
++            continue
++        if not isinstance(ids, list):
++            continue
++        out[str(ctx_sig)] = [str(x) for x in ids if isinstance(x, str) and str(x)]
++    return str(act.id), out, {"store_hash": base_hash, "meta": meta}
++
++
++def gate_table_used_rate(
++    *, transcripts: Sequence[Dict[str, Any]], table: Dict[str, List[str]]
++) -> Tuple[int, int]:
++    covered = 0
++    total = 0
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            mode = str(t.get("mode") or "default")
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            cks = tr.get("context_keys") or []
++            if not isinstance(cks, list):
++                continue
++            for ck in cks:
++                if not isinstance(ck, str) or not ck:
++                    continue
++                total += 1
++                if f"{mode}{SEP}{ck}" in table:
++                    covered += 1
++    return covered, total
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_base_run", required=True, help="Base run dir with acts.jsonl (no gate-table act).")
++    ap.add_argument("--acts_gate_run", required=True, help="Run dir with acts.jsonl including gate-table act.")
++    ap.add_argument("--out", required=True, help="WORM output dir under results/.")
++    ap.add_argument("--seeds", default="0,1", help="Comma-separated seeds (default: 0,1).")
++    ap.add_argument("--router_modes", default="off,on", help="Comma-separated router modes: off,on.")
++    ap.add_argument("--suite_repeats", type=int, default=5, help="Repeat CHAT_DIALOGUES_20X3 N times.")
++    ap.add_argument("--max_new_tokens", type=int, default=80)
++    args = ap.parse_args()
++
++    out_dir = str(args.out)
++    ensure_out_dir_absent(out_dir)
++    os.makedirs(out_dir, exist_ok=False)
++
++    base_acts_jsonl = os.path.join(str(args.acts_base_run), "acts.jsonl")
++    gate_acts_jsonl = os.path.join(str(args.acts_gate_run), "acts.jsonl")
++    if not os.path.exists(base_acts_jsonl):
++        raise SystemExit(f"ERROR: missing {base_acts_jsonl}")
++    if not os.path.exists(gate_acts_jsonl):
++        raise SystemExit(f"ERROR: missing {gate_acts_jsonl}")
++
++    dialogues = expand_dialogues(CHAT_DIALOGUES_20X3, repeats=int(args.suite_repeats))
++
++    seeds = [int(x) for x in str(args.seeds).split(",") if str(x).strip() != ""]
++    router_modes = [str(x).strip() for x in str(args.router_modes).split(",") if str(x).strip() != ""]
++    if not seeds:
++        raise SystemExit("ERROR: empty --seeds")
++    if not router_modes:
++        raise SystemExit("ERROR: empty --router_modes")
++
++    rows: List[Dict[str, Any]] = []
++    for seed in seeds:
++        for rm in router_modes:
++            router_on = rm.lower() in {"on", "true", "1", "yes"}
++
++            base_store = ActStore.load_jsonl(base_acts_jsonl)
++            base_engine = Engine(
++                base_store,
++                seed=int(seed),
++                config=EngineConfig(router_live_enabled=bool(router_on)),
++            )
++            base_transcripts, base_metrics = run_chat_suite(
++                base_engine, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens)
++            )
++            base_text = transcripts_text(base_transcripts)
++            base_hash = sha256_text(base_text)
++            base_cost = float(base_metrics.get("scan_acts_considered_per_token_mean") or 0.0)
++            tokens_total = int(base_metrics.get("trace_tokens_total") or 0)
++
++            gate_store = ActStore.load_jsonl(gate_acts_jsonl)
++            gate_engine = Engine(
++                gate_store,
++                seed=int(seed),
++                config=EngineConfig(
++                    router_live_enabled=bool(router_on),
++                    use_gate_table_act=True,
++                ),
++            )
++            gate_transcripts, gate_metrics = run_chat_suite(
++                gate_engine, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens)
++            )
++            gate_text = transcripts_text(gate_transcripts)
++            gate_hash = sha256_text(gate_text)
++
++            mismatches, total_dialogues, examples = compare_transcripts_by_full_text(
++                base_transcripts, gate_transcripts
++            )
++            divergence_rate = float(mismatches / max(1, total_dialogues))
++
++            gate_cost = float(gate_metrics.get("scan_acts_considered_per_token_mean") or 0.0)
++            pct_saved_real = float((base_cost - gate_cost) / base_cost) if base_cost > 0 else 0.0
++
++            gate_act_id, gate_table, gate_table_meta = extract_gate_table_from_store(gate_store)
++            used_cov, used_total = gate_table_used_rate(transcripts=base_transcripts, table=gate_table)
++            used_rate = float(used_cov / max(1, used_total))
++
++            trace_meta = extract_gate_act_trace_meta(gate_transcripts)
++            gate_used = bool(trace_meta.get("used")) if isinstance(trace_meta, dict) else False
++            acts_hash_match = bool(
++                str(trace_meta.get("reason") or "") == "ok"
++                and str(trace_meta.get("trained_on_store_content_hash") or "")
++                and str(trace_meta.get("trained_on_store_content_hash") or "")
++                == str(trace_meta.get("store_content_hash") or "")
++            )
++
++            rows.append(
++                {
++                    "seed": int(seed),
++                    "router_mode": "on" if router_on else "off",
++                    "tokens_total": int(tokens_total),
++                    "divergence_rate_full_text": float(divergence_rate),
++                    "mismatch_dialogues": int(mismatches),
++                    "total_dialogues": int(total_dialogues),
++                    "pct_saved_real": float(pct_saved_real),
++                    "avg_scan_cost_baseline_per_token_mean": float(base_cost),
++                    "avg_scan_cost_gate_per_token_mean": float(gate_cost),
++                    "used_rate_est": float(used_rate),
++                    "gate_act_used": bool(gate_used),
++                    "gate_act_id": str(trace_meta.get("act_id") or gate_act_id or ""),
++                    "acts_hash_match": bool(acts_hash_match),
++                    "hash_baseline": str(base_hash),
++                    "hash_gate_from_store": str(gate_hash),
++                    "mismatch_examples": examples,
++                    "gate_table_meta": gate_table_meta,
++                }
++            )
++
++    summary = {
++        "name": "V57_GATE_TABLE_ACT_EVAL",
++        "acts": {
++            "base_acts_jsonl": base_acts_jsonl,
++            "gate_acts_jsonl": gate_acts_jsonl,
++            "sha256_base_acts_jsonl": sha256_file(base_acts_jsonl),
++            "sha256_gate_acts_jsonl": sha256_file(gate_acts_jsonl),
++        },
++        "results": rows,
++    }
++    summary_path = os.path.join(out_dir, "summary.json")
++    with open(summary_path + ".tmp", "w", encoding="utf-8") as f:
++        f.write(canonical_json(summary))
++        f.write("\n")
++    os.replace(summary_path + ".tmp", summary_path)
++
++    csv_path = os.path.join(out_dir, "summary.csv")
++    fields = [
++        "seed",
++        "router_mode",
++        "tokens_total",
++        "divergence_rate_full_text",
++        "pct_saved_real",
++        "avg_scan_cost_baseline_per_token_mean",
++        "avg_scan_cost_gate_per_token_mean",
++        "used_rate_est",
++        "gate_act_used",
++        "gate_act_id",
++        "acts_hash_match",
++        "hash_baseline",
++        "hash_gate_from_store",
++    ]
++    with open(csv_path + ".tmp", "w", encoding="utf-8", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=fields)
++        w.writeheader()
++        for r in rows:
++            w.writerow({k: r.get(k) for k in fields})
++    os.replace(csv_path + ".tmp", csv_path)
++
++    print(canonical_json({"out_dir": out_dir, "summary_json": summary_path, "summary_csv": csv_path}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+--- /dev/null	2026-01-11 13:47:01
++++ scripts/smoke_gate_table_act.py	2026-01-11 13:49:01
+@@ -0,0 +1,207 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def normalize_gate_table(table: Any) -> Dict[str, List[str]]:
++    if not isinstance(table, dict):
++        return {}
++    out: Dict[str, List[str]] = {}
++    for ctx_sig, ids in table.items():
++        if not isinstance(ctx_sig, str) or not ctx_sig:
++            continue
++        if not isinstance(ids, list) or not ids:
++            continue
++        cleaned = [str(x) for x in ids if isinstance(x, str) and str(x)]
++        if not cleaned:
++            continue
++        out[str(ctx_sig)] = sorted(set(cleaned))
++    return out
++
++
++def make_gate_table_act(
++    *,
++    trained_on_store_hash: str,
++    gate_table_json_sha256: str,
++    gate_table_meta: Dict[str, Any],
++    gate_table: Dict[str, List[str]],
++) -> Act:
++    meta = {
++        "builder": str(gate_table_meta.get("builder") or ""),
++        "top_k": int(gate_table_meta.get("top_k", 0) or 0),
++        "min_ctx_occ": int(gate_table_meta.get("min_ctx_occ", 0) or 0),
++        "min_winner_rate": float(gate_table_meta.get("min_winner_rate", 0.0) or 0.0),
++        "topcand_n": int(gate_table_meta.get("topcand_n", 0) or 0),
++        "trained_on_store_content_hash": str(trained_on_store_hash),
++        "trained_on_store_content_hash_excluding_kinds": ["gate_table_ctxsig"],
++        "gate_table_json_sha256": str(gate_table_json_sha256),
++        "table_ctx_sigs": int(len(gate_table)),
++    }
++    evidence = {"name": "gate_table_ctxsig_v0", "meta": meta, "table": gate_table}
++    body = {
++        "kind": "gate_table_ctxsig",
++        "match": {"type": "always"},
++        "program": [],
++        "evidence": evidence,
++        "deps": [],
++        "active": True,
++    }
++    act_id = "act_gate_table_ctxsig_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))[:12]
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=0, offset_us=571000),
++        kind="gate_table_ctxsig",
++        match={"type": "always"},
++        program=[],
++        evidence=evidence,
++        cost={"overhead_bits": 512},
++        deps=[],
++        active=True,
++    )
++
++
++def extract_gate_meta(transcripts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if isinstance(tr, dict) and isinstance(tr.get("gate_table_act"), dict):
++                return dict(tr.get("gate_table_act") or {})
++    return {}
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True)
++    ap.add_argument("--gate_table_json", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=80)
++    ap.add_argument("--dialogues", type=int, default=10, help="How many CHAT_DIALOGUES_20X3 items to use.")
++    args = ap.parse_args()
++
++    acts_jsonl = os.path.join(str(args.acts_run), "acts.jsonl")
++    if not os.path.exists(acts_jsonl):
++        raise SystemExit(f"ERROR: missing acts.jsonl: {acts_jsonl}")
++
++    gate_path = str(args.gate_table_json)
++    if not os.path.exists(gate_path):
++        raise SystemExit(f"ERROR: missing gate table JSON: {gate_path}")
++
++    raw = json.loads(open(gate_path, "r", encoding="utf-8").read())
++    gate_table_meta = raw.get("meta") if isinstance(raw, dict) else {}
++    gate_table = normalize_gate_table(raw.get("table") if isinstance(raw, dict) else {})
++    gate_table_sha = sha256_file(gate_path)
++
++    base_store = ActStore.load_jsonl(acts_jsonl)
++    base_hash = base_store.content_hash(exclude_kinds=["gate_table_ctxsig"])
++
++    gate_act_ok = make_gate_table_act(
++        trained_on_store_hash=base_hash,
++        gate_table_json_sha256=gate_table_sha,
++        gate_table_meta=gate_table_meta if isinstance(gate_table_meta, dict) else {},
++        gate_table=gate_table,
++    )
++
++    gate_store = ActStore.load_jsonl(acts_jsonl)
++    gate_store.add(gate_act_ok)
++
++    dialogues = CHAT_DIALOGUES_20X3[: max(1, int(args.dialogues))]
++
++    eng_base = Engine(base_store, seed=int(args.seed), config=EngineConfig())
++    tx_base, m_base = run_chat_suite(eng_base, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens))
++    h_base = sha256_text(transcripts_text(tx_base))
++    cost_base = float(m_base.get("scan_acts_considered_per_token_mean") or 0.0)
++
++    eng_gate = Engine(
++        gate_store, seed=int(args.seed), config=EngineConfig(use_gate_table_act=True)
++    )
++    tx_gate, m_gate = run_chat_suite(eng_gate, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens))
++    h_gate = sha256_text(transcripts_text(tx_gate))
++    cost_gate = float(m_gate.get("scan_acts_considered_per_token_mean") or 0.0)
++
++    if h_gate != h_base:
++        raise SystemExit("FAIL: compatible gate-table act changed output hash")
++    if cost_gate > cost_base:
++        raise SystemExit("FAIL: compatible gate-table act did not reduce scan cost")
++
++    # Incompatible act: explicit selection should NO-OP.
++    gate_act_bad = make_gate_table_act(
++        trained_on_store_hash="bogus_hash",
++        gate_table_json_sha256=gate_table_sha,
++        gate_table_meta=gate_table_meta if isinstance(gate_table_meta, dict) else {},
++        gate_table=gate_table,
++    )
++    bad_store = ActStore.load_jsonl(acts_jsonl)
++    bad_store.add(gate_act_bad)
++    eng_bad = Engine(
++        bad_store,
++        seed=int(args.seed),
++        config=EngineConfig(gate_table_act_id=str(gate_act_bad.id)),
++    )
++    tx_bad, m_bad = run_chat_suite(eng_bad, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens))
++    h_bad = sha256_text(transcripts_text(tx_bad))
++    if h_bad != h_base:
++        raise SystemExit("FAIL: incompatible gate-table act changed output hash")
++    meta_bad = extract_gate_meta(tx_bad)
++    if str(meta_bad.get("reason") or "") != "hash_mismatch":
++        raise SystemExit(f"FAIL: expected reason=hash_mismatch, got {meta_bad}")
++    if bool(meta_bad.get("used")):
++        raise SystemExit("FAIL: incompatible gate-table act should not be used")
++
++    print(
++        canonical_json_dumps(
++            {
++                "ok": True,
++                "seed": int(args.seed),
++                "sha256_baseline": str(h_base),
++                "sha256_gate_ok": str(h_gate),
++                "sha256_gate_bad": str(h_bad),
++                "scan_cost_baseline": float(cost_base),
++                "scan_cost_gate_ok": float(cost_gate),
++                "gate_bad_trace": meta_bad,
++            }
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++

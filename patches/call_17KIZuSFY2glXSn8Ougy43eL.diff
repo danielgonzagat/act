@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         trace_selected_act_ids: List[str] = []
+         trace_selected_tokens: List[str] = []
+         trace_candidates_pre: List[int] = []
+         trace_candidates_post: List[int] = []
++        trace_predictor_iterated: List[int] = []
+         trace_predictor_matched: List[int] = []
+         trace_predictor_emitted: List[int] = []
+         trace_executed_predictor_ids: List[List[str]] = []
+         trace_context_keys: List[str] = []
+*** End Patch

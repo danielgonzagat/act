@@ -1,0 +1,29 @@
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+     metrics: Dict[str, Any] = {
+         "tokens": int(total_tokens),
+         "coverage_rate": float(covered / max(1, total_tokens)),
+         "winner_in_allowed_rate": float(winner_ok / max(1, total_tokens)),
+         "live_fastpath_rate": float(fastpath / max(1, total_tokens)),
+         "live_fallback_rate": float(fallbacks / max(1, total_tokens)),
+         "live_mismatch_rate": float(mismatches / max(1, total_tokens)),
++        "mismatch_count": int(mismatches),
+         "live_predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, total_tokens)),
+         "debug_baseline_predictors_evaluated_per_token_mean": float(
+             baseline_eval_sum_dbg / max(1, total_tokens)
+         ),
+     }
+@@
+         "max_new_tokens": int(args.max_new_tokens),
+         "sha256_transcript_text_baseline": str(base_sha),
+         "sha256_transcript_text_gate": str(gate_sha),
+-        "mismatch_count": int(
+-            round(float(gate_metrics.get("live_mismatch_rate", 0.0)) * gate_metrics.get("tokens", 0))
+-        ),
++        "mismatch_count": int(gate_metrics.get("mismatch_count", 0) or 0),
+         "mismatch_examples": examples,
+         "baseline": {
+             "tokens": int(base_tokens),
+             "predictors_evaluated_sum": int(base_eval_sum),
+*** End Patch

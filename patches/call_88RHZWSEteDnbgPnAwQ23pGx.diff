@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+ class EngineConfig:
+@@
+     cycle_history: int = 512
+     min_new_tokens_before_eos: int = 8
++    # Gate-live (default OFF): use macro_router_v0 to restrict predictor evaluation.
++    router_live_enabled: bool = False
++    # Proof mode: compute baseline + gate per token, count mismatches, and fall back to baseline.
++    router_live_debug_compare: bool = False
+*** End Patch

@@ -1,0 +1,746 @@
+--- patches/v51_csv_loop_base/suite.py	2026-01-11 07:59:35
++++ atos_core/suite.py	2026-01-11 08:03:28
+@@ -701,6 +701,7 @@
+     prefix_k: int = 8,
+     template_ngram_n: int = 6,
+     template_prefix_window: int = 32,
++    csv: Any = None,
+ ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+     transcripts: List[Dict[str, Any]] = []
+     all_gen_tokens: List[str] = []
+@@ -725,6 +726,7 @@
+     trace_active_set_size: int = 0
+     trace_rewrite_rules_total: int = 0
+     trace_selector_present: int = 0
++    csv_step = 0
+ 
+     for i, turns in enumerate(dialogues):
+         history: List[Dict[str, str]] = []
+@@ -749,6 +751,19 @@
+             history[-1]["policy_coverage"] = float(out.get("policy_coverage") or 0.0)
+             history[-1]["user_sig"] = str(out.get("user_sig") or "")
+             history[-1]["trace"] = dict(out.get("trace") or {})
++            if csv is not None:
++                try:
++                    csv.observe_turn(
++                        step=int(csv_step),
++                        context_signature=f"chat␟d={i}␟t={j}",
++                        trace=history[-1]["trace"],
++                        utility_passed=None,
++                        suite_kind="chat",
++                        meta={"dialogue_id": int(i), "turn": int(j)},
++                    )
++                except Exception:
++                    pass
++                csv_step += 1
+ 
+             sig = reply_signature(resp)
+             reply_sigs.append(sig)
+@@ -864,6 +879,7 @@
+     *,
+     tasks: Sequence[Dict[str, Any]] = SKILL_DIALOGUES_V0,
+     max_new_tokens: int = 200,
++    csv: Any = None,
+ ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+     transcripts: List[Dict[str, Any]] = []
+     failures: List[Dict[str, Any]] = []
+@@ -878,6 +894,7 @@
+     plan_turns_missing = 0
+     contract_used_turns = 0
+     contract_used_by_kind: Counter = Counter()
++    csv_step = 0
+ 
+     for i, task in enumerate(tasks):
+         if not isinstance(task, dict):
+@@ -974,6 +991,22 @@
+                     }
+                 )
+ 
++        if csv is not None:
++            try:
++                tr = turn_rec.get("trace") or {}
++                if isinstance(tr, dict):
++                    csv.observe_turn(
++                        step=int(csv_step),
++                        context_signature=f"skill␟task={task_id}␟turn={validate_turn}",
++                        trace=tr,
++                        utility_passed=bool(ok),
++                        suite_kind="skill",
++                        meta={"task_id": str(task_id), "validate_turn": int(validate_turn), "validator_id": str(validator_id)},
++                    )
++                    csv_step += 1
++            except Exception:
++                pass
++
+     def _rate(ok: int, total: int) -> float:
+         return float(ok / total) if int(total) > 0 else 0.0
+ 
+--- patches/v51_csv_loop_base/concepts.py	2026-01-11 07:59:35
++++ atos_core/concepts.py	2026-01-11 08:00:54
+@@ -274,6 +274,11 @@
+ 
+ def execute_concept_subgraph(subgraph_ref: Dict[str, Any], inputs: Dict[str, Any]) -> Any:
+     kind = str(subgraph_ref.get("kind", ""))
++    if kind == "engine_turn_subgraph_v0":
++        ids = subgraph_ref.get("executed_predictor_act_ids") or []
++        if not isinstance(ids, list):
++            return []
++        return [str(x) for x in ids if isinstance(x, str)]
+     if kind == "unary_pipeline_v0":
+         ops = list(subgraph_ref.get("ops", []))
+         if len(inputs) != 1:
+@@ -289,6 +294,16 @@
+     raise ValueError(f"unknown_subgraph_kind:{kind}")
+ 
+ 
++def estimate_subgraph_cost_units(subgraph_ref: Dict[str, Any], output: Any) -> float:
++    kind = str(subgraph_ref.get("kind", ""))
++    if kind == "engine_turn_subgraph_v0":
++        if isinstance(output, list):
++            return float(len(output))
++        return 0.0
++    # Default: treat concept invocation as a single unit (compressed call).
++    return 1.0
++
++
+ @dataclass
+ class ConceptRegistry:
+     run_dir: str
+@@ -498,7 +513,7 @@
+ 
+         out = execute_concept_subgraph(c.subgraph_ref, inputs)
+         vr = run_validator(c.interface.validator_id, out, expected)
+-        cost_used = 1.0
++        cost_used = float(estimate_subgraph_cost_units(c.subgraph_ref, out))
+ 
+         self._append_evidence(
+             step=int(step),
+--- patches/v51_csv_loop_base/validators.py	2026-01-11 07:59:35
++++ atos_core/validators.py	2026-01-11 08:00:11
+@@ -3,7 +3,7 @@
+ import json
+ import re
+ from dataclasses import dataclass
+-from typing import Any, Callable, Dict, Optional
++from typing import Any, Callable, Dict, List, Optional
+ 
+ 
+ @dataclass(frozen=True)
+@@ -96,12 +96,42 @@
+     return ValidatorResult(True, "ok")
+ 
+ 
++def validate_list_contains_all_str(output: Any, expected: Any) -> ValidatorResult:
++    if not isinstance(output, (list, tuple)):
++        return ValidatorResult(False, "output_not_list")
++    out: List[str] = []
++    for x in output:
++        if isinstance(x, str):
++            out.append(x)
++        else:
++            return ValidatorResult(False, "output_non_str")
++    out_set = set(out)
++
++    if isinstance(expected, str):
++        exp_list = [expected]
++    elif isinstance(expected, (list, tuple)):
++        exp_list = []
++        for x in expected:
++            if isinstance(x, str):
++                exp_list.append(x)
++            else:
++                return ValidatorResult(False, "expected_non_str")
++    else:
++        return ValidatorResult(False, "expected_not_list_or_str")
++
++    missing = [x for x in exp_list if x not in out_set]
++    if missing:
++        return ValidatorResult(False, "missing_expected_items")
++    return ValidatorResult(True, "ok")
++
++
+ ValidatorFn = Callable[[Any, Any], ValidatorResult]
+ 
+ VALIDATORS: Dict[str, ValidatorFn] = {
+     "int_value_exact": validate_int_value_exact,
+     "int_text_canonical_exact": validate_int_text_canonical_exact,
+     "json_ab_int_exact": validate_json_ab_int_exact,
++    "list_contains_all_str": validate_list_contains_all_str,
+ }
+ 
+ 
+--- /dev/null	2026-01-11 08:03:23
++++ atos_core/csv_integration.py	2026-01-11 08:03:04
+@@ -0,0 +1,310 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .concept_miner import ConceptBirthTrigger
++from .concepts import Concept, ConceptInterface, ConceptRegistry, stable_hash_obj
++from .concepts import ConceptPolicies
++from .validators import run_validator
++
++
++def _safe_str_list(x: Any) -> List[str]:
++    if not isinstance(x, list):
++        return []
++    return [str(v) for v in x if isinstance(v, str) and str(v)]
++
++
++def _unique_preserve(xs: Sequence[str]) -> List[str]:
++    out: List[str] = []
++    seen = set()
++    for x in xs:
++        if x in seen:
++            continue
++        seen.add(x)
++        out.append(x)
++    return out
++
++
++def winners_unique_from_trace(trace: Dict[str, Any]) -> List[str]:
++    ids = trace.get("selected_source_act_ids")
++    lst = _safe_str_list(ids)
++    # Filter engine-only sources.
++    out = [x for x in lst if x and x not in {"__engine__", "__unknown__", "__contract__"}]
++    return sorted(set(out))
++
++
++def baseline_scan_cost_per_token_mean(trace: Dict[str, Any]) -> float:
++    pred_iter = trace.get("predictor_iterated")
++    if not isinstance(pred_iter, list):
++        return 0.0
++    vals = [int(x) for x in pred_iter if isinstance(x, int) and int(x) > 0]
++    if not vals:
++        return 0.0
++    return float(sum(vals) / len(vals))
++
++
++def executed_predictors_from_turn_subgraph(trace: Dict[str, Any]) -> List[str]:
++    sub = trace.get("subgraph") if isinstance(trace.get("subgraph"), dict) else {}
++    ids = sub.get("executed_predictor_act_ids") if isinstance(sub, dict) else []
++    return _safe_str_list(ids)
++
++
++def rewrite_hits_from_turn_subgraph(trace: Dict[str, Any]) -> List[str]:
++    sub = trace.get("subgraph") if isinstance(trace.get("subgraph"), dict) else {}
++    ids = sub.get("rewrite_rule_hit_ids") if isinstance(sub, dict) else []
++    return _safe_str_list(ids)
++
++
++def contract_used_from_trace(trace: Dict[str, Any]) -> bool:
++    meta = trace.get("instruction_contract")
++    return bool(isinstance(meta, dict) and bool(meta.get("used")))
++
++
++@dataclass
++class CSVLoopConfig:
++    mode: str = "shadow"  # "shadow" | "active"
++    birth_min_count: int = 5
++    birth_window_size: int = 200
++    birth_min_pass_rate: float = 0.0
++    birth_min_avg_cost: float = 1.0
++    candidate_prefix_k: int = 32
++    enable_empty_concept: bool = True
++    enable_top1_winner_concept: bool = True
++    enable_exec_prefix_concept: bool = True
++    # Evaluation policy (shadow): call both "stress" and "best" to prove lifecycle.
++    eval_stress: bool = True
++    eval_best: bool = True
++
++
++@dataclass
++class CSVLoopIntegration:
++    registry: ConceptRegistry
++    config: CSVLoopConfig = field(default_factory=CSVLoopConfig)
++    birth: ConceptBirthTrigger = field(init=False)
++
++    # Metrics for the run (shadow planner).
++    turns_observed: int = 0
++    turns_contract_used: int = 0
++    baseline_cost_sum: float = 0.0
++    shadow_cost_sum: float = 0.0
++    shadow_calls: int = 0
++    shadow_pass: int = 0
++    shadow_fail: int = 0
++
++    def __post_init__(self) -> None:
++        self.birth = ConceptBirthTrigger(
++            window_size=int(self.config.birth_window_size),
++            birth_min_count=int(self.config.birth_min_count),
++            birth_min_pass_rate=float(self.config.birth_min_pass_rate),
++            birth_min_avg_cost=float(self.config.birth_min_avg_cost),
++            policies=ConceptPolicies(),
++        )
++
++    def _interface(self) -> ConceptInterface:
++        return ConceptInterface(
++            input_schema={"turn_sig": "str"},
++            output_schema={"executed_predictor_act_ids": "list[str]"},
++            validator_id="list_contains_all_str",
++            preconditions={},
++            postconditions={},
++        )
++
++    def _candidate_subgraphs(
++        self,
++        *,
++        exec_pred_ids: List[str],
++        winners: List[str],
++        rr_hit_ids: List[str],
++    ) -> List[Tuple[str, Dict[str, Any]]]:
++        out: List[Tuple[str, Dict[str, Any]]] = []
++
++        if bool(self.config.enable_empty_concept):
++            out.append(
++                (
++                    "empty_gate",
++                    {
++                        "kind": "engine_turn_subgraph_v0",
++                        "executed_predictor_act_ids": [],
++                        "rewrite_rule_hit_ids": [],
++                    },
++                )
++            )
++
++        if bool(self.config.enable_top1_winner_concept) and winners:
++            # Take a deterministic representative winner. (sorted -> stable)
++            out.append(
++                (
++                    "top1_winner_gate",
++                    {
++                        "kind": "engine_turn_subgraph_v0",
++                        "executed_predictor_act_ids": [str(sorted(winners)[0])],
++                        "rewrite_rule_hit_ids": [],
++                    },
++                )
++            )
++
++        if bool(self.config.enable_exec_prefix_concept) and exec_pred_ids:
++            k = max(1, int(self.config.candidate_prefix_k))
++            out.append(
++                (
++                    f"exec_prefix_{k}",
++                    {
++                        "kind": "engine_turn_subgraph_v0",
++                        "executed_predictor_act_ids": list(exec_pred_ids[:k]),
++                        "rewrite_rule_hit_ids": list(rr_hit_ids),
++                    },
++                )
++            )
++
++        return out
++
++    def _birth_observe(
++        self,
++        *,
++        step: int,
++        context_signature: str,
++        subgraph_ref: Dict[str, Any],
++        passed: bool,
++        cost_used: float,
++    ) -> Optional[Concept]:
++        iface = self._interface()
++        key = stable_hash_obj({"label": "csv_turn", "subgraph_ref": subgraph_ref, "iface": iface.to_dict()})
++        return self.birth.observe(
++            registry=self.registry,
++            key=key,
++            step=int(step),
++            subgraph_ref=subgraph_ref,
++            interface=iface,
++            context_signature=str(context_signature),
++            passed=bool(passed),
++            cost_used=float(cost_used),
++        )
++
++    def _pick_best_concept(self, *, iface: ConceptInterface) -> Optional[Concept]:
++        alive = [c for c in self.registry.alive_concepts() if c.interface.type_signature() == iface.type_signature()]
++        if not alive:
++            return None
++        # Score: U/(1+K) with deterministic tie-break. Small anti-monopoly penalty by call share.
++        total_calls = max(1, sum(int(c.calls_total) for c in alive))
++        scored: List[Tuple[float, str, Concept]] = []
++        for c in alive:
++            share = float(int(c.calls_total)) / float(total_calls)
++            score = float(c.u_ema) / (1.0 + float(c.k_ema))
++            if share > 0.9:
++                score -= 0.05 * (share - 0.9)
++            scored.append((score, str(c.id), c))
++        scored.sort(key=lambda t: (-t[0], t[1]))
++        return scored[0][2]
++
++    def _pick_stress_concept(self, *, iface: ConceptInterface) -> Optional[Concept]:
++        alive = [c for c in self.registry.alive_concepts() if c.interface.type_signature() == iface.type_signature()]
++        if not alive:
++            return None
++        # Prefer smallest cost (brittle) to force pruning demonstration; tie-break by id.
++        alive.sort(key=lambda c: (float(c.k_ema), str(c.id)))
++        return alive[0]
++
++    def observe_turn(
++        self,
++        *,
++        step: int,
++        context_signature: str,
++        trace: Dict[str, Any],
++        utility_passed: Optional[bool] = None,
++        suite_kind: str = "chat",
++        meta: Optional[Dict[str, Any]] = None,
++    ) -> None:
++        meta = dict(meta or {})
++        self.turns_observed += 1
++
++        contract_used = contract_used_from_trace(trace)
++        if bool(contract_used):
++            self.turns_contract_used += 1
++
++        winners = winners_unique_from_trace(trace) if not bool(contract_used) else []
++        exec_pred_ids = executed_predictors_from_turn_subgraph(trace) if not bool(contract_used) else []
++        rr_hit_ids = rewrite_hits_from_turn_subgraph(trace) if not bool(contract_used) else []
++
++        baseline_cost = baseline_scan_cost_per_token_mean(trace) if not bool(contract_used) else 0.0
++        self.baseline_cost_sum += float(baseline_cost)
++
++        iface = self._interface()
++
++        # Log baseline "primitives" execution as a trace-subgraph object (observability only).
++        base_out = list(exec_pred_ids)
++        base_vr = run_validator(iface.validator_id, base_out, winners)
++        self.registry.log_primitives(
++            step=int(step),
++            subgraph_ref={
++                "kind": "engine_turn_trace_v0",
++                "executed_predictor_act_ids": list(exec_pred_ids),
++                "rewrite_rule_hit_ids": list(rr_hit_ids),
++            },
++            interface=iface,
++            inputs={"suite": str(suite_kind), "turn_sig": str(context_signature), **meta},
++            expected=list(winners),
++            output=base_out,
++            validator_result=base_vr,
++            cost_used=float(baseline_cost),
++            baseline_cost=float(baseline_cost),
++            context_signature=str(context_signature),
++            call_depth=0,
++            note="baseline_trace_only",
++        )
++
++        # Birth triggers (purely observational; do not depend on contract mode).
++        # For v51 we do not require an external utility validator: default to True.
++        birth_pass = bool(utility_passed) if utility_passed is not None else True
++        for _label, sub in self._candidate_subgraphs(
++            exec_pred_ids=exec_pred_ids, winners=winners, rr_hit_ids=rr_hit_ids
++        ):
++            self._birth_observe(
++                step=int(step),
++                context_signature=str(context_signature),
++                subgraph_ref=sub,
++                passed=bool(birth_pass),
++                cost_used=float(baseline_cost),
++            )
++
++        # Shadow evaluation: concept calls must never affect generation. If a contract is active,
++        # skip any "active" behavior; at most log bypass.
++        if str(self.config.mode) not in {"shadow", "active"}:
++            return
++        if bool(contract_used):
++            return
++
++        def _shadow_call(concept: Concept, role: str) -> None:
++            nonlocal baseline_cost, winners
++            out, vr, cost_used = self.registry.call(
++                step=int(step),
++                concept_id=str(concept.id),
++                inputs={
++                    "csv_mode": str(self.config.mode),
++                    "csv_role": str(role),
++                    "suite": str(suite_kind),
++                    "turn_sig": str(context_signature),
++                    **meta,
++                },
++                expected=list(winners),
++                context_signature=str(context_signature),
++                call_depth=0,
++                baseline_cost=float(baseline_cost),
++                contract_active=False,
++            )
++            self.shadow_calls += 1
++            if bool(vr.passed):
++                self.shadow_pass += 1
++            else:
++                self.shadow_fail += 1
++            self.shadow_cost_sum += float(cost_used)
++
++        if bool(self.config.eval_stress):
++            c = self._pick_stress_concept(iface=iface)
++            if c is not None:
++                _shadow_call(c, role="stress")
++
++        if bool(self.config.eval_best):
++            c = self._pick_best_concept(iface=iface)
++            if c is not None:
++                _shadow_call(c, role="best")
+--- /dev/null	2026-01-11 08:03:23
++++ scripts/csv_loop_integration_demo.py	2026-01-11 08:04:19
+@@ -0,0 +1,259 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.csv_integration import CSVLoopConfig, CSVLoopIntegration
++from atos_core.concepts import ConceptRegistry
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import CHAT_DIALOGUES_20X3, SKILL_DIALOGUES_V0, run_chat_suite, run_skill_suite
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()
++
++
++def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def shannon_entropy(counts: Dict[str, int]) -> float:
++    total = float(sum(int(v) for v in counts.values()))
++    if total <= 0:
++        return 0.0
++    import math
++
++    ent = 0.0
++    for v in counts.values():
++        p = float(v) / total
++        if p > 0:
++            ent -= p * math.log(p, 2)
++    return float(ent)
++
++
++def load_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def summarize_csv_run(*, run_dir: str, registry: ConceptRegistry) -> Dict[str, Any]:
++    concepts_path = os.path.join(run_dir, "concepts.jsonl")
++    evidence_path = os.path.join(run_dir, "concept_evidence.jsonl")
++    telemetry_path = os.path.join(run_dir, "concept_telemetry.jsonl")
++
++    births = 0
++    if os.path.exists(concepts_path):
++        for row in load_jsonl(concepts_path):
++            if row.get("event") == "DEFINE":
++                births += 1
++
++    prunes = 0
++    if os.path.exists(evidence_path):
++        for row in load_jsonl(evidence_path):
++            if row.get("event") == "PRUNE":
++                prunes += 1
++
++    call_rows = 0
++    pass_rows = 0
++    cost_used_sum = 0.0
++    cost_base_sum = 0.0
++    type_counts: Dict[str, int] = {}
++    concept_call_counts: Dict[str, int] = {}
++    if os.path.exists(telemetry_path):
++        for row in load_jsonl(telemetry_path):
++            ev = str(row.get("event") or "")
++            if ev.startswith("CALL"):
++                call_rows += 1
++                if bool(row.get("validator_passed")):
++                    pass_rows += 1
++                cost_used_sum += float(row.get("cost_used") or 0.0)
++                cost_base_sum += float(row.get("baseline_cost") or 0.0)
++                cid = row.get("concept_id")
++                if isinstance(cid, str) and cid:
++                    concept_call_counts[cid] = concept_call_counts.get(cid, 0) + 1
++
++            ct = row.get("concept_type")
++            if isinstance(ct, str) and ct:
++                type_counts[ct] = type_counts.get(ct, 0) + 1
++
++    pass_rate = float(pass_rows / call_rows) if call_rows > 0 else 0.0
++    avg_cost_base = float(cost_base_sum / call_rows) if call_rows > 0 else 0.0
++    avg_cost_used = float(cost_used_sum / call_rows) if call_rows > 0 else 0.0
++    avg_cost_saved = float(avg_cost_base - avg_cost_used)
++
++    entropy_types = shannon_entropy(type_counts)
++    monopoly = None
++    if concept_call_counts:
++        total_calls = sum(int(v) for v in concept_call_counts.values())
++        top_cid, top_n = sorted(concept_call_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
++        share = float(top_n) / float(max(1, total_calls))
++        if share >= 0.8:
++            monopoly = {"concept_id": str(top_cid), "share": float(share)}
++
++    alive = [c for c in registry.concepts() if bool(c.alive)]
++
++    # Category-theory checks (MVP): only unary_pipeline concepts participate; none expected here.
++    composition = {"identity_error": 0, "assoc_error": 0, "checked": 0}
++
++    return {
++        "births": int(births),
++        "prunes": int(prunes),
++        "alive_count": int(len(alive)),
++        "totals": {
++            "calls": int(call_rows),
++            "pass_rate": float(pass_rate),
++            "avg_cost_baseline": float(avg_cost_base),
++            "avg_cost_used": float(avg_cost_used),
++            "avg_cost_saved": float(avg_cost_saved),
++        },
++        "types": {
++            "entropy_types": float(entropy_types),
++            "entropy_collapse": bool(entropy_types < 0.5 and sum(type_counts.values()) >= 10),
++            "type_counts": dict(sorted((k, int(v)) for k, v in type_counts.items())),
++        },
++        "alarms": {"monopoly": monopoly},
++        "composition": composition,
++        "chains": registry.verify_chains(),
++        "paths": {
++            "concepts_jsonl": concepts_path,
++            "concept_evidence_jsonl": evidence_path,
++            "concept_telemetry_jsonl": telemetry_path,
++        },
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run", required=True, help="Existing run dir containing acts.jsonl (read-only)")
++    ap.add_argument("--out", required=True, help="New WORM out dir for CSV logs (must not exist)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=80)
++    ap.add_argument("--suite", choices=["chat", "skill"], default="chat")
++    ap.add_argument("--enable_contracts", action="store_true")
++    args = ap.parse_args()
++
++    acts_path = os.path.join(str(args.run), "acts.jsonl")
++    store = ActStore.load_jsonl(acts_path)
++
++    # Baseline (CSV off)
++    eng0 = Engine(store, seed=int(args.seed), config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
++    if str(args.suite) == "skill":
++        base_transcripts, base_metrics = run_skill_suite(
++            eng0, tasks=SKILL_DIALOGUES_V0, max_new_tokens=int(args.max_new_tokens), csv=None
++        )
++    else:
++        base_transcripts, base_metrics = run_chat_suite(
++            eng0,
++            dialogues=CHAT_DIALOGUES_20X3,
++            max_new_tokens=int(args.max_new_tokens),
++            prefix_k=8,
++            template_ngram_n=6,
++            template_prefix_window=32,
++            csv=None,
++        )
++    base_text = transcripts_text(base_transcripts)
++    base_hash = sha256_text(base_text)
++
++    # Shadow (CSV on, no output influence)
++    out_dir = str(args.out)
++    if os.path.exists(out_dir):
++        raise SystemExit(f"--out already exists (WORM): {out_dir}")
++    registry = ConceptRegistry(run_dir=out_dir)
++    csv = CSVLoopIntegration(
++        registry=registry,
++        config=CSVLoopConfig(
++            mode="shadow",
++            birth_min_count=5,
++            birth_window_size=200,
++            birth_min_pass_rate=0.0,
++            birth_min_avg_cost=1.0,
++            candidate_prefix_k=32,
++            enable_empty_concept=True,
++            enable_top1_winner_concept=True,
++            enable_exec_prefix_concept=True,
++            eval_stress=True,
++            eval_best=True,
++        ),
++    )
++
++    eng1 = Engine(store, seed=int(args.seed), config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
++    if str(args.suite) == "skill":
++        shadow_transcripts, shadow_metrics = run_skill_suite(
++            eng1, tasks=SKILL_DIALOGUES_V0, max_new_tokens=int(args.max_new_tokens), csv=csv
++        )
++    else:
++        shadow_transcripts, shadow_metrics = run_chat_suite(
++            eng1,
++            dialogues=CHAT_DIALOGUES_20X3,
++            max_new_tokens=int(args.max_new_tokens),
++            prefix_k=8,
++            template_ngram_n=6,
++            template_prefix_window=32,
++            csv=csv,
++        )
++    shadow_text = transcripts_text(shadow_transcripts)
++    shadow_hash = sha256_text(shadow_text)
++    invariance_ok = bool(base_hash == shadow_hash)
++    if not invariance_ok:
++        raise SystemExit("OUTPUT_INVARIANCE_FAILED: sha256(baseline)!=sha256(shadow)")
++
++    summary: Dict[str, Any] = {
++        "seed": int(args.seed),
++        "suite": str(args.suite),
++        "max_new_tokens": int(args.max_new_tokens),
++        "acts_source_run": str(args.run),
++        "out_dir": out_dir,
++        "output_invariance": {
++            "sha256_transcript_text_baseline": base_hash,
++            "sha256_transcript_text_shadow": shadow_hash,
++            "ok": bool(invariance_ok),
++        },
++        "baseline_suite_metrics": dict(base_metrics),
++        "shadow_suite_metrics": dict(shadow_metrics),
++        "csv": summarize_csv_run(run_dir=out_dir, registry=registry),
++    }
++
++    # Reproducibility hashes for the new run dir.
++    summary["sha256"] = {
++        "acts_jsonl": sha256_file(acts_path),
++        "concepts_jsonl": sha256_file(os.path.join(out_dir, "concepts.jsonl")),
++        "concept_evidence_jsonl": sha256_file(os.path.join(out_dir, "concept_evidence.jsonl")),
++        "concept_telemetry_jsonl": sha256_file(os.path.join(out_dir, "concept_telemetry.jsonl")),
++    }
++
++    summary_path = os.path.join(out_dir, "concept_summary.json")
++    with open(summary_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps(summary, ensure_ascii=False, indent=2))
++        f.write("\n")
++
++    print(json.dumps(summary, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
++

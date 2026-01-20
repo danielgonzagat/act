@@ -1,0 +1,45 @@
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+-if __name__ == "__main__":
+-    main()
+-    )
+-    live_eval_sum, live_tokens = sum_metric_over_selected_tokens(
+-        gate_transcripts, metric_key="router_live_predictors_evaluated"
+-    )
+-
+-    gate_metrics, examples = collect_gate_live_metrics(gate_transcripts)
+-
+-    # Compute skip rate from counts (simulated live cost).
+-    would_skip_rate = 0.0
+-    if base_eval_sum > 0:
+-        would_skip_rate = float((base_eval_sum - live_eval_sum) / base_eval_sum)
+-
+-    out: Dict[str, Any] = {
+-        "run": str(args.run),
+-        "seed": int(args.seed),
+-        "max_new_tokens": int(args.max_new_tokens),
+-        "sha256_transcript_text_baseline": str(base_sha),
+-        "sha256_transcript_text_gate": str(gate_sha),
+-        "mismatch_count": int(gate_metrics.get("mismatch_count", 0) or 0),
+-        "mismatch_examples": examples,
+-        "baseline": {
+-            "tokens": int(base_tokens),
+-            "predictors_evaluated_sum": int(base_eval_sum),
+-            "predictors_evaluated_per_token_mean": float(base_eval_sum / max(1, base_tokens)),
+-        },
+-        "gate_live": {
+-            **gate_metrics,
+-            "predictors_evaluated_sum": int(live_eval_sum),
+-            "predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, live_tokens)),
+-            "live_would_skip_rate": float(would_skip_rate),
+-        },
+-    }
+-    print(json.dumps(out, ensure_ascii=False, indent=2))
+-
+-
+-if __name__ == "__main__":
+-    main()
++if __name__ == "__main__":
++    main()
+*** End Patch

@@ -1,0 +1,1037 @@
+--- /dev/null	2026-01-16 15:08:39
++++ atos_core/world_pressure_validators_v123.py	2026-01-16 14:58:45
+@@ -0,0 +1,240 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .external_world_gate_v122 import (
++    EXTERNAL_WORLD_ACTION_SEARCH_V122,
++    compute_external_world_chain_hash_v122,
++    external_world_access_v122,
++    verify_external_world_event_sig_chain_v122,
++)
++
++WORLD_PRESSURE_SCHEMA_VERSION_V123 = 123
++
++# Closed set of V123 reason codes (hard gate).
++HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123 = "historical_regression_without_causal_diff_v123"
++HISTORICAL_WORLD_IGNORED_V123 = "historical_world_ignored_v123"
++REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123 = "reuse_required_but_not_attempted_v123"
++IAC_MISSING_GOAL_V123 = "iac_missing_goal_v123"
++IAC_MISSING_PLAN_V123 = "iac_missing_plan_v123"
++IAC_MISSING_EVAL_V123 = "iac_missing_eval_v123"
++IAC_MISSING_CONSEQUENCE_V123 = "iac_missing_consequence_v123"
++EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123 = "exhausted_but_world_has_viable_candidate_v123"
++WORLD_EVIDENCE_MISSING_OR_INVALID_V123 = "world_evidence_missing_or_invalid_v123"
++
++WORLD_PRESSURE_REASON_CODES_V123 = {
++    HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123,
++    HISTORICAL_WORLD_IGNORED_V123,
++    REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123,
++    IAC_MISSING_GOAL_V123,
++    IAC_MISSING_PLAN_V123,
++    IAC_MISSING_EVAL_V123,
++    IAC_MISSING_CONSEQUENCE_V123,
++    EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123,
++    WORLD_EVIDENCE_MISSING_OR_INVALID_V123,
++}
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _write_jsonl_x(path: str, rows: Sequence[Dict[str, Any]]) -> None:
++    _ensure_absent(path)
++    with open(path, "x", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++
++
++def fail_signature_v123(*, validator_name: str, reason_code: str, context: Dict[str, Any]) -> str:
++    """
++    Deterministic failure signature for anti-regression lookup.
++    """
++    body = {
++        "schema_version": int(WORLD_PRESSURE_SCHEMA_VERSION_V123),
++        "validator_name": str(validator_name),
++        "reason_code": str(reason_code),
++        "context": dict(context),
++    }
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def should_consult_world_v123(*, reason_code: str, repeated_count: int, is_exhaustion: bool) -> bool:
++    if bool(is_exhaustion):
++        return True
++    return int(repeated_count) >= 1
++
++
++@dataclass(frozen=True)
++class ExternalWorldConsultV123:
++    query: str
++    hits_total: int
++    evidence_ids: List[str]
++    external_world_chain_hash_v122: str
++    result_summary: Dict[str, Any]
++    events: List[Dict[str, Any]]
++    evidences: List[Dict[str, Any]]
++
++
++def consult_external_world_v123(
++    *,
++    manifest_path: str,
++    query: str,
++    seed: int,
++    turn_index: int,
++    prev_event_sig: str,
++    out_dir: str,
++    allowed: bool,
++    reason_code: str,
++    limit: int = 3,
++    source_filter: str = "engineering_doc",
++    artifact_prefix: str = "external_world",
++) -> ExternalWorldConsultV123:
++    """
++    Consult the unified ExternalWorld via the V122 gate and write WORM artifacts under out_dir.
++    """
++    evs, evids, result_summary = external_world_access_v122(
++        allowed=bool(allowed),
++        manifest_path=str(manifest_path),
++        action=str(EXTERNAL_WORLD_ACTION_SEARCH_V122),
++        reason_code=str(reason_code),
++        args={"query": str(query), "limit": int(limit), "source_filter": str(source_filter), "roles": []},
++        seed=int(seed),
++        turn_index=int(turn_index),
++        prev_event_sig=str(prev_event_sig or ""),
++    )
++
++    ap = str(artifact_prefix or "external_world")
++    events_path = os.path.join(str(out_dir), f"{ap}_events_v123.jsonl")
++    evidence_path = os.path.join(str(out_dir), f"{ap}_evidence_v123.jsonl")
++    snap_path = os.path.join(str(out_dir), f"{ap}_registry_snapshot_v123.json")
++    _write_jsonl_x(events_path, list(evs))
++    _write_jsonl_x(evidence_path, list(evids))
++
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v122(list(evs))
++    if not bool(ok_sig):
++        raise ValueError(f"external_world_event_sig_chain_fail:{reason_sig}")
++    chain_hash = compute_external_world_chain_hash_v122(list(evs))
++
++    snap = {
++        "schema_version": int(WORLD_PRESSURE_SCHEMA_VERSION_V123),
++        "kind": "external_world_registry_snapshot_v123",
++        "events_total": int(len(evs)),
++        "external_world_chain_hash_v122": str(chain_hash),
++        "sha256": {
++            "events_jsonl": _sha256_file(events_path),
++            "evidence_jsonl": _sha256_file(evidence_path),
++        },
++    }
++    snap["snapshot_sig"] = sha256_hex(canonical_json_dumps(snap).encode("utf-8"))
++    _write_once_json(snap_path, snap)
++
++    hits_total = int(result_summary.get("hits_total") or 0)
++    evidence_ids = list(result_summary.get("evidence_ids") or [])
++    if not evidence_ids:
++        # Derive evidence IDs from the evidence objects.
++        evidence_ids = [str(e.get("evidence_id") or "") for e in evids if isinstance(e, dict)]
++        evidence_ids = [x for x in evidence_ids if x]
++    return ExternalWorldConsultV123(
++        query=str(query),
++        hits_total=int(hits_total),
++        evidence_ids=list(evidence_ids),
++        external_world_chain_hash_v122=str(chain_hash),
++        result_summary=dict(result_summary),
++        events=list(evs),
++        evidences=list(evids),
++    )
++
++
++def validate_iac_v123(
++    *,
++    goal_ok: bool,
++    plan_ok: bool,
++    eval_ok: bool,
++    consequence_ok: bool,
++) -> Tuple[bool, str]:
++    """
++    Hard IAC gate: Intention -> Action -> Consequence must exist.
++    """
++    if not bool(goal_ok):
++        return False, IAC_MISSING_GOAL_V123
++    if not bool(plan_ok):
++        return False, IAC_MISSING_PLAN_V123
++    if not bool(eval_ok):
++        return False, IAC_MISSING_EVAL_V123
++    if not bool(consequence_ok):
++        return False, IAC_MISSING_CONSEQUENCE_V123
++    return True, "ok"
++
++
++def validate_historical_regression_v123(
++    *,
++    repeated: bool,
++    world_hits_total: int,
++    causal_diff_present: bool,
++) -> Tuple[bool, str]:
++    """
++    If a failure repeats and the world contains any evidence hits, a causal diff is required.
++    """
++    if bool(repeated) and int(world_hits_total) > 0 and not bool(causal_diff_present):
++        return False, HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123
++    return True, "ok"
++
++
++def validate_exhaustion_with_world_v123(
++    *,
++    exhausted: bool,
++    world_hits_total: int,
++) -> Tuple[bool, str]:
++    """
++    If exhaustion is declared and the world has any hits for the query, treat as not-proved (fail).
++    """
++    if bool(exhausted) and int(world_hits_total) > 0:
++        return False, EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123
++    return True, "ok"
++
++
++def validate_reuse_required_v123(
++    *,
++    world_hits_total: int,
++    reuse_attempted: bool,
++) -> Tuple[bool, str]:
++    """
++    Hard gate: if the world indicates a viable candidate exists, require an explicit reuse attempt
++    before declaring failure/exhaustion.
++
++    In V123 minimal form, "reuse_attempted" is a structured boolean set by the caller (runtime).
++    """
++    if int(world_hits_total) > 0 and not bool(reuse_attempted):
++        return False, REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123
++    return True, "ok"
+--- /dev/null	2026-01-16 15:08:39
++++ atos_core/conversation_loop_v123.py	2026-01-16 15:01:17
+@@ -0,0 +1,276 @@
++from __future__ import annotations
++
++import json
++import os
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .conversation_loop_v121 import FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V121, run_conversation_v121
++from .world_pressure_validators_v123 import (
++    WORLD_PRESSURE_SCHEMA_VERSION_V123,
++    consult_external_world_v123,
++    fail_signature_v123,
++    validate_exhaustion_with_world_v123,
++    validate_historical_regression_v123,
++    validate_iac_v123,
++    validate_reuse_required_v123,
++)
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if isinstance(obj, dict):
++                out.append(dict(obj))
++    return list(out)
++
++
++def _iac_snapshot_from_run_dir(run_dir: str) -> Dict[str, bool]:
++    rd = str(run_dir)
++    goal_ok = os.path.exists(os.path.join(rd, "goal_plan_eval_summary_v115.json"))
++    plan_ok = os.path.exists(os.path.join(rd, "action_plans.jsonl")) or os.path.exists(os.path.join(rd, "plan_events.jsonl"))
++    eval_ok = os.path.exists(os.path.join(rd, "objective_evals.jsonl"))
++    consequence_ok = bool(eval_ok) and bool(plan_ok)
++    return {
++        "goal_ok": bool(goal_ok),
++        "plan_ok": bool(plan_ok),
++        "eval_ok": bool(eval_ok),
++        "consequence_ok": bool(consequence_ok),
++    }
++
++
++def _pick_repeated_fail_reason_v123(*, replan_trace: Dict[str, Any]) -> Tuple[str, int]:
++    attempts = replan_trace.get("attempts") if isinstance(replan_trace.get("attempts"), list) else []
++    counts: Dict[str, int] = {}
++    for a in attempts:
++        if not isinstance(a, dict):
++            continue
++        ok = bool(a.get("ok_final_v116", False))
++        if ok:
++            continue
++        reason = str(a.get("reason_final_v116") or "")
++        if not reason:
++            continue
++        counts[reason] = int(counts.get(reason, 0)) + 1
++    for reason, cnt in sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))):
++        if int(cnt) >= 2:
++            return str(reason), int(cnt)
++    return "", 0
++
++
++def run_conversation_v123(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_plan_attempts: int = 8,
++    max_replans_per_turn: int = 3,
++    goal_autopilot_total_steps: int = 60,
++    external_world_manifest_path: str = "external_world_v122/manifest_v122.json",
++) -> Dict[str, Any]:
++    """
++    V123: "world pressure validators as law" wrapper over V121.
++
++    Minimal hard gates:
++      - IAC presence (goal/plan/eval/consequence) as a deterministic contract.
++      - Exhaustion consult: if exhausted, consult external world under progress_blocked.
++        If any hits exist, exhaustion is treated as not-proved (fail reason overridden).
++    """
++    od = str(out_dir)
++    _ensure_absent(od)
++
++    base = run_conversation_v121(
++        user_turn_texts=list(user_turn_texts),
++        out_dir=str(od),
++        seed=int(seed),
++        max_plan_attempts=int(max_plan_attempts),
++        max_replans_per_turn=int(max_replans_per_turn),
++        goal_autopilot_total_steps=int(goal_autopilot_total_steps),
++    )
++
++    fr121_path = os.path.join(od, "final_response_v121.json")
++    fr121 = _read_json(fr121_path) if os.path.exists(fr121_path) else {}
++    base_ok = bool(fr121.get("ok", False)) if isinstance(fr121, dict) else False
++    base_reason = str(fr121.get("reason") or "") if isinstance(fr121, dict) else "missing_final_response_v121"
++
++    iac = _iac_snapshot_from_run_dir(str(od))
++    ok_iac, reason_iac = validate_iac_v123(
++        goal_ok=bool(iac.get("goal_ok", False)),
++        plan_ok=bool(iac.get("plan_ok", False)),
++        eval_ok=bool(iac.get("eval_ok", False)),
++        consequence_ok=bool(iac.get("consequence_ok", False)),
++    )
++
++    consulted: Optional[Dict[str, Any]] = None
++    anti_regression: Optional[Dict[str, Any]] = None
++    reuse: Optional[Dict[str, Any]] = None
++    final_ok = bool(base_ok) and bool(ok_iac)
++    final_reason = "ok" if bool(final_ok) else (str(reason_iac) if not bool(ok_iac) else str(base_reason or "fail"))
++
++    progress_blocked = not bool(final_ok)
++
++    # Anti-regression (minimal): if a failure reason repeats across attempts AND we're already blocked,
++    # consult the world (forced) and require an explicit causal diff if the world has evidence.
++    replan_trace_path = os.path.join(od, "replan_trace_v121.json")
++    replan_trace = _read_json(replan_trace_path) if os.path.exists(replan_trace_path) else {}
++    rep_reason, rep_count = _pick_repeated_fail_reason_v123(replan_trace=dict(replan_trace) if isinstance(replan_trace, dict) else {})
++    if bool(progress_blocked) and rep_reason:
++        sig = fail_signature_v123(validator_name="anti_regression_v123", reason_code=str(rep_reason), context={"count": int(rep_count)})
++        try:
++            rep_consult = consult_external_world_v123(
++                manifest_path=str(external_world_manifest_path),
++                query=str(rep_reason),
++                seed=int(seed),
++                turn_index=int(len(list(user_turn_texts))),
++                prev_event_sig="",
++                out_dir=str(od),
++                allowed=True,
++                reason_code="progress_blocked",
++                limit=3,
++                source_filter="engineering_doc",
++                artifact_prefix="external_world_antiregression",
++            )
++            ok_ar, reason_ar = validate_historical_regression_v123(
++                repeated=True,
++                world_hits_total=int(rep_consult.hits_total),
++                # V123 default: no causal diff object is produced by the runtime yet.
++                causal_diff_present=False,
++            )
++            anti_regression = {
++                "repeated_reason": str(rep_reason),
++                "repeated_count": int(rep_count),
++                "fail_signature": str(sig),
++                "world_hits_total": int(rep_consult.hits_total),
++                "evidence_ids": list(rep_consult.evidence_ids),
++                "ok": bool(ok_ar),
++                "reason": str(reason_ar),
++            }
++            if not bool(ok_ar):
++                final_ok = False
++                final_reason = str(reason_ar)
++        except Exception:
++            final_ok = False
++            final_reason = "historical_world_ignored_v123"
++
++    # If exhausted/budget failure, consult world once (hard pressure).
++    is_exhaustion = str(base_reason) in {str(FAIL_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V121), "goal_exhausted_v121"} or "exhaust" in str(base_reason)
++    if bool(progress_blocked) and bool(is_exhaustion):
++        try:
++            consult = consult_external_world_v123(
++                manifest_path=str(external_world_manifest_path),
++                query=str(base_reason),
++                seed=int(seed),
++                turn_index=int(len(list(user_turn_texts))),
++                prev_event_sig="",
++                out_dir=str(od),
++                allowed=True,
++                reason_code="progress_blocked",
++                limit=3,
++                source_filter="engineering_doc",
++                artifact_prefix="external_world_exhaustion",
++            )
++            consulted = {
++                "query": str(consult.query),
++                "hits_total": int(consult.hits_total),
++                "evidence_ids": list(consult.evidence_ids),
++                "external_world_chain_hash_v122": str(consult.external_world_chain_hash_v122),
++            }
++            ok_exh, reason_exh = validate_exhaustion_with_world_v123(exhausted=True, world_hits_total=int(consult.hits_total))
++            if not bool(ok_exh):
++                final_ok = False
++                final_reason = str(reason_exh)
++        except Exception:
++            # Fail-closed: world consult required but failed.
++            final_ok = False
++            final_reason = "historical_world_ignored_v123"
++
++    # Reuse-required (minimal): when blocked (non-exhaustion), consult the world for a reuse hint.
++    # If any hits exist, fail-closed unless the runtime records an explicit reuse attempt.
++    if bool(progress_blocked) and not bool(is_exhaustion) and not rep_reason:
++        try:
++            consult = consult_external_world_v123(
++                manifest_path=str(external_world_manifest_path),
++                query=str(base_reason),
++                seed=int(seed),
++                turn_index=int(len(list(user_turn_texts))),
++                prev_event_sig="",
++                out_dir=str(od),
++                allowed=True,
++                reason_code="progress_blocked",
++                limit=3,
++                source_filter="engineering_doc",
++                artifact_prefix="external_world_reuse",
++            )
++            ok_reuse, reason_reuse = validate_reuse_required_v123(world_hits_total=int(consult.hits_total), reuse_attempted=False)
++            reuse = {
++                "query": str(consult.query),
++                "hits_total": int(consult.hits_total),
++                "evidence_ids": list(consult.evidence_ids),
++                "ok": bool(ok_reuse),
++                "reason": str(reason_reuse),
++            }
++            if not bool(ok_reuse):
++                final_ok = False
++                final_reason = str(reason_reuse)
++        except Exception:
++            final_ok = False
++            final_reason = "historical_world_ignored_v123"
++
++    world_pressure_summary = {
++        "schema_version": int(WORLD_PRESSURE_SCHEMA_VERSION_V123),
++        "kind": "world_pressure_summary_v123",
++        "iac": dict(iac),
++        "iac_ok": bool(ok_iac),
++        "iac_reason": str(reason_iac),
++        "anti_regression": dict(anti_regression) if isinstance(anti_regression, dict) else None,
++        "reuse": dict(reuse) if isinstance(reuse, dict) else None,
++        "consulted": dict(consulted) if isinstance(consulted, dict) else None,
++        "final_ok": bool(final_ok),
++        "final_reason": str(final_reason),
++        "upstream": {"final_response_v121": dict(fr121) if isinstance(fr121, dict) else {}},
++    }
++    world_pressure_summary["summary_sig"] = sha256_hex(canonical_json_dumps(world_pressure_summary).encode("utf-8"))
++    _write_once_json(os.path.join(od, "world_pressure_summary_v123.json"), dict(world_pressure_summary))
++
++    final_obj = {
++        "schema_version": int(WORLD_PRESSURE_SCHEMA_VERSION_V123),
++        "kind": "final_response_v123",
++        "ok": bool(final_ok),
++        "reason": str(final_reason if not bool(final_ok) else "ok"),
++        "upstream": {"final_response_v121": dict(fr121) if isinstance(fr121, dict) else {}},
++    }
++    final_obj["final_sig"] = sha256_hex(canonical_json_dumps(final_obj).encode("utf-8"))
++    _write_once_json(os.path.join(od, "final_response_v123.json"), dict(final_obj))
++
++    out = dict(base) if isinstance(base, dict) else {}
++    out.update({"final_ok_v123": bool(final_ok), "final_reason_v123": str(final_reason), "iac": dict(iac)})
++    return out
+--- /dev/null	2026-01-16 15:08:39
++++ scripts/run_family7_dla_v123.py	2026-01-16 15:03:25
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v123 import run_conversation_v123
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", default=9999, type=int)
++    ap.add_argument("--max_plan_attempts", default=8, type=int)
++    ap.add_argument("--max_replans_per_turn", default=3, type=int)
++    ap.add_argument("--goal_autopilot_total_steps", default=60, type=int)
++    args = ap.parse_args()
++
++    tasks_path = Path(str(args.tasks))
++    out_dir = Path(str(args.out))
++    seed = int(args.seed)
++
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        raise SystemExit("tasks_empty")
++
++    tasks_total = min(int(len(tasks)), int(args.max_tasks))
++    results: List[Dict[str, Any]] = []
++
++    for i in range(tasks_total):
++        task = tasks[i]
++        task_id = str(task.get("task_id") or f"task_{i:03d}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        world_manifest = str(task.get("world_manifest") or "external_world_v122/manifest_v122.json")
++
++        task_dir = out_dir / "task_{i:03d}".format(i=i)
++        _ensure_absent(task_dir)
++        task_dir.mkdir(parents=True, exist_ok=False)
++
++        attempt_dir = task_dir / "attempt_000"
++        _ensure_absent(attempt_dir)
++
++        run_conversation_v123(
++            user_turn_texts=list(user_turn_texts),
++            out_dir=str(attempt_dir),
++            seed=int(seed) + int(i),
++            max_plan_attempts=int(args.max_plan_attempts),
++            max_replans_per_turn=int(args.max_replans_per_turn),
++            goal_autopilot_total_steps=int(args.goal_autopilot_total_steps),
++            external_world_manifest_path=str(world_manifest),
++        )
++
++        fr = _load_json(attempt_dir / "final_response_v123.json")
++        ok = bool(fr.get("ok", False)) if isinstance(fr, dict) else False
++        reason = str(fr.get("reason") or "") if isinstance(fr, dict) else "missing_final_response_v123"
++        results.append({"task_id": str(task_id), "ok": bool(ok), "reason": str(reason)})
++
++    tasks_ok = sum([1 for r in results if bool(r.get("ok"))])
++
++    eval_obj = {
++        "schema_version": 123,
++        "kind": "family7_dla_eval_v123",
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "tasks": list(results),
++        "tasks_sha256": _sha256_file(tasks_path),
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    eval_sha256 = _sha256_file(out_dir / "eval.json")
++    summary = {
++        "schema_version": 123,
++        "kind": "family7_dla_summary_v123",
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": str(eval_sha256),
++    }
++    summary["summary_sig"] = sha256_hex(canonical_json_dumps(summary).encode("utf-8"))
++    _write_once_json(out_dir / "summary.json", summary)
++
++    if int(tasks_ok) != int(tasks_total):
++        raise SystemExit("tasks_not_all_ok")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-16 15:08:39
++++ scripts/smoke_v123_world_pressure_validators.py	2026-01-16 15:00:02
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.external_world_gate_v122 import EXTERNAL_WORLD_ACTION_SEARCH_V122, external_world_access_v122
++from atos_core.world_pressure_validators_v123 import (
++    EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123,
++    HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123,
++    REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123,
++    consult_external_world_v123,
++    validate_exhaustion_with_world_v123,
++    validate_historical_regression_v123,
++    validate_iac_v123,
++    validate_reuse_required_v123,
++)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _run_one(*, out_dir: Path, seed: int, manifest: str) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    neg: Dict[str, Dict[str, Any]] = {}
++    try:
++        external_world_access_v122(
++            allowed=False,
++            manifest_path=str(manifest),
++            action=str(EXTERNAL_WORLD_ACTION_SEARCH_V122),
++            reason_code="progress_blocked",
++            args={"query": "x", "limit": 1, "source_filter": "engineering_doc", "roles": []},
++            seed=int(seed),
++            turn_index=0,
++            prev_event_sig="",
++        )
++        neg["access_not_allowed"] = {"ok": True, "reason": "unexpected_ok"}
++    except Exception as e:
++        neg["access_not_allowed"] = {"ok": False, "reason": str(e)}
++
++    try:
++        external_world_access_v122(
++            allowed=True,
++            manifest_path=str(manifest),
++            action=str(EXTERNAL_WORLD_ACTION_SEARCH_V122),
++            reason_code="bad_reason_code",
++            args={"query": "x", "limit": 1, "source_filter": "engineering_doc", "roles": []},
++            seed=int(seed),
++            turn_index=0,
++            prev_event_sig="",
++        )
++        neg["invalid_reason_code"] = {"ok": True, "reason": "unexpected_ok"}
++    except Exception as e:
++        neg["invalid_reason_code"] = {"ok": False, "reason": str(e)}
++
++    consult = consult_external_world_v123(
++        manifest_path=str(manifest),
++        query="fluência como lei física",
++        seed=int(seed),
++        turn_index=0,
++        prev_event_sig="",
++        out_dir=str(out_dir),
++        allowed=True,
++        reason_code="progress_blocked",
++        limit=3,
++        source_filter="engineering_doc",
++        artifact_prefix="external_world_smoke",
++    )
++
++    ok_exh, reason_exh = validate_exhaustion_with_world_v123(exhausted=True, world_hits_total=int(consult.hits_total))
++    ok_ar, reason_ar = validate_historical_regression_v123(repeated=True, world_hits_total=int(consult.hits_total), causal_diff_present=False)
++    ok_ar2, reason_ar2 = validate_historical_regression_v123(repeated=True, world_hits_total=int(consult.hits_total), causal_diff_present=True)
++    ok_iac, reason_iac = validate_iac_v123(goal_ok=False, plan_ok=True, eval_ok=True, consequence_ok=True)
++    ok_reuse, reason_reuse = validate_reuse_required_v123(world_hits_total=int(consult.hits_total), reuse_attempted=False)
++
++    eval_obj = {
++        "schema_version": 123,
++        "seed": int(seed),
++        "manifest_sha256": _sha256_file(Path(manifest)),
++        "negative": dict(neg),
++        "consult": {
++            "hits_total": int(consult.hits_total),
++            "external_world_chain_hash_v122": str(consult.external_world_chain_hash_v122),
++            "events_total": int(len(consult.events)),
++            "evidence_total": int(len(consult.evidences)),
++        },
++        "checks": {
++            "exhaustion_with_hits": {"ok": bool(ok_exh), "reason": str(reason_exh)},
++            "anti_regression_no_causal_diff": {"ok": bool(ok_ar), "reason": str(reason_ar)},
++            "anti_regression_with_causal_diff": {"ok": bool(ok_ar2), "reason": str(reason_ar2)},
++            "iac_missing_goal": {"ok": bool(ok_iac), "reason": str(reason_iac)},
++            "reuse_required": {"ok": bool(ok_reuse), "reason": str(reason_reuse)},
++        },
++        "sha256": {
++            "events_jsonl": _sha256_file(out_dir / "external_world_smoke_events_v123.jsonl"),
++            "evidence_jsonl": _sha256_file(out_dir / "external_world_smoke_evidence_v123.jsonl"),
++            "snapshot_json": _sha256_file(out_dir / "external_world_smoke_registry_snapshot_v123.json"),
++        },
++    }
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    core = {
++        "schema_version": 123,
++        "seed": int(seed),
++        "manifest_sha256": str(eval_obj["manifest_sha256"]),
++        "hits_total": int(consult.hits_total),
++        "neg_access_not_allowed": str(neg["access_not_allowed"]["reason"]),
++        "neg_invalid_reason_code": str(neg["invalid_reason_code"]["reason"]),
++        "expect_exhaustion_reason": str(EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123),
++        "expect_anti_regression_reason": str(HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123),
++        "expect_reuse_reason": str(REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    smoke_summary = {"core": core, "summary_sha256": str(summary_sha256)}
++    _write_once_json(out_dir / "smoke_summary.json", smoke_summary)
++    return {"eval": eval_obj, "smoke_summary": smoke_summary}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--manifest", default="external_world_v122/manifest_v122.json")
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_base = Path(str(args.out_base))
++    manifest = str(args.manifest)
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    r1 = _run_one(out_dir=out1, seed=seed, manifest=manifest)
++    r2 = _run_one(out_dir=out2, seed=seed, manifest=manifest)
++
++    e1 = r1["eval"]
++    e2 = r2["eval"]
++    if canonical_json_dumps(e1) != canonical_json_dumps(e2):
++        raise SystemExit("determinism_failed:eval_json")
++    s1 = r1["smoke_summary"]
++    s2 = r2["smoke_summary"]
++    if canonical_json_dumps(s1) != canonical_json_dumps(s2):
++        raise SystemExit("determinism_failed:smoke_summary")
++
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(s1["summary_sha256"]),
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-16 15:08:39
++++ scripts/smoke_v123_family7_real_history_stress.py	2026-01-16 15:00:37
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    env = dict(os.environ)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v123.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(seed),
++        "--max_tasks",
++        "9999",
++    ]
++    p = subprocess.run(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
++    if p.returncode != 0:
++        raise SystemExit("runner_failed:\nSTDOUT:\n{out}\nSTDERR:\n{err}".format(out=p.stdout, err=p.stderr))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_base = Path(str(args.out_base))
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if len(tasks) < 20:
++        raise SystemExit("tasks_total_lt_20")
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    _run_runner(tasks=tasks_path, out_dir=out1, seed=seed)
++    _run_runner(tasks=tasks_path, out_dir=out2, seed=seed)
++
++    s1 = _load_json(out1 / "summary.json")
++    s2 = _load_json(out2 / "summary.json")
++    eval_sha1 = str(s1.get("eval_sha256") or "")
++    eval_sha2 = str(s2.get("eval_sha256") or "")
++    if eval_sha1 != eval_sha2:
++        raise SystemExit("determinism_failed:eval_sha")
++
++    ev1 = _load_json(out1 / "eval.json")
++    ev2 = _load_json(out2 / "eval.json")
++    if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++        raise SystemExit("determinism_failed:eval_json")
++    if int(ev1.get("tasks_ok") or 0) != int(ev1.get("tasks_total") or 0):
++        raise SystemExit("tasks_not_all_ok")
++
++    core = {
++        "schema_version": 123,
++        "seed": int(seed),
++        "tasks_sha256": _sha256_file(Path(tasks_path)),
++        "try1": {"eval_sha256": eval_sha1, "tasks_ok": int(s1.get("tasks_ok") or 0)},
++        "try2": {"eval_sha256": eval_sha2, "tasks_ok": int(s2.get("tasks_ok") or 0)},
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(summary_sha256),
++        "core": core,
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-16 15:08:39
++++ tests/test_world_pressure_validators_v123.py	2026-01-16 14:59:48
+@@ -0,0 +1,58 @@
++import unittest
++
++from atos_core.world_pressure_validators_v123 import (
++    EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123,
++    HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123,
++    IAC_MISSING_CONSEQUENCE_V123,
++    IAC_MISSING_EVAL_V123,
++    IAC_MISSING_GOAL_V123,
++    IAC_MISSING_PLAN_V123,
++    REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123,
++    fail_signature_v123,
++    validate_exhaustion_with_world_v123,
++    validate_historical_regression_v123,
++    validate_iac_v123,
++    validate_reuse_required_v123,
++)
++
++
++class TestWorldPressureValidatorsV123(unittest.TestCase):
++    def test_iac_missing_goal(self) -> None:
++        ok, reason = validate_iac_v123(goal_ok=False, plan_ok=True, eval_ok=True, consequence_ok=True)
++        self.assertFalse(ok)
++        self.assertEqual(reason, IAC_MISSING_GOAL_V123)
++
++    def test_iac_missing_plan(self) -> None:
++        ok, reason = validate_iac_v123(goal_ok=True, plan_ok=False, eval_ok=True, consequence_ok=True)
++        self.assertFalse(ok)
++        self.assertEqual(reason, IAC_MISSING_PLAN_V123)
++
++    def test_iac_missing_eval(self) -> None:
++        ok, reason = validate_iac_v123(goal_ok=True, plan_ok=True, eval_ok=False, consequence_ok=True)
++        self.assertFalse(ok)
++        self.assertEqual(reason, IAC_MISSING_EVAL_V123)
++
++    def test_iac_missing_consequence(self) -> None:
++        ok, reason = validate_iac_v123(goal_ok=True, plan_ok=True, eval_ok=True, consequence_ok=False)
++        self.assertFalse(ok)
++        self.assertEqual(reason, IAC_MISSING_CONSEQUENCE_V123)
++
++    def test_historical_regression_requires_causal_diff(self) -> None:
++        ok, reason = validate_historical_regression_v123(repeated=True, world_hits_total=1, causal_diff_present=False)
++        self.assertFalse(ok)
++        self.assertEqual(reason, HISTORICAL_REGRESSION_WITHOUT_CAUSAL_DIFF_V123)
++
++    def test_exhaustion_with_world_hits_fails(self) -> None:
++        ok, reason = validate_exhaustion_with_world_v123(exhausted=True, world_hits_total=2)
++        self.assertFalse(ok)
++        self.assertEqual(reason, EXHAUSTED_BUT_WORLD_HAS_VIABLE_CANDIDATE_V123)
++
++    def test_reuse_required_when_world_has_hits(self) -> None:
++        ok, reason = validate_reuse_required_v123(world_hits_total=1, reuse_attempted=False)
++        self.assertFalse(ok)
++        self.assertEqual(reason, REUSE_REQUIRED_BUT_NOT_ATTEMPTED_V123)
++
++    def test_fail_signature_deterministic(self) -> None:
++        s1 = fail_signature_v123(validator_name="v", reason_code="r", context={"a": 1, "b": 2})
++        s2 = fail_signature_v123(validator_name="v", reason_code="r", context={"a": 1, "b": 2})
++        self.assertEqual(s1, s2)

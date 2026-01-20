@@ -1,0 +1,12 @@
+--- patches/v37_base/learn.py	2026-01-10 20:24:15
++++ atos_core/learn.py	2026-01-10 20:24:33
+@@ -3488,6 +3488,9 @@
+                     util_log.pop("failures", None)
+                 for k, v in util_log.items():
+                     gen[f"utility_{k}"] = v
++                if patch_meta is None:
++                    patch_meta = {}
++                patch_meta["utility_suite"] = {f"utility_{k}": v for k, v in util_log.items()}
+ 
+                 memory_meta = self._update_fact_memory_from_transcripts(transcripts, step=step)
+                 if memory_meta and memory_meta.get("enabled"):

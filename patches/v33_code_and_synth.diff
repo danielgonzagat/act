@@ -1,0 +1,8342 @@
+--- patches/v33_base/train.py	2026-01-10 17:30:03
++++ scripts/train.py	2026-01-10 17:30:20
+@@ -51,6 +51,18 @@
+     ap.add_argument("--out", required=True, help="Output dir (e.g., results/run1)")
+     ap.add_argument("--window", type=int, default=10_000)
+     ap.add_argument("--mode", choices=["demo", "pure"], default="demo")
++    ap.add_argument(
++        "--utility_weight",
++        type=float,
++        default=0.0,
++        help="Weight for utility penalty in patch score (default 0.0 = shadow/logging only).",
++    )
++    ap.add_argument(
++        "--skill_suite_max_new_tokens",
++        type=int,
++        default=128,
++        help="Max new tokens for the utility suite during training (eval scripts remain canonical).",
++    )
+     args = ap.parse_args()
+ 
+     ensure_sample_dataset(args.data)
+@@ -62,6 +74,8 @@
+         window=args.window,
+         propose_every=args.window,
+         mode=args.mode,
++        utility_weight=float(args.utility_weight),
++        skill_suite_max_new_tokens=int(args.skill_suite_max_new_tokens),
+     )
+     trainer = KAAbsoluteTrainer(data_path=args.data, out_dir=args.out, config=cfg)
+     trainer.train()
+--- patches/v33_base/learn.py	2026-01-10 17:30:03
++++ atos_core/learn.py	2026-01-10 17:30:47
+@@ -748,6 +748,8 @@
+     suite_template_prefix_window: int = 32
+     # Utility suite weight in patch score (shadow default: 0.0). Set >0 to optimize pass_rate.
+     utility_weight: float = 0.0
++    # Utility suite token budget during training (evaluation scripts use their own max_new_tokens).
++    skill_suite_max_new_tokens: int = 128
+ 
+ 
+ class KAAbsoluteTrainer:
+@@ -881,7 +883,7 @@
+     def _eval_skill_suite_metrics(self, engine: Engine) -> Dict[str, Any]:
+         _transcripts, metrics = run_skill_suite(
+             engine,
+-            max_new_tokens=self.config.fluency_gen_tokens,
++            max_new_tokens=self.config.skill_suite_max_new_tokens,
+         )
+         return dict(metrics)
+ 
+@@ -2826,7 +2828,7 @@
+ 
+                 _skill_transcripts, util_metrics = run_skill_suite(
+                     engine,
+-                    max_new_tokens=self.config.fluency_gen_tokens,
++                    max_new_tokens=self.config.skill_suite_max_new_tokens,
+                 )
+                 util_log = dict(util_metrics)
+                 if step != int(self.config.steps):
+--- /dev/null	2026-01-10 17:36:39
++++ data/skill_synth_v0.txt	2026-01-10 17:33:23
+@@ -0,0 +1,8280 @@
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++
++User: Responda exatamente: OK
++System:
++OK
++
++
++
++
++
++
++
++User: Retorne exatamente a string: PATO-123
++System:
++PATO-123
++
++
++
++
++
++
++
++User: Retorne exatamente a string: X_Y-Z
++System:
++X_Y-Z
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "a" e "b". "a" deve ser a string "x" e "b" deve ser o número 7.
++System:
++{"a":"x","b":7}
++
++
++
++
++
++
++
++User: Responda com APENAS um JSON válido (sem texto extra) com chaves "ok" e "n". "ok" deve ser true e "n" deve ser 3.
++System:
++{"n":3,"ok":true}
++
++
++
++
++
++
++
++User: 17 + 25 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: 9 * 7 = ? (responda APENAS com o número inteiro)
++System:
++63
++
++
++
++
++
++
++
++User: 100 - 58 = ? (responda APENAS com o número inteiro)
++System:
++42
++
++
++
++
++
++
++
++User: Contexto: a senha é PINEAPPLE. Apenas memorize.
++System: OK
++User: Qual é a senha? Responda exatamente com a senha.
++System:
++PINEAPPLE
++
++
++
++
++
++
++
++User: Contexto: Joana nasceu em 1980. Apenas memorize.
++System: OK
++User: Em que ano Joana nasceu? Responda APENAS com o número inteiro.
++System:
++1980
++
++
++
++
++
++
++
++User: Memorize a palavra-código: ALFA9.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++ALFA9
++
++
++
++
++
++
++
++User: Memorize a palavra-código: BETA7.
++System: OK
++User: Repita a palavra-código exatamente.
++System:
++BETA7
++
++
++
++
++
++
++
++User: A palavra-chave é FOOBAR. Responda em uma frase curta, mas inclua FOOBAR.
++System:
++FOOBAR
++
++
++
++
++
++
++

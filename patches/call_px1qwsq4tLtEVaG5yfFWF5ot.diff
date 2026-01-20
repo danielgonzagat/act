@@ -1,0 +1,485 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+ @dataclass
+ class EngineConfig:
+     max_order: int = 4
+     top_k: int = 64
+     alpha: float = 0.5
+     order_bonus: float = 0.15
+     eos_bias: float = -2.0
+     repetition_recent: int = 64
+     cycle_ngram: int = 3
+     cycle_history: int = 512
+     min_new_tokens_before_eos: int = 8
++    # Gate-live (default OFF): use macro_router_v0 to restrict predictor evaluation.
++    router_live_enabled: bool = False
++    # Proof mode: compute baseline + gate per token, count mismatches, and fall back to baseline.
++    router_live_debug_compare: bool = False
+ 
+ 
+ class Engine:
+     def __init__(self, store, *, seed: int, config: Optional[EngineConfig] = None):
+         self.store = store
+@@
+         self._tables: Dict[str, Dict[str, Dict[str, int]]] = {}
+         self._predictors: List[Act] = []
++        self._predictor_by_id: Dict[str, Act] = {}
++        self._predictor_order: Dict[str, int] = {}
+         self._mode_selectors: List[Act] = []
+         self._mode_policy: Optional[Act] = None
+         self._rewrite_rules: List[Act] = []
+         self._selector: Optional[Act] = None
+         self._unigram: Optional[Act] = None
++        self._macro_router: Optional[Act] = None
++        self._macro_router_table: Optional[Dict[str, Any]] = None
+         self.rebuild_cache()
+ 
+     def rebuild_cache(self) -> None:
+         self._tables.clear()
+         acts = self.store.active()
+         predictors: List[Act] = []
+         mode_selectors: List[Act] = []
+         mode_policy: Optional[Act] = None
+         rewrite_rules: List[Act] = []
+         selector: Optional[Act] = None
+         unigram: Optional[Act] = None
++        macro_router: Optional[Act] = None
+ 
+         for act in acts:
+             if act.kind == "predictor":
+                 predictors.append(act)
+                 table_id = str(act.evidence.get("table_id", act.id))
+                 act.evidence.setdefault("table_id", table_id)
+                 table = act.evidence.setdefault("table", {})
+                 self._tables[table_id] = table
+                 n = int(act.evidence.get("n", act.match.get("n", 1)))
+                 if n == 1 and unigram is None:
+                     unigram = act
+             elif act.kind == "rewrite_rule":
+                 rewrite_rules.append(act)
+             elif act.kind == "mode_selector":
+                 mode_selectors.append(act)
+             elif act.kind == "mode_policy" and mode_policy is None:
+                 mode_policy = act
+             elif act.kind == "selector" and selector is None:
+                 selector = act
++            elif act.kind == "compressor" and macro_router is None:
++                ev = act.evidence
++                if isinstance(ev, dict) and str(ev.get("name") or "") == "macro_router_v0":
++                    macro_router = act
+ 
+         def _act_order(a: Act) -> Tuple[int, str]:
+             n = int(a.evidence.get("n", a.match.get("n", 1)))
+             return (-n, str(a.id))
+ 
+         predictors.sort(key=_act_order)
+         mode_selectors.sort(key=lambda a: str(a.id))
+         rewrite_rules.sort(key=lambda a: str(a.id))
+ 
+         self._predictors = predictors
++        self._predictor_by_id = {str(a.id): a for a in predictors}
++        self._predictor_order = {str(a.id): i for i, a in enumerate(predictors)}
+         self._mode_selectors = mode_selectors
+         self._mode_policy = mode_policy
+         self._rewrite_rules = rewrite_rules
+         self._selector = selector
+         self._unigram = unigram
++        self._macro_router = macro_router
++        self._macro_router_table = None
++        if macro_router is not None:
++            ev = macro_router.evidence
++            if isinstance(ev, dict) and isinstance(ev.get("table"), dict):
++                self._macro_router_table = ev.get("table")
+@@
+     def _emit_candidates(
+         self,
+         *,
+         context: Sequence[str],
+         penalties: Optional[Dict[str, Any]] = None,
++        predictors: Optional[Sequence[Act]] = None,
+         trace: Optional[Dict[str, Any]] = None,
+     ) -> Dict[str, Candidate]:
+         vocab = self.vocab()
+         penalties = penalties or {}
+         merged: Dict[str, Candidate] = {}
+         predictor_matched = 0
+         predictor_emitted = 0
+         executed_predictor_ids: List[str] = []
+-        for act in self._predictors:
++        pred_list: Sequence[Act] = predictors if predictors is not None else self._predictors
++        for act in pred_list:
+             if not self.match_act(act, context=context):
+                 continue
+             predictor_matched += 1
+ 
+             n = int(act.evidence.get("n", act.match.get("n", 1)))
+@@
+     def generate(
+         self,
+         *,
+         prompt: str,
+         max_new_tokens: int = 200,
+@@
+         trace_predictor_matched: List[int] = []
+         trace_executed_predictor_ids: List[List[str]] = []
+         trace_context_keys: List[str] = []
++        trace_router_live_used: List[int] = []
++        trace_router_live_fallback: List[int] = []
++        trace_router_live_fallback_reason: List[str] = []
++        trace_router_live_allowed_predictor_ids: List[List[str]] = []
++        trace_router_live_predictors_evaluated: List[int] = []
++        trace_baseline_predictors_evaluated: List[int] = []
++        trace_router_live_mismatch: List[int] = []
++        trace_router_live_debug_baseline_token: List[str] = []
++        trace_router_live_debug_gate_token: List[str] = []
+         trace_predictor_emitted: List[int] = []
+         trace_candidates_pre: List[int] = []
+         trace_candidates_post: List[int] = []
+         trace_rewrite_rule_hit_ids: List[List[str]] = []
+@@
+             }
+ 
+         for i in range(int(max_new_tokens)):
+-            trace_context_keys.append(ctx_key(context))
++            ck = ctx_key(context)
++            trace_context_keys.append(ck)
+             penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+-            emit_trace: Dict[str, Any] = {}
+-            candidates = self._emit_candidates(context=context, penalties=penalties, trace=emit_trace)
+-
+-            exec_pred = emit_trace.get("executed_predictor_ids") or []
+-            if isinstance(exec_pred, list):
+-                trace_executed_predictor_ids.append([str(x) for x in exec_pred if isinstance(x, str)])
+-            else:
+-                trace_executed_predictor_ids.append([])
++            router_live_enabled = bool(self.config.router_live_enabled)
++            router_debug = bool(self.config.router_live_debug_compare)
++
++            router_used = False
++            router_fallback = False
++            router_fallback_reason = ""
++            allowed_predictor_ids: List[str] = []
++            gated_predictors: Optional[List[Act]] = None
++
++            if router_live_enabled:
++                table = self._macro_router_table
++                if table is None or not isinstance(table, dict):
++                    router_fallback = True
++                    router_fallback_reason = "router_missing"
++                else:
++                    ctx_sig = f"{mode_state}{SEP}{ck}"
++                    entry = table.get(ctx_sig)
++                    if isinstance(entry, dict):
++                        preds = entry.get("predictors") or []
++                        if isinstance(preds, list):
++                            allowed_predictor_ids = [
++                                str(x) for x in preds if isinstance(x, str) and x
++                            ]
++                    if allowed_predictor_ids:
++                        present = [pid for pid in allowed_predictor_ids if pid in self._predictor_by_id]
++                        if present:
++                            present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
++                            gated_predictors = [self._predictor_by_id[pid] for pid in present]
++                        else:
++                            router_fallback = True
++                            router_fallback_reason = "allowed_missing"
++                    else:
++                        router_fallback = True
++                        router_fallback_reason = "missing_ctx"
++
++            def _apply_rewrite_rules(
++                cands: Dict[str, Candidate], *, record_trace: bool
++            ) -> Dict[str, Candidate]:
++                if not self._rewrite_rules:
++                    if record_trace:
++                        trace_rewrite_rule_hit_ids.append([])
++                        trace_rewrite_rules_changed_count.append(0)
++                    return cands
++
++                # Apply rewrite-rule penalties via AtoLang.
++                def _top1_token(c0: Dict[str, Candidate]) -> Optional[str]:
++                    if not c0:
++                        return None
++                    return min(
++                        c0.values(), key=lambda c: (-c.score, c.token, c.source_act)
++                    ).token
++
++                rr_hits: List[str] = []
++                top_tok = _top1_token(cands)
++                for rr in self._rewrite_rules:
++                    before_tok = top_tok
++                    before_score = cands.get(before_tok).score if before_tok in cands else None
++                    st = self.vm.run(
++                        rr,
++                        context=context,
++                        tables=self._tables,
++                        vocab=self.vocab(),
++                        initial_candidates=cands,
++                        penalties=penalties,
++                        mode="emit_only",
++                    )
++                    cands = st.candidates
++                    after_tok = _top1_token(cands)
++                    after_score = cands.get(before_tok).score if before_tok in cands else None
++                    if after_tok is None:
++                        after_tok = before_tok
++                    if (
++                        before_tok is not None
++                        and after_tok is not None
++                        and (
++                            after_tok != before_tok
++                            or (before_score is None)
++                            or (after_score is None)
++                            or abs(float(after_score) - float(before_score)) > 1e-12
++                        )
++                    ):
++                        rr_hits.append(str(rr.id))
++                    top_tok = after_tok
++
++                if record_trace:
++                    trace_rewrite_rule_hit_ids.append(rr_hits)
++                    trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
++                return cands
++
++            def _select_next(cands: Dict[str, Candidate]) -> Optional[str]:
++                if not cands:
++                    return None
++                nxt0: Optional[str] = None
++                if mode == "greedy" and self._selector is not None:
++                    st = self.vm.run(
++                        self._selector,
++                        context=context,
++                        tables=self._tables,
++                        vocab=self.vocab(),
++                        initial_candidates=cands,
++                        penalties=penalties,
++                        mode="select",
++                    )
++                    nxt0 = st.selected
++                if nxt0 is None:
++                    ordered = sorted(
++                        cands.values(), key=lambda c: (-c.score, c.token, c.source_act)
++                    )
++                    if mode == "greedy":
++                        nxt0 = ordered[0].token
++                    else:
++                        mx = ordered[0].score
++                        exps = [math.exp(min(60.0, c.score - mx)) for c in ordered]
++                        s = sum(exps)
++                        r = self.rng.random() * s
++                        acc = 0.0
++                        nxt0 = ordered[-1].token
++                        for c, e in zip(ordered, exps):
++                            acc += e
++                            if acc >= r:
++                                nxt0 = c.token
++                                break
++                return nxt0
++
++            # --- Compute candidate sets (gate + baseline) ---
++            emit_gate: Optional[Dict[str, Any]] = None
++            cand_gate: Optional[Dict[str, Candidate]] = None
++            if gated_predictors is not None:
++                emit_gate = {}
++                cand_gate = self._emit_candidates(
++                    context=context, penalties=penalties, predictors=gated_predictors, trace=emit_gate
++                )
++                # Safety: if the gated set emits nothing, fall back to baseline (avoids early EOS).
++                if int(emit_gate.get("predictor_emitted", 0) or 0) <= 0:
++                    router_fallback = True
++                    router_fallback_reason = "gate_empty_emit"
++                    cand_gate = None
++                    emit_gate = None
++
++            emit_base: Optional[Dict[str, Any]] = None
++            cand_base: Optional[Dict[str, Candidate]] = None
++            if router_debug or (router_live_enabled and (cand_gate is None)):
++                emit_base = {}
++                cand_base = self._emit_candidates(context=context, penalties=penalties, trace=emit_base)
++
++            mismatch = False
++            baseline_tok = ""
++            gate_tok = ""
++            if router_debug and (cand_gate is not None) and (cand_base is not None):
++                base_after = _apply_rewrite_rules(dict(cand_base), record_trace=False)
++                gate_after = _apply_rewrite_rules(dict(cand_gate), record_trace=False)
++                b_nxt = _select_next(base_after)
++                g_nxt = _select_next(gate_after)
++                baseline_tok = str(b_nxt or "")
++                gate_tok = str(g_nxt or "")
++                mismatch = bool(b_nxt != g_nxt)
++                if mismatch:
++                    router_fallback = True
++                    router_fallback_reason = "mismatch"
++                    cand_gate = None
++                    emit_gate = None
++
++            # --- Final branch (baseline fallback vs gated) ---
++            emit_trace: Dict[str, Any] = {}
++            candidates: Dict[str, Candidate] = {}
++            if cand_gate is not None and emit_gate is not None and not router_fallback:
++                router_used = True
++                emit_trace = emit_gate
++                candidates = cand_gate
++            else:
++                router_used = False
++                if router_live_enabled and not router_fallback:
++                    router_fallback = True
++                    router_fallback_reason = "no_gate"
++                if cand_base is None or emit_base is None:
++                    emit_base = {}
++                    cand_base = self._emit_candidates(
++                        context=context, penalties=penalties, trace=emit_base
++                    )
++                emit_trace = emit_base
++                candidates = cand_base
++
++            # --- Apply rewrite rules (recorded on final branch) ---
++            candidates = _apply_rewrite_rules(candidates, record_trace=True)
+ 
+             # Apply rewrite-rule penalties via AtoLang.
+-            def _top1_token(cands: Dict[str, Candidate]) -> Optional[str]:
+-                if not cands:
+-                    return None
+-                return min(cands.values(), key=lambda c: (-c.score, c.token, c.source_act)).token
+-
+-            rr_hits: List[str] = []
+-            top_tok = _top1_token(candidates)
+-            for rr in self._rewrite_rules:
+-                before_tok = top_tok
+-                before_score = candidates.get(before_tok).score if before_tok in candidates else None
+-                st = self.vm.run(
+-                    rr,
+-                    context=context,
+-                    tables=self._tables,
+-                    vocab=self.vocab(),
+-                    initial_candidates=candidates,
+-                    penalties=penalties,
+-                    mode="emit_only",
+-                )
+-                candidates = st.candidates
+-                after_tok = _top1_token(candidates)
+-                after_score = candidates.get(before_tok).score if before_tok in candidates else None
+-                if after_tok is None:
+-                    after_tok = before_tok
+-                if (
+-                    before_tok is not None
+-                    and after_tok is not None
+-                    and (
+-                        after_tok != before_tok
+-                        or (before_score is None)
+-                        or (after_score is None)
+-                        or abs(float(after_score) - float(before_score)) > 1e-12
+-                    )
+-                ):
+-                    rr_hits.append(str(rr.id))
+-                top_tok = after_tok
+-            trace_rewrite_rule_hit_ids.append(rr_hits)
+-            trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
+-
+             # EOS guardrail
+             if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
+                 candidates["<EOS>"].score -= 1e6
+ 
+             if not candidates:
+                 break
+ 
+             trace_predictor_matched.append(int(emit_trace.get("predictor_matched", 0) or 0))
+             trace_predictor_emitted.append(int(emit_trace.get("predictor_emitted", 0) or 0))
+             trace_candidates_pre.append(int(emit_trace.get("candidates_pre_rewrite", len(candidates)) or 0))
+             trace_candidates_post.append(int(len(candidates)))
+ 
++            exec_pred = emit_trace.get("executed_predictor_ids") or []
++            if isinstance(exec_pred, list):
++                trace_executed_predictor_ids.append([str(x) for x in exec_pred if isinstance(x, str)])
++            else:
++                trace_executed_predictor_ids.append([])
++
++            trace_router_live_used.append(1 if router_used else 0)
++            trace_router_live_fallback.append(1 if router_fallback else 0)
++            trace_router_live_fallback_reason.append(str(router_fallback_reason))
++            trace_router_live_allowed_predictor_ids.append(list(allowed_predictor_ids))
++            trace_router_live_predictors_evaluated.append(
++                int(emit_trace.get("predictor_matched", 0) or 0)
++            )
++            if router_debug:
++                trace_baseline_predictors_evaluated.append(
++                    int((emit_base or {}).get("predictor_matched", 0) or 0)
++                )
++                trace_router_live_mismatch.append(1 if mismatch else 0)
++                trace_router_live_debug_baseline_token.append(baseline_tok)
++                trace_router_live_debug_gate_token.append(gate_tok)
++
+             nxt: Optional[str] = None
+-            if mode == "greedy" and self._selector is not None:
+-                st = self.vm.run(
+-                    self._selector,
+-                    context=context,
+-                    tables=self._tables,
+-                    vocab=self.vocab(),
+-                    initial_candidates=candidates,
+-                    penalties=penalties,
+-                    mode="select",
+-                )
+-                nxt = st.selected
+-
+-            if nxt is None:
+-                ordered = sorted(
+-                    candidates.values(), key=lambda c: (-c.score, c.token, c.source_act)
+-                )
+-                if mode == "greedy":
+-                    nxt = ordered[0].token
+-                else:
+-                    mx = ordered[0].score
+-                    exps = [math.exp(min(60.0, c.score - mx)) for c in ordered]
+-                    s = sum(exps)
+-                    r = self.rng.random() * s
+-                    acc = 0.0
+-                    nxt = ordered[-1].token
+-                    for c, e in zip(ordered, exps):
+-                        acc += e
+-                        if acc >= r:
+-                            nxt = c.token
+-                            break
++            nxt = _select_next(candidates)
+ 
+             if nxt == "<EOS>":
+                 break
+@@
+         return {
+             "prompt": prompt,
+             "text": detokenize(out_tokens + gen_tokens),
+             "prompt_tokens": prompt_tokens,
+             "gen_tokens": gen_tokens,
+             "all_tokens": out_tokens + gen_tokens,
+             "trace": {
+                 "active_set_size": int(active_set_size),
+                 "predictor_total": int(predictor_total),
+                 "rewrite_rules_total": int(rewrite_rules_total),
+                 "selector_id": selector_id,
+                 "context_keys": trace_context_keys,
+                 "executed_predictor_ids": trace_executed_predictor_ids,
+                 "rewrite_rule_hit_ids": trace_rewrite_rule_hit_ids,
+                 "rewrite_rules_changed_count": trace_rewrite_rules_changed_count,
+                 "selected_tokens": trace_selected_tokens,
+                 "selected_source_act_ids": trace_selected_act_ids,
+                 "selected_act_ids": trace_selected_act_ids,
+                 "candidates_pre_rewrite": trace_candidates_pre,
+                 "candidates_post_rewrite": trace_candidates_post,
+                 "predictor_matched": trace_predictor_matched,
+                 "predictor_emitted": trace_predictor_emitted,
++                "router_live_used": trace_router_live_used,
++                "router_live_fallback": trace_router_live_fallback,
++                "router_live_fallback_reason": trace_router_live_fallback_reason,
++                "router_live_allowed_predictor_ids": trace_router_live_allowed_predictor_ids,
++                "router_live_predictors_evaluated": trace_router_live_predictors_evaluated,
++                "baseline_predictors_evaluated": trace_baseline_predictors_evaluated,
++                "router_live_mismatch": trace_router_live_mismatch,
++                "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
++                "router_live_debug_gate_token": trace_router_live_debug_gate_token,
+             },
+             "mode": mode_state,
+             "mode_act_id": mode_act_id,
+             "mode_source": mode_source,
+*** End Patch

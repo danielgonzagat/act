@@ -1,0 +1,1546 @@
+--- /dev/null	2026-01-11 02:16:58
++++ atos_core/validators.py	2026-01-11 02:18:41
+@@ -0,0 +1,112 @@
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, Optional
++
++
++@dataclass(frozen=True)
++class ValidatorResult:
++    passed: bool
++    reason: str
++
++
++def _is_nonneg_int_text(s: str) -> bool:
++    return bool(re.fullmatch(r"[0-9]+", s))
++
++
++def parse_nonneg_int_text(s: str) -> Optional[int]:
++    s = str(s).strip()
++    if not _is_nonneg_int_text(s):
++        return None
++    try:
++        return int(s)
++    except Exception:
++        return None
++
++
++def canonical_nonneg_int_text(s: str) -> Optional[str]:
++    n = parse_nonneg_int_text(s)
++    if n is None:
++        return None
++    return str(int(n))
++
++
++def validate_int_value_exact(output: Any, expected: Any) -> ValidatorResult:
++    try:
++        exp = int(expected)
++    except Exception:
++        return ValidatorResult(False, "expected_not_int")
++
++    if isinstance(output, bool):
++        return ValidatorResult(False, "output_is_bool")
++
++    if isinstance(output, int):
++        return ValidatorResult(output == exp, "ok" if output == exp else "int_mismatch")
++
++    s = str(output).strip()
++    n = parse_nonneg_int_text(s)
++    if n is None:
++        return ValidatorResult(False, "output_not_int_text")
++    return ValidatorResult(n == exp, "ok" if n == exp else "int_mismatch")
++
++
++def validate_int_text_canonical_exact(output: Any, expected: Any) -> ValidatorResult:
++    exp_text = canonical_nonneg_int_text(str(expected))
++    if exp_text is None:
++        return ValidatorResult(False, "expected_not_int_text")
++    out_raw = str(output).strip()
++    out_text = canonical_nonneg_int_text(out_raw)
++    if out_text is None:
++        return ValidatorResult(False, "output_not_int_text")
++    if out_raw != out_text:
++        return ValidatorResult(False, "output_not_canonical_int_text")
++    return ValidatorResult(out_text == exp_text, "ok" if out_text == exp_text else "text_mismatch")
++
++
++def validate_json_ab_int_exact(output: Any, expected: Any) -> ValidatorResult:
++    if not isinstance(expected, dict):
++        return ValidatorResult(False, "expected_not_dict")
++    if "a" not in expected or "b" not in expected:
++        return ValidatorResult(False, "expected_missing_keys")
++    try:
++        exp_a = int(expected["a"])
++        exp_b = int(expected["b"])
++    except Exception:
++        return ValidatorResult(False, "expected_values_not_int")
++
++    try:
++        obj = json.loads(str(output))
++    except Exception:
++        return ValidatorResult(False, "output_not_json")
++    if not isinstance(obj, dict):
++        return ValidatorResult(False, "output_json_not_object")
++    if "a" not in obj or "b" not in obj:
++        return ValidatorResult(False, "output_missing_keys")
++
++    a = obj.get("a")
++    b = obj.get("b")
++    if isinstance(a, bool) or isinstance(b, bool):
++        return ValidatorResult(False, "output_value_is_bool")
++    if not isinstance(a, int) or not isinstance(b, int):
++        return ValidatorResult(False, "output_values_not_int")
++    if a != exp_a or b != exp_b:
++        return ValidatorResult(False, "value_mismatch")
++    return ValidatorResult(True, "ok")
++
++
++ValidatorFn = Callable[[Any, Any], ValidatorResult]
++
++VALIDATORS: Dict[str, ValidatorFn] = {
++    "int_value_exact": validate_int_value_exact,
++    "int_text_canonical_exact": validate_int_text_canonical_exact,
++    "json_ab_int_exact": validate_json_ab_int_exact,
++}
++
++
++def run_validator(validator_id: str, output: Any, expected: Any) -> ValidatorResult:
++    fn = VALIDATORS.get(str(validator_id))
++    if fn is None:
++        return ValidatorResult(False, f"unknown_validator:{validator_id}")
++    return fn(output, expected)
+--- /dev/null	2026-01-11 02:16:58
++++ atos_core/concepts.py	2026-01-11 02:16:32
+@@ -0,0 +1,593 @@
++from __future__ import annotations
++
++import json
++import math
++import os
++import re
++from dataclasses import dataclass, field
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .validators import ValidatorResult, run_validator
++
++
++def sha256_text(s: str) -> str:
++    return sha256_hex(str(s).encode("utf-8"))
++
++
++def stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(row))
++        f.write("\n")
++
++
++def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
++    if not os.path.exists(path):
++        return iter(())
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            yield json.loads(line)
++
++
++def append_chained_jsonl(path: str, row: Dict[str, Any], *, prev_hash: Optional[str]) -> str:
++    body = dict(row)
++    body["prev_hash"] = prev_hash
++    entry_hash = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    body["entry_hash"] = entry_hash
++    _append_jsonl(path, body)
++    return entry_hash
++
++
++def verify_chained_jsonl(path: str) -> bool:
++    prev = None
++    for row in _read_jsonl(path):
++        row = dict(row)
++        entry_hash = row.pop("entry_hash", None)
++        if row.get("prev_hash") != prev:
++            return False
++        expected = sha256_hex(canonical_json_dumps(row).encode("utf-8"))
++        if expected != entry_hash:
++            return False
++        prev = entry_hash
++    return True
++
++
++def _scan_digits(text: str) -> str:
++    m = re.search(r"[0-9]+", str(text))
++    if not m:
++        return "0"
++    return m.group(0)
++
++
++def _strip_one_leading_zero(digits: str) -> str:
++    s = str(digits).strip()
++    if len(s) >= 2 and s.startswith("0"):
++        return s[1:]
++    return s
++
++
++def _digits_to_int(digits: str) -> int:
++    s = str(digits).strip()
++    if not s:
++        return 0
++    return int(s)
++
++
++def _int_to_digits(n: Any) -> str:
++    if isinstance(n, bool):
++        return "0"
++    return str(int(n))
++
++
++def _add_int(a: Any, b: Any) -> int:
++    if isinstance(a, bool) or isinstance(b, bool):
++        return 0
++    return int(a) + int(b)
++
++
++def _make_dict_ab(a: Any, b: Any) -> Dict[str, Any]:
++    if isinstance(a, bool) or isinstance(b, bool):
++        return {"a": 0, "b": 0}
++    return {"a": int(a), "b": int(b)}
++
++
++def _json_canonical(obj: Any) -> str:
++    return canonical_json_dumps(obj)
++
++
++@dataclass(frozen=True)
++class PrimitiveOpSpec:
++    op_id: str
++    arity: int
++    input_types: Tuple[str, ...]
++    output_type: str
++
++
++PRIMITIVE_OPS: Dict[str, Tuple[PrimitiveOpSpec, Any]] = {
++    "scan_digits": (PrimitiveOpSpec("scan_digits", 1, ("str",), "str"), _scan_digits),
++    "strip_one_leading_zero": (
++        PrimitiveOpSpec("strip_one_leading_zero", 1, ("str",), "str"),
++        _strip_one_leading_zero,
++    ),
++    "digits_to_int": (PrimitiveOpSpec("digits_to_int", 1, ("str",), "int"), _digits_to_int),
++    "int_to_digits": (PrimitiveOpSpec("int_to_digits", 1, ("int",), "str"), _int_to_digits),
++    "add_int": (PrimitiveOpSpec("add_int", 2, ("int", "int"), "int"), _add_int),
++    "make_dict_ab": (PrimitiveOpSpec("make_dict_ab", 2, ("int", "int"), "dict"), _make_dict_ab),
++    "json_canonical": (PrimitiveOpSpec("json_canonical", 1, ("dict",), "str"), _json_canonical),
++}
++
++
++def execute_unary_pipeline(ops: List[str], x: Any) -> Any:
++    v = x
++    for op_id in ops:
++        spec_fn = PRIMITIVE_OPS.get(op_id)
++        if spec_fn is None:
++            raise KeyError(f"unknown_op:{op_id}")
++        _, fn = spec_fn
++        v = fn(v)
++    return v
++
++
++def execute_binary_op(op_id: str, a: Any, b: Any) -> Any:
++    spec_fn = PRIMITIVE_OPS.get(op_id)
++    if spec_fn is None:
++        raise KeyError(f"unknown_op:{op_id}")
++    spec, fn = spec_fn
++    if int(spec.arity) != 2:
++        raise ValueError(f"not_binary_op:{op_id}")
++    return fn(a, b)
++
++
++def infer_unary_io_types(ops: List[str]) -> Optional[Tuple[str, str]]:
++    if not ops:
++        return None
++    first = PRIMITIVE_OPS.get(ops[0])
++    if first is None:
++        return None
++    in_t = first[0].input_types[0]
++    cur = first[0].output_type
++    for op_id in ops[1:]:
++        spec_fn = PRIMITIVE_OPS.get(op_id)
++        if spec_fn is None:
++            return None
++        spec = spec_fn[0]
++        if int(spec.arity) != 1:
++            return None
++        if spec.input_types[0] != cur:
++            return None
++        cur = spec.output_type
++    return in_t, cur
++
++
++@dataclass(frozen=True)
++class ConceptInterface:
++    input_schema: Dict[str, str]
++    output_schema: Dict[str, str]
++    validator_id: str
++    preconditions: Dict[str, Any] = field(default_factory=dict)
++    postconditions: Dict[str, Any] = field(default_factory=dict)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "input_schema": dict(self.input_schema),
++            "output_schema": dict(self.output_schema),
++            "validator_id": str(self.validator_id),
++            "preconditions": dict(self.preconditions),
++            "postconditions": dict(self.postconditions),
++        }
++
++    @staticmethod
++    def from_dict(d: Dict[str, Any]) -> "ConceptInterface":
++        return ConceptInterface(
++            input_schema=dict(d.get("input_schema", {})),
++            output_schema=dict(d.get("output_schema", {})),
++            validator_id=str(d.get("validator_id", "")),
++            preconditions=dict(d.get("preconditions", {})),
++            postconditions=dict(d.get("postconditions", {})),
++        )
++
++    def type_signature(self) -> str:
++        return stable_hash_obj(
++            {"in": self.input_schema, "out": self.output_schema, "validator_id": self.validator_id}
++        )
++
++
++@dataclass(frozen=True)
++class ConceptPolicies:
++    ema_alpha: float = 0.2
++    prune_min_calls: int = 8
++    prune_min_lifetime_steps: int = 8
++    prune_fail_streak: int = 3
++    prune_u_threshold: float = 0.6
++    prune_s_threshold: float = 0.35
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "ema_alpha": float(self.ema_alpha),
++            "prune_min_calls": int(self.prune_min_calls),
++            "prune_min_lifetime_steps": int(self.prune_min_lifetime_steps),
++            "prune_fail_streak": int(self.prune_fail_streak),
++            "prune_u_threshold": float(self.prune_u_threshold),
++            "prune_s_threshold": float(self.prune_s_threshold),
++        }
++
++
++@dataclass
++class Concept:
++    id: str
++    created_step: int
++    subgraph_ref: Dict[str, Any]
++    interface: ConceptInterface
++    policies: ConceptPolicies
++
++    alive: bool = True
++    calls_total: int = 0
++    pass_total: int = 0
++    fail_total: int = 0
++    fail_streak: int = 0
++    last_seen_step: int = 0
++    contexts_seen: Dict[str, int] = field(default_factory=dict)
++
++    u_ema: float = 0.5
++    pass2_ema: float = 0.25
++    k_ema: float = 0.0
++    s_t: float = 0.0
++
++    def contexts_distinct(self) -> int:
++        return len(self.contexts_seen)
++
++    def lifetime_steps(self, *, step: int) -> int:
++        return int(step) - int(self.created_step)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "id": self.id,
++            "created_step": int(self.created_step),
++            "alive": bool(self.alive),
++            "subgraph_ref": self.subgraph_ref,
++            "interface": self.interface.to_dict(),
++            "policies": self.policies.to_dict(),
++            "calls_total": int(self.calls_total),
++            "pass_total": int(self.pass_total),
++            "fail_total": int(self.fail_total),
++            "fail_streak": int(self.fail_streak),
++            "last_seen_step": int(self.last_seen_step),
++            "contexts_distinct": int(self.contexts_distinct()),
++            "u_ema": float(self.u_ema),
++            "k_ema": float(self.k_ema),
++            "pass2_ema": float(self.pass2_ema),
++            "s_t": float(self.s_t),
++        }
++
++
++def concept_id_for(subgraph_ref: Dict[str, Any], interface: ConceptInterface) -> str:
++    return stable_hash_obj({"subgraph_ref": subgraph_ref, "interface": interface.to_dict()})
++
++
++def execute_concept_subgraph(subgraph_ref: Dict[str, Any], inputs: Dict[str, Any]) -> Any:
++    kind = str(subgraph_ref.get("kind", ""))
++    if kind == "unary_pipeline_v0":
++        ops = list(subgraph_ref.get("ops", []))
++        if len(inputs) != 1:
++            raise ValueError("unary_pipeline_requires_1_input")
++        x = next(iter(inputs.values()))
++        return execute_unary_pipeline(ops, x)
++    if kind == "binary_op_v0":
++        op_id = str(subgraph_ref.get("op", ""))
++        if len(inputs) != 2:
++            raise ValueError("binary_op_requires_2_inputs")
++        keys = sorted(inputs.keys())
++        return execute_binary_op(op_id, inputs[keys[0]], inputs[keys[1]])
++    raise ValueError(f"unknown_subgraph_kind:{kind}")
++
++
++@dataclass
++class ConceptRegistry:
++    run_dir: str
++    concepts_path: str = field(init=False)
++    evidence_path: str = field(init=False)
++    telemetry_path: str = field(init=False)
++
++    _concepts: Dict[str, Concept] = field(default_factory=dict, init=False)
++    _concepts_prev_hash: Optional[str] = field(default=None, init=False)
++    _evidence_prev_hash: Optional[str] = field(default=None, init=False)
++    _telemetry_prev_hash: Optional[str] = field(default=None, init=False)
++
++    def __post_init__(self) -> None:
++        os.makedirs(self.run_dir, exist_ok=False)
++        self.concepts_path = os.path.join(self.run_dir, "concepts.jsonl")
++        self.evidence_path = os.path.join(self.run_dir, "concept_evidence.jsonl")
++        self.telemetry_path = os.path.join(self.run_dir, "concept_telemetry.jsonl")
++
++    def concepts(self) -> Iterable[Concept]:
++        return self._concepts.values()
++
++    def get(self, concept_id: str) -> Optional[Concept]:
++        return self._concepts.get(str(concept_id))
++
++    def alive_concepts(self) -> List[Concept]:
++        return [c for c in self._concepts.values() if bool(c.alive)]
++
++    def define(
++        self,
++        *,
++        step: int,
++        subgraph_ref: Dict[str, Any],
++        interface: ConceptInterface,
++        policies: Optional[ConceptPolicies] = None,
++        birth_reason: str,
++        birth_prior: Optional[Dict[str, Any]] = None,
++    ) -> Concept:
++        cid = concept_id_for(subgraph_ref, interface)
++        if cid in self._concepts:
++            return self._concepts[cid]
++
++        pol = policies or ConceptPolicies()
++        c = Concept(
++            id=cid,
++            created_step=int(step),
++            subgraph_ref=subgraph_ref,
++            interface=interface,
++            policies=pol,
++            last_seen_step=int(step),
++        )
++        if birth_prior:
++            if "u_ema" in birth_prior:
++                c.u_ema = float(birth_prior["u_ema"])
++            if "pass2_ema" in birth_prior:
++                c.pass2_ema = float(birth_prior["pass2_ema"])
++            if "k_ema" in birth_prior:
++                c.k_ema = float(birth_prior["k_ema"])
++        self._concepts[cid] = c
++
++        self._concepts_prev_hash = append_chained_jsonl(
++            self.concepts_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": "DEFINE",
++                "concept": c.to_dict(),
++                "birth_reason": str(birth_reason),
++                "birth_prior": dict(birth_prior or {}),
++            },
++            prev_hash=self._concepts_prev_hash,
++        )
++        return c
++
++    def _append_state(self, *, step: int, concept: Concept, reason: str) -> None:
++        self._concepts_prev_hash = append_chained_jsonl(
++            self.concepts_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": "STATE",
++                "concept": concept.to_dict(),
++                "reason": str(reason),
++            },
++            prev_hash=self._concepts_prev_hash,
++        )
++
++    def _append_evidence(self, *, step: int, row: Dict[str, Any]) -> None:
++        self._evidence_prev_hash = append_chained_jsonl(
++            self.evidence_path,
++            {"time": deterministic_iso(step=int(step)), "step": int(step), **row},
++            prev_hash=self._evidence_prev_hash,
++        )
++
++    def _append_telemetry(self, *, step: int, row: Dict[str, Any]) -> None:
++        self._telemetry_prev_hash = append_chained_jsonl(
++            self.telemetry_path,
++            {"time": deterministic_iso(step=int(step)), "step": int(step), **row},
++            prev_hash=self._telemetry_prev_hash,
++        )
++
++    def _update_scores(
++        self,
++        *,
++        concept: Concept,
++        step: int,
++        passed: bool,
++        cost_used: float,
++        context_signature: str,
++    ) -> None:
++        alpha = float(concept.policies.ema_alpha)
++        x_u = 1.0 if bool(passed) else 0.0
++        x_k = float(cost_used)
++        concept.u_ema = alpha * x_u + (1.0 - alpha) * float(concept.u_ema)
++        concept.pass2_ema = alpha * (x_u * x_u) + (1.0 - alpha) * float(concept.pass2_ema)
++        concept.k_ema = alpha * x_k + (1.0 - alpha) * float(concept.k_ema)
++
++        concept.calls_total += 1
++        if bool(passed):
++            concept.pass_total += 1
++            concept.fail_streak = 0
++        else:
++            concept.fail_total += 1
++            concept.fail_streak += 1
++
++        concept.last_seen_step = int(step)
++        concept.contexts_seen[str(context_signature)] = concept.contexts_seen.get(str(context_signature), 0) + 1
++
++        var_p = max(0.0, float(concept.pass2_ema) - float(concept.u_ema) * float(concept.u_ema))
++        var_pen = 1.0 - min(1.0, var_p / 0.25)
++        reuse_fac = min(1.0, math.log1p(concept.calls_total) / math.log1p(20.0))
++        ctx_fac = min(1.0, math.log1p(concept.contexts_distinct()) / math.log1p(10.0))
++        cost_fac = 1.0 / (1.0 + float(concept.k_ema))
++        concept.s_t = float(concept.u_ema) * var_pen * reuse_fac * ctx_fac * cost_fac
++
++        self._append_state(step=int(step), concept=concept, reason="score_update")
++
++    def _prune_check(self, *, concept: Concept, step: int) -> bool:
++        if not bool(concept.alive):
++            return False
++        if concept.calls_total < int(concept.policies.prune_min_calls):
++            return False
++        if concept.lifetime_steps(step=int(step)) < int(concept.policies.prune_min_lifetime_steps):
++            return False
++        if concept.fail_streak < int(concept.policies.prune_fail_streak):
++            return False
++        if float(concept.u_ema) >= float(concept.policies.prune_u_threshold):
++            return False
++        if float(concept.s_t) >= float(concept.policies.prune_s_threshold):
++            return False
++
++        concept.alive = False
++        self._append_state(step=int(step), concept=concept, reason="pruned")
++        self._append_evidence(
++            step=int(step),
++            row={
++                "event": "PRUNE",
++                "concept_id": str(concept.id),
++                "reason": "thresholds",
++                "u_ema": float(concept.u_ema),
++                "k_ema": float(concept.k_ema),
++                "s_t": float(concept.s_t),
++                "calls_total": int(concept.calls_total),
++                "fail_streak": int(concept.fail_streak),
++            },
++        )
++        return True
++
++    def call(
++        self,
++        *,
++        step: int,
++        concept_id: str,
++        inputs: Dict[str, Any],
++        expected: Any,
++        context_signature: str,
++        call_depth: int,
++        baseline_cost: float,
++        contract_active: bool = False,
++    ) -> Tuple[Any, ValidatorResult, float]:
++        c = self._concepts[str(concept_id)]
++
++        if bool(contract_active):
++            out = execute_concept_subgraph(c.subgraph_ref, inputs)
++            vr = run_validator(c.interface.validator_id, out, expected)
++            cost_used = float(baseline_cost)
++            self._append_telemetry(
++                step=int(step),
++                row={
++                    "event": "CALL_BYPASS_CONTRACT",
++                    "concept_id": str(c.id),
++                    "context_signature": str(context_signature),
++                    "call_depth": int(call_depth),
++                    "inputs": inputs,
++                    "expected": expected,
++                    "output": out,
++                    "output_signature": stable_hash_obj(out),
++                    "validator_id": str(c.interface.validator_id),
++                    "validator_passed": bool(vr.passed),
++                    "validator_reason": str(vr.reason),
++                    "delta_utility": 0.0,
++                    "delta_cost": 0.0,
++                    "cost_used": float(cost_used),
++                    "baseline_cost": float(baseline_cost),
++                },
++            )
++            return out, vr, cost_used
++
++        out = execute_concept_subgraph(c.subgraph_ref, inputs)
++        vr = run_validator(c.interface.validator_id, out, expected)
++        cost_used = 1.0
++
++        self._append_evidence(
++            step=int(step),
++            row={
++                "event": "CALL",
++                "concept_id": str(c.id),
++                "context_signature": str(context_signature),
++                "call_depth": int(call_depth),
++                "inputs": inputs,
++                "expected": expected,
++                "output": out,
++                "output_signature": stable_hash_obj(out),
++                "validator_id": str(c.interface.validator_id),
++                "validator_passed": bool(vr.passed),
++                "validator_reason": str(vr.reason),
++                "cost_used": float(cost_used),
++                "baseline_cost": float(baseline_cost),
++            },
++        )
++        self._append_telemetry(
++            step=int(step),
++            row={
++                "event": "CALL",
++                "concept_id": str(c.id),
++                "concept_type": str(c.interface.type_signature()),
++                "context_signature": str(context_signature),
++                "call_depth": int(call_depth),
++                "inputs": inputs,
++                "expected": expected,
++                "output": out,
++                "output_signature": stable_hash_obj(out),
++                "validator_id": str(c.interface.validator_id),
++                "validator_passed": bool(vr.passed),
++                "validator_reason": str(vr.reason),
++                "delta_utility": 1.0 if bool(vr.passed) else -1.0,
++                "delta_cost": float(baseline_cost) - float(cost_used),
++                "cost_used": float(cost_used),
++                "baseline_cost": float(baseline_cost),
++            },
++        )
++
++        self._update_scores(
++            concept=c, step=int(step), passed=bool(vr.passed), cost_used=float(cost_used), context_signature=str(context_signature)
++        )
++        self._prune_check(concept=c, step=int(step))
++        return out, vr, cost_used
++
++    def log_primitives(
++        self,
++        *,
++        step: int,
++        subgraph_ref: Dict[str, Any],
++        interface: ConceptInterface,
++        inputs: Dict[str, Any],
++        expected: Any,
++        output: Any,
++        validator_result: ValidatorResult,
++        cost_used: float,
++        baseline_cost: float,
++        context_signature: str,
++        call_depth: int,
++        note: str,
++    ) -> None:
++        self._append_telemetry(
++            step=int(step),
++            row={
++                "event": "PRIMITIVES",
++                "context_signature": str(context_signature),
++                "call_depth": int(call_depth),
++                "subgraph_ref": subgraph_ref,
++                "concept_type": str(interface.type_signature()),
++                "inputs": inputs,
++                "expected": expected,
++                "output": output,
++                "output_signature": stable_hash_obj(output),
++                "validator_id": str(interface.validator_id),
++                "validator_passed": bool(validator_result.passed),
++                "validator_reason": str(validator_result.reason),
++                "delta_utility": 1.0 if bool(validator_result.passed) else -1.0,
++                "delta_cost": float(baseline_cost) - float(cost_used),
++                "cost_used": float(cost_used),
++                "baseline_cost": float(baseline_cost),
++                "note": str(note),
++            },
++        )
++
++    def verify_chains(self) -> Dict[str, bool]:
++        return {
++            "concepts_jsonl_chain_ok": bool(verify_chained_jsonl(self.concepts_path)),
++            "evidence_jsonl_chain_ok": bool(verify_chained_jsonl(self.evidence_path)),
++            "telemetry_jsonl_chain_ok": bool(verify_chained_jsonl(self.telemetry_path)),
++        }
+--- /dev/null	2026-01-11 02:16:58
++++ atos_core/concept_miner.py	2026-01-11 02:16:32
+@@ -0,0 +1,140 @@
++from __future__ import annotations
++
++from collections import deque
++from dataclasses import dataclass, field
++from typing import Any, Deque, Dict, Optional
++
++from .concepts import Concept, ConceptInterface, ConceptPolicies, ConceptRegistry
++
++
++@dataclass
++class CandidateStats:
++    key: str
++    subgraph_ref: Dict[str, Any]
++    interface: ConceptInterface
++    count_window: int = 0
++    pass_window: int = 0
++    cost_sum_window: float = 0.0
++    contexts_window: Dict[str, int] = field(default_factory=dict)
++
++    def pass_rate_window(self) -> float:
++        if self.count_window <= 0:
++            return 0.0
++        return float(self.pass_window) / float(self.count_window)
++
++    def avg_cost_window(self) -> float:
++        if self.count_window <= 0:
++            return 0.0
++        return float(self.cost_sum_window) / float(self.count_window)
++
++    def contexts_distinct_window(self) -> int:
++        return len(self.contexts_window)
++
++
++@dataclass(frozen=True)
++class CandidateEvent:
++    key: str
++    context_signature: str
++    passed: bool
++    cost_used: float
++
++
++@dataclass
++class ConceptBirthTrigger:
++    window_size: int = 50
++    birth_min_count: int = 5
++    birth_min_pass_rate: float = 0.8
++    birth_min_avg_cost: float = 2.0
++    policies: ConceptPolicies = field(default_factory=ConceptPolicies)
++
++    _events: Deque[CandidateEvent] = field(default_factory=deque, init=False)
++    _stats: Dict[str, CandidateStats] = field(default_factory=dict, init=False)
++    _already_defined: Dict[str, str] = field(default_factory=dict, init=False)  # key -> concept_id
++
++    def observe(
++        self,
++        *,
++        registry: Optional[ConceptRegistry] = None,
++        key: str,
++        step: int,
++        subgraph_ref: Dict[str, Any],
++        interface: ConceptInterface,
++        context_signature: str,
++        passed: bool,
++        cost_used: float,
++    ) -> Optional[Concept]:
++        k = str(key)
++        ctx = str(context_signature)
++        self._events.append(CandidateEvent(key=k, context_signature=ctx, passed=bool(passed), cost_used=float(cost_used)))
++        st = self._stats.get(k)
++        if st is None:
++            st = CandidateStats(key=k, subgraph_ref=subgraph_ref, interface=interface)
++            self._stats[k] = st
++        st.subgraph_ref = subgraph_ref
++        st.interface = interface
++
++        st.count_window += 1
++        if bool(passed):
++            st.pass_window += 1
++        st.cost_sum_window += float(cost_used)
++        st.contexts_window[ctx] = st.contexts_window.get(ctx, 0) + 1
++
++        if len(self._events) > int(self.window_size):
++            old = self._events.popleft()
++            ost = self._stats.get(old.key)
++            if ost is not None:
++                ost.count_window -= 1
++                if bool(old.passed):
++                    ost.pass_window -= 1
++                ost.cost_sum_window -= float(old.cost_used)
++                c = ost.contexts_window.get(old.context_signature, 0) - 1
++                if c <= 0:
++                    ost.contexts_window.pop(old.context_signature, None)
++                else:
++                    ost.contexts_window[old.context_signature] = c
++
++        if registry is None:
++            return None
++        return self.maybe_birth(registry=registry, key=k, step=int(step))
++
++    def maybe_birth(self, *, registry: ConceptRegistry, key: str, step: int) -> Optional[Concept]:
++        k = str(key)
++        st = self._stats.get(k)
++        if st is None:
++            return None
++        if k in self._already_defined:
++            return None
++        if st.count_window < int(self.birth_min_count):
++            return None
++        if st.pass_rate_window() < float(self.birth_min_pass_rate):
++            return None
++        if st.avg_cost_window() < float(self.birth_min_avg_cost):
++            return None
++
++        c = registry.define(
++            step=int(step),
++            subgraph_ref=st.subgraph_ref,
++            interface=st.interface,
++            policies=self.policies,
++            birth_reason=f"birth_trigger:key={k},count={st.count_window},pass_rate={st.pass_rate_window():.3f},avg_cost={st.avg_cost_window():.3f}",
++            birth_prior={
++                "u_ema": float(st.pass_rate_window()),
++                "pass2_ema": float(st.pass_rate_window()),
++                "k_ema": 1.0,
++            },
++        )
++        self._already_defined[k] = str(c.id)
++        return c
++
++    def stats_snapshot(self) -> Dict[str, Any]:
++        out: Dict[str, Any] = {}
++        for k, st in self._stats.items():
++            out[str(k)] = {
++                "count_window": int(st.count_window),
++                "pass_rate_window": float(st.pass_rate_window()),
++                "avg_cost_window": float(st.avg_cost_window()),
++                "contexts_distinct_window": int(st.contexts_distinct_window()),
++                "subgraph_ref": st.subgraph_ref,
++                "validator_id": str(st.interface.validator_id),
++            }
++        return out
+--- /dev/null	2026-01-11 02:16:58
++++ scripts/concept_csv_mvp_demo.py	2026-01-11 02:19:55
+@@ -0,0 +1,689 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import random
++import sys
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.concept_miner import ConceptBirthTrigger
++from atos_core.concepts import (
++    Concept,
++    ConceptInterface,
++    ConceptPolicies,
++    ConceptRegistry,
++    execute_binary_op,
++    execute_concept_subgraph,
++    execute_unary_pipeline,
++    infer_unary_io_types,
++    stable_hash_obj,
++)
++from atos_core.validators import canonical_nonneg_int_text, run_validator
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def shannon_entropy(counts: Dict[str, int]) -> float:
++    total = float(sum(int(v) for v in counts.values()))
++    if total <= 0:
++        return 0.0
++    import math
++
++    ent = 0.0
++    for v in counts.values():
++        p = float(v) / total
++        if p > 0:
++            ent -= p * math.log(p, 2)
++    return float(ent)
++
++
++@dataclass
++class Strategy:
++    strategy_id: str
++    ops: List[str]
++    cost: float
++
++    def subgraph_ref(self) -> Dict[str, Any]:
++        return {"kind": "unary_pipeline_v0", "ops": list(self.ops)}
++
++
++def concept_score(c: Concept, *, popularity: float) -> float:
++    u = float(c.u_ema)
++    k = float(c.k_ema)
++    base = u / (1.0 + k)
++    if popularity > 0.9:
++        base -= 0.1 * (popularity - 0.9)
++    return float(base)
++
++
++def strategy_score(pass_rate_est: float, cost: float) -> float:
++    u = float(pass_rate_est)
++    k = float(cost)
++    return float(u / (1.0 + k))
++
++
++def pick_best_concept(concepts: List[Concept]) -> Optional[Concept]:
++    if not concepts:
++        return None
++    concepts = sorted(concepts, key=lambda c: str(c.id))
++    best = concepts[0]
++    return best
++
++
++def filter_alive_matching(registry: ConceptRegistry, interface: ConceptInterface) -> List[Concept]:
++    t = interface.type_signature()
++    return [c for c in registry.alive_concepts() if c.interface.type_signature() == t]
++
++
++def plan_try_unary(
++    *,
++    registry: ConceptRegistry,
++    birth: ConceptBirthTrigger,
++    step: int,
++    goal_key: str,
++    interface: ConceptInterface,
++    strategies: List[Strategy],
++    inputs: Dict[str, Any],
++    expected: Any,
++    context_signature: str,
++    call_depth: int,
++    prefer_safe_after_fail: bool,
++    last_fail_flag: bool,
++) -> Tuple[Any, bool, float, str]:
++    baseline_cost = float(max(s.cost for s in strategies))
++
++    alive = filter_alive_matching(registry, interface)
++    popularity_total = max(1, sum(int(c.calls_total) for c in alive))
++    concept_candidates: List[Tuple[float, str, Concept]] = []
++    for c in alive:
++        pop = float(c.calls_total) / float(popularity_total)
++        concept_candidates.append((concept_score(c, popularity=pop), str(c.id), c))
++    concept_candidates.sort(key=lambda t: (-t[0], t[1]))
++
++    # Prefer "safe" strategy once right after a failure to avoid runaway collapse.
++    if bool(prefer_safe_after_fail) and bool(last_fail_flag):
++        safe = max(strategies, key=lambda s: (s.cost, s.strategy_id))
++        out = execute_concept_subgraph(safe.subgraph_ref(), inputs)
++        vr = run_validator(interface.validator_id, out, expected)
++        cost_used = float(safe.cost)
++        registry.log_primitives(
++            step=int(step),
++            subgraph_ref=safe.subgraph_ref(),
++            interface=interface,
++            inputs=inputs,
++            expected=expected,
++            output=out,
++            validator_result=vr,
++            cost_used=cost_used,
++            baseline_cost=baseline_cost,
++            context_signature=context_signature,
++            call_depth=int(call_depth),
++            note="forced_safe_after_fail",
++        )
++        birth.observe(
++            registry=registry,
++            key=f"{goal_key}::{safe.strategy_id}",
++            step=int(step),
++            subgraph_ref=safe.subgraph_ref(),
++            interface=interface,
++            context_signature=context_signature,
++            passed=bool(vr.passed),
++            cost_used=float(safe.cost),
++        )
++        return out, bool(vr.passed), float(cost_used), f"primitives:{safe.strategy_id}"
++
++    if concept_candidates:
++        _, _, c = concept_candidates[0]
++        out, vr, cost_used = registry.call(
++            step=int(step),
++            concept_id=str(c.id),
++            inputs=inputs,
++            expected=expected,
++            context_signature=context_signature,
++            call_depth=int(call_depth),
++            baseline_cost=baseline_cost,
++            contract_active=False,
++        )
++        if bool(prefer_safe_after_fail) and not bool(vr.passed):
++            safe = max(strategies, key=lambda s: (s.cost, s.strategy_id))
++            out2 = execute_concept_subgraph(safe.subgraph_ref(), inputs)
++            vr2 = run_validator(interface.validator_id, out2, expected)
++            registry.log_primitives(
++                step=int(step),
++                subgraph_ref=safe.subgraph_ref(),
++                interface=interface,
++                inputs=inputs,
++                expected=expected,
++                output=out2,
++                validator_result=vr2,
++                cost_used=float(safe.cost),
++                baseline_cost=baseline_cost,
++                context_signature=context_signature,
++                call_depth=int(call_depth),
++                note=f"fallback_after_concept_fail:concept_id={c.id}",
++            )
++            birth.observe(
++                registry=registry,
++                key=f"{goal_key}::{safe.strategy_id}",
++                step=int(step),
++                subgraph_ref=safe.subgraph_ref(),
++                interface=interface,
++                context_signature=context_signature,
++                passed=bool(vr2.passed),
++                cost_used=float(safe.cost),
++            )
++            return out2, bool(vr2.passed), float(cost_used + safe.cost), f"concept:{c.id}+fallback:{safe.strategy_id}"
++        return out, bool(vr.passed), float(cost_used), f"concept:{c.id}"
++
++    # No concept yet: choose between primitive strategies by observed pass_rate_window in the birth trigger.
++    snap = birth.stats_snapshot()
++    scored: List[Tuple[float, str, Strategy]] = []
++    for s in strategies:
++        k = f"{goal_key}::{s.strategy_id}"
++        pr = float(snap.get(k, {}).get("pass_rate_window", 0.5))
++        scored.append((strategy_score(pr, s.cost), s.strategy_id, s))
++    scored.sort(key=lambda t: (-t[0], t[1]))
++    chosen = scored[0][2]
++
++    out = execute_concept_subgraph(chosen.subgraph_ref(), inputs)
++    vr = run_validator(interface.validator_id, out, expected)
++    cost_used = float(chosen.cost)
++    registry.log_primitives(
++        step=int(step),
++        subgraph_ref=chosen.subgraph_ref(),
++        interface=interface,
++        inputs=inputs,
++        expected=expected,
++        output=out,
++        validator_result=vr,
++        cost_used=cost_used,
++        baseline_cost=baseline_cost,
++        context_signature=context_signature,
++        call_depth=int(call_depth),
++        note="chosen_by_score",
++    )
++    birth.observe(
++        registry=registry,
++        key=f"{goal_key}::{chosen.strategy_id}",
++        step=int(step),
++        subgraph_ref=chosen.subgraph_ref(),
++        interface=interface,
++        context_signature=context_signature,
++        passed=bool(vr.passed),
++        cost_used=float(chosen.cost),
++    )
++    if bool(prefer_safe_after_fail) and not bool(vr.passed):
++        safe = max(strategies, key=lambda s: (s.cost, s.strategy_id))
++        out2 = execute_concept_subgraph(safe.subgraph_ref(), inputs)
++        vr2 = run_validator(interface.validator_id, out2, expected)
++        registry.log_primitives(
++            step=int(step),
++            subgraph_ref=safe.subgraph_ref(),
++            interface=interface,
++            inputs=inputs,
++            expected=expected,
++            output=out2,
++            validator_result=vr2,
++            cost_used=float(safe.cost),
++            baseline_cost=baseline_cost,
++            context_signature=context_signature,
++            call_depth=int(call_depth),
++            note=f"fallback_after_primitives_fail:strategy_id={chosen.strategy_id}",
++        )
++        birth.observe(
++            registry=registry,
++            key=f"{goal_key}::{safe.strategy_id}",
++            step=int(step),
++            subgraph_ref=safe.subgraph_ref(),
++            interface=interface,
++            context_signature=context_signature,
++            passed=bool(vr2.passed),
++            cost_used=float(safe.cost),
++        )
++        return out2, bool(vr2.passed), float(cost_used + safe.cost), f"primitives:{chosen.strategy_id}+fallback:{safe.strategy_id}"
++    return out, bool(vr.passed), float(cost_used), f"primitives:{chosen.strategy_id}"
++
++
++def id_morphism(x: Any) -> Any:
++    return x
++
++
++def demo_category_checks(concepts: List[Concept]) -> Dict[str, Any]:
++    unary = []
++    for c in concepts:
++        if not bool(c.alive):
++            continue
++        if str(c.subgraph_ref.get("kind", "")) != "unary_pipeline_v0":
++            continue
++        unary.append(c)
++    unary = sorted(unary, key=lambda c: str(c.id))
++    if not unary:
++        return {"identity_error": 0, "assoc_error": 0, "checked": 0}
++
++    samples = ["x=00042", "id=7", "n=0000", "v=00123"]
++    identity_error = 0
++    assoc_error = 0
++    checked = 0
++
++    for c in unary:
++        ops = list(c.subgraph_ref.get("ops", []))
++        io = infer_unary_io_types(ops)
++        if io is None:
++            continue
++        in_t, out_t = io
++        if in_t != "str":
++            continue
++        for s in samples:
++            checked += 1
++            y = execute_unary_pipeline(ops, s)
++            y1 = execute_unary_pipeline(ops, id_morphism(s))
++            if stable_hash_obj(y) != stable_hash_obj(y1):
++                identity_error += 1
++
++            if out_t == "str":
++                y2 = id_morphism(y)
++            else:
++                y2 = y
++            if stable_hash_obj(y) != stable_hash_obj(y2):
++                identity_error += 1
++
++    if len(unary) >= 3:
++        f, g, h = unary[0], unary[1], unary[2]
++        f_ops = list(f.subgraph_ref.get("ops", []))
++        g_ops = list(g.subgraph_ref.get("ops", []))
++        h_ops = list(h.subgraph_ref.get("ops", []))
++        for s in samples:
++            checked += 1
++            try:
++                left = execute_unary_pipeline(h_ops, execute_unary_pipeline(g_ops, execute_unary_pipeline(f_ops, s)))
++                right = execute_unary_pipeline(h_ops, execute_unary_pipeline(g_ops, execute_unary_pipeline(f_ops, s)))
++                if stable_hash_obj(left) != stable_hash_obj(right):
++                    assoc_error += 1
++            except Exception:
++                assoc_error += 1
++
++    return {"identity_error": int(identity_error), "assoc_error": int(assoc_error), "checked": int(checked)}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", required=True, help="New WORM-safe run dir (must not exist)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--episodes", type=int, default=50)
++    args = ap.parse_args()
++
++    out_dir = str(args.out)
++    if os.path.exists(out_dir):
++        raise SystemExit(f"--out already exists (WORM): {out_dir}")
++
++    rnd = random.Random(int(args.seed))
++
++    policies = ConceptPolicies(
++        ema_alpha=0.2,
++        prune_min_calls=5,
++        prune_min_lifetime_steps=5,
++        prune_fail_streak=3,
++        prune_u_threshold=0.6,
++        prune_s_threshold=0.35,
++    )
++    registry = ConceptRegistry(run_dir=out_dir)
++    birth = ConceptBirthTrigger(
++        window_size=50,
++        birth_min_count=5,
++        birth_min_pass_rate=0.8,
++        birth_min_avg_cost=2.0,
++        policies=policies,
++    )
++
++    # Micro-tasks and validators
++    iface_parse_int = ConceptInterface(
++        input_schema={"text": "str"},
++        output_schema={"value": "int"},
++        validator_id="int_value_exact",
++        preconditions={"has_digits": True},
++        postconditions={"type": "int"},
++    )
++    iface_norm_text = ConceptInterface(
++        input_schema={"text": "str"},
++        output_schema={"text": "str"},
++        validator_id="int_text_canonical_exact",
++        preconditions={"has_digits": True},
++        postconditions={"canonical_int_text": True},
++    )
++
++    # Goal: normalize int-text (buggy vs robust)
++    norm_buggy = Strategy("norm_buggy_strip1", ["scan_digits", "strip_one_leading_zero"], cost=2.0)
++    norm_full = Strategy("norm_full_int", ["scan_digits", "digits_to_int", "int_to_digits"], cost=3.0)
++
++    # Goal: parse int value
++    parse_full = Strategy("parse_full", ["scan_digits", "digits_to_int"], cost=2.0)
++
++    totals: Dict[str, Any] = {
++        "episodes": int(args.episodes),
++        "top_level_pass": 0,
++        "top_level_fail": 0,
++        "top_level_cost_used_sum": 0.0,
++        "top_level_cost_baseline_sum": 0.0,
++        "births": 0,
++        "prunes": 0,
++    }
++
++    normalize_last_failed = False
++    known_concepts: Dict[str, int] = {}
++
++    step = 0
++    for ep in range(int(args.episodes)):
++        task_kind = ["T2_norm_text", "T3_sum_ints", "T1_json_ab"][ep % 3]
++
++        # Deterministic regime change to force a brittle concept to fail and get pruned.
++        zpad = 1 if ep < 15 else 3
++
++        def make_text_int() -> Tuple[str, int]:
++            n = rnd.randint(0, 999)
++            digits = ("0" * int(zpad)) + str(int(n))
++            txt = f"val={digits}"
++            return txt, int(str(int(digits)))
++
++        if task_kind == "T2_norm_text":
++            text, exp_int = make_text_int()
++            exp_text = str(int(exp_int))
++            baseline_cost = float(norm_full.cost)
++
++            out, ok, cost_used, used = plan_try_unary(
++                registry=registry,
++                birth=birth,
++                step=int(step),
++                goal_key="goal:norm_text",
++                interface=iface_norm_text,
++                strategies=[norm_buggy, norm_full],
++                inputs={"text": text},
++                expected=exp_text,
++                context_signature=f"{task_kind}␟ep={ep}",
++                call_depth=0,
++                prefer_safe_after_fail=True,
++                last_fail_flag=bool(normalize_last_failed),
++            )
++            totals["top_level_cost_used_sum"] += float(cost_used)
++            totals["top_level_cost_baseline_sum"] += float(baseline_cost)
++            if ok:
++                totals["top_level_pass"] += 1
++                normalize_last_failed = False
++            else:
++                totals["top_level_fail"] += 1
++                normalize_last_failed = True
++            step += 1
++
++            for c in registry.concepts():
++                if c.id not in known_concepts:
++                    known_concepts[c.id] = int(step)
++                    totals["births"] += 1
++            continue
++
++        if task_kind == "T3_sum_ints":
++            text_a, exp_a = make_text_int()
++            text_b, exp_b = make_text_int()
++            exp_sum = int(exp_a) + int(exp_b)
++            exp_sum_text = str(int(exp_sum))
++
++            a, ok_a, cost_a, used_a = plan_try_unary(
++                registry=registry,
++                birth=birth,
++                step=int(step),
++                goal_key="goal:parse_int",
++                interface=iface_parse_int,
++                strategies=[parse_full],
++                inputs={"text": text_a},
++                expected=int(exp_a),
++                context_signature=f"{task_kind}:a␟ep={ep}",
++                call_depth=1,
++                prefer_safe_after_fail=False,
++                last_fail_flag=False,
++            )
++            step += 1
++            b, ok_b, cost_b, used_b = plan_try_unary(
++                registry=registry,
++                birth=birth,
++                step=int(step),
++                goal_key="goal:parse_int",
++                interface=iface_parse_int,
++                strategies=[parse_full],
++                inputs={"text": text_b},
++                expected=int(exp_b),
++                context_signature=f"{task_kind}:b␟ep={ep}",
++                call_depth=1,
++                prefer_safe_after_fail=False,
++                last_fail_flag=False,
++            )
++            step += 1
++
++            s = execute_binary_op("add_int", a, b)
++            out_text = execute_unary_pipeline(["int_to_digits"], s)
++            vr = run_validator("int_text_canonical_exact", out_text, exp_sum_text)
++
++            baseline_cost = float(parse_full.cost + parse_full.cost + 1.0 + 1.0)
++            cost_used = float(cost_a + cost_b + 1.0 + 1.0)
++            totals["top_level_cost_used_sum"] += float(cost_used)
++            totals["top_level_cost_baseline_sum"] += float(baseline_cost)
++
++            registry.log_primitives(
++                step=int(step),
++                subgraph_ref={"kind": "top_level_v0", "task": task_kind},
++                interface=ConceptInterface(
++                    input_schema={"text_a": "str", "text_b": "str"},
++                    output_schema={"text": "str"},
++                    validator_id="int_text_canonical_exact",
++                ),
++                inputs={"text_a": text_a, "text_b": text_b},
++                expected=exp_sum_text,
++                output=out_text,
++                validator_result=vr,
++                cost_used=float(cost_used),
++                baseline_cost=float(baseline_cost),
++                context_signature=f"{task_kind}␟ep={ep}",
++                call_depth=0,
++                note=f"sum_path:a={used_a},b={used_b},ok_a={ok_a},ok_b={ok_b}",
++            )
++            if bool(vr.passed):
++                totals["top_level_pass"] += 1
++            else:
++                totals["top_level_fail"] += 1
++            step += 1
++
++            for c in registry.concepts():
++                if c.id not in known_concepts:
++                    known_concepts[c.id] = int(step)
++                    totals["births"] += 1
++            continue
++
++        if task_kind == "T1_json_ab":
++            text_a, exp_a = make_text_int()
++            text_b, exp_b = make_text_int()
++            exp_obj = {"a": int(exp_a), "b": int(exp_b)}
++
++            a, ok_a, cost_a, used_a = plan_try_unary(
++                registry=registry,
++                birth=birth,
++                step=int(step),
++                goal_key="goal:parse_int",
++                interface=iface_parse_int,
++                strategies=[parse_full],
++                inputs={"text": text_a},
++                expected=int(exp_a),
++                context_signature=f"{task_kind}:a␟ep={ep}",
++                call_depth=1,
++                prefer_safe_after_fail=False,
++                last_fail_flag=False,
++            )
++            step += 1
++            b, ok_b, cost_b, used_b = plan_try_unary(
++                registry=registry,
++                birth=birth,
++                step=int(step),
++                goal_key="goal:parse_int",
++                interface=iface_parse_int,
++                strategies=[parse_full],
++                inputs={"text": text_b},
++                expected=int(exp_b),
++                context_signature=f"{task_kind}:b␟ep={ep}",
++                call_depth=1,
++                prefer_safe_after_fail=False,
++                last_fail_flag=False,
++            )
++            step += 1
++
++            obj = execute_binary_op("make_dict_ab", a, b)
++            out_text = execute_unary_pipeline(["json_canonical"], obj)
++            vr = run_validator("json_ab_int_exact", out_text, exp_obj)
++
++            baseline_cost = float(parse_full.cost + parse_full.cost + 1.0 + 1.0)
++            cost_used = float(cost_a + cost_b + 1.0 + 1.0)
++            totals["top_level_cost_used_sum"] += float(cost_used)
++            totals["top_level_cost_baseline_sum"] += float(baseline_cost)
++
++            registry.log_primitives(
++                step=int(step),
++                subgraph_ref={"kind": "top_level_v0", "task": task_kind},
++                interface=ConceptInterface(
++                    input_schema={"text_a": "str", "text_b": "str"},
++                    output_schema={"json": "str"},
++                    validator_id="json_ab_int_exact",
++                ),
++                inputs={"text_a": text_a, "text_b": text_b},
++                expected=exp_obj,
++                output=out_text,
++                validator_result=vr,
++                cost_used=float(cost_used),
++                baseline_cost=float(baseline_cost),
++                context_signature=f"{task_kind}␟ep={ep}",
++                call_depth=0,
++                note=f"json_path:a={used_a},b={used_b},ok_a={ok_a},ok_b={ok_b}",
++            )
++            if bool(vr.passed):
++                totals["top_level_pass"] += 1
++            else:
++                totals["top_level_fail"] += 1
++            step += 1
++
++            for c in registry.concepts():
++                if c.id not in known_concepts:
++                    known_concepts[c.id] = int(step)
++                    totals["births"] += 1
++            continue
++
++    totals["top_level_pass_rate"] = float(totals["top_level_pass"]) / float(max(1, totals["episodes"]))
++    totals["avg_cost_used"] = float(totals["top_level_cost_used_sum"]) / float(max(1, totals["episodes"]))
++    totals["avg_cost_baseline"] = float(totals["top_level_cost_baseline_sum"]) / float(max(1, totals["episodes"]))
++    totals["avg_cost_saved"] = float(totals["avg_cost_baseline"] - totals["avg_cost_used"])
++
++    # Count prune events from evidence log.
++    prunes = 0
++    if os.path.exists(registry.evidence_path):
++        with open(registry.evidence_path, "r", encoding="utf-8") as f:
++            for line in f:
++                if '"event":"PRUNE"' in line:
++                    prunes += 1
++    totals["prunes"] = int(prunes)
++
++    # Types + anti-collapse metrics from telemetry
++    type_counts: Dict[str, int] = {}
++    concept_call_counts: Dict[str, int] = {}
++    if os.path.exists(registry.telemetry_path):
++        with open(registry.telemetry_path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                row = json.loads(line)
++                ct = row.get("concept_type")
++                if isinstance(ct, str) and ct:
++                    type_counts[ct] = type_counts.get(ct, 0) + 1
++                if row.get("event") == "CALL":
++                    cid = row.get("concept_id")
++                    if isinstance(cid, str) and cid:
++                        concept_call_counts[cid] = concept_call_counts.get(cid, 0) + 1
++
++    entropy_types = shannon_entropy(type_counts)
++    monopoly_alarm = None
++    if concept_call_counts:
++        top_cid, top_n = sorted(concept_call_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
++        share = float(top_n) / float(sum(concept_call_counts.values()))
++        if share >= 0.8:
++            monopoly_alarm = {"concept_id": top_cid, "share": share}
++
++    category_checks = demo_category_checks(list(registry.concepts()))
++
++    concepts_out: List[Dict[str, Any]] = []
++    types_out: List[Dict[str, Any]] = []
++    for c in sorted(list(registry.concepts()), key=lambda c: str(c.id)):
++        concepts_out.append(
++            {
++                "id": str(c.id),
++                "alive": bool(c.alive),
++                "type_signature": str(c.interface.type_signature()),
++                "validator_id": str(c.interface.validator_id),
++                "subgraph_ref": dict(c.subgraph_ref),
++                "U_t": float(c.u_ema),
++                "K_t": float(c.k_ema),
++                "S_t": float(c.s_t),
++                "hits": int(c.calls_total),
++                "contexts_distinct": int(c.contexts_distinct()),
++                "last_seen_step": int(c.last_seen_step),
++            }
++        )
++    for t_sig, n in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])):
++        types_out.append({"type_signature": str(t_sig), "calls": int(n)})
++
++    alarms = {
++        "entropy_types": float(entropy_types),
++        "entropy_collapse": bool(entropy_types < 0.5 and sum(type_counts.values()) >= 10),
++        "monopoly": monopoly_alarm,
++    }
++
++    summary = {
++        "seed": int(args.seed),
++        "run_dir": out_dir,
++        "chains": registry.verify_chains(),
++        "totals": totals,
++        "concepts": concepts_out,
++        "types": types_out,
++        "composition": category_checks,
++        "alarms": alarms,
++        "paths": {
++            "concepts_jsonl": registry.concepts_path,
++            "concept_evidence_jsonl": registry.evidence_path,
++            "concept_telemetry_jsonl": registry.telemetry_path,
++        },
++    }
++
++    with open(os.path.join(out_dir, "concept_summary.json"), "w", encoding="utf-8") as f:
++        f.write(json.dumps(summary, ensure_ascii=False, indent=2))
++        f.write("\n")
++
++    # Basic reproducibility hashes for the run dir.
++    summary["sha256"] = {
++        "concepts_jsonl": sha256_file(registry.concepts_path) if os.path.exists(registry.concepts_path) else None,
++        "concept_evidence_jsonl": sha256_file(registry.evidence_path) if os.path.exists(registry.evidence_path) else None,
++        "concept_telemetry_jsonl": sha256_file(registry.telemetry_path) if os.path.exists(registry.telemetry_path) else None,
++        "concept_summary_json": sha256_file(os.path.join(out_dir, "concept_summary.json")),
++    }
++
++    print(json.dumps(summary, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()

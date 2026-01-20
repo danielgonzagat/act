@@ -1,0 +1,19 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         trace_router_live_used: List[int] = []
+         trace_router_live_fallback: List[int] = []
+         trace_router_live_fallback_reason: List[str] = []
+         trace_router_live_allowed_predictor_ids: List[List[str]] = []
+-        trace_router_live_predictors_evaluated: List[int] = []
+-        trace_baseline_predictors_evaluated: List[int] = []
++        trace_router_live_predictors_iterated: List[int] = []
++        trace_router_live_predictors_matched: List[int] = []
++        trace_router_live_predictors_emitted: List[int] = []
++        trace_baseline_predictors_iterated: List[int] = []
++        trace_baseline_predictors_matched: List[int] = []
++        trace_baseline_predictors_emitted: List[int] = []
+         trace_router_live_mismatch: List[int] = []
+         trace_router_live_debug_baseline_token: List[str] = []
+         trace_router_live_debug_gate_token: List[str] = []
+*** End Patch

@@ -1,0 +1,487 @@
+--- patches/v69_base/atos_core/engine.py	2026-01-11 23:35:46
++++ atos_core/engine.py	2026-01-11 23:39:00
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import copy
+ import math
+ import hashlib
+ import json
+@@ -864,6 +865,16 @@
+                 mode_state = str(sel.evidence.get("mode") or "default")
+             mode_act_id = sel.id
+ 
++        trace_plan_trace: Optional[Dict[str, Any]] = None
++        if isinstance(plan_trace, dict):
++            try:
++                trace_plan_trace = copy.deepcopy(plan_trace)
++            except Exception:
++                trace_plan_trace = dict(plan_trace)
++            if not isinstance(trace_plan_trace, dict):
++                trace_plan_trace = None
++        trace_plan_trace_sig = ""
++
+         contract_meta: Dict[str, Any] = {
+             "enabled": bool(self.config.enable_contracts),
+             "contract_act_id": self._instruction_contract.id if self._instruction_contract is not None else None,
+@@ -1271,6 +1282,18 @@
+ 
+         contract_active = bool(contract_tokens)
+ 
++        if isinstance(trace_plan_trace, dict):
++            try:
++                trace_plan_trace["trace_instruction_contract"] = copy.deepcopy(contract_meta)
++            except Exception:
++                trace_plan_trace["trace_instruction_contract"] = dict(contract_meta)
++            try:
++                trace_plan_trace_sig = sha256_hex(
++                    canonical_json_dumps(trace_plan_trace).encode("utf-8")
++                )
++            except Exception:
++                trace_plan_trace_sig = ""
++
+         def penalty_view(tokens: List[str], gen: List[str]) -> Dict[str, Any]:
+             filtered = [x for x in tokens if x not in {"<BOS>"}]
+             recent = filtered[-self.config.repetition_recent :]
+@@ -2087,6 +2110,66 @@
+             rr_hit_unique = sorted(rr_set, key=lambda rid: (int(rr_order.get(rid, 10**9)), rid))
+         except Exception:
+             rr_hit_unique = []
++
++        trace_out: Dict[str, Any] = {
++            "active_set_size": int(active_set_size),
++            "predictor_total": int(predictor_total),
++            "rewrite_rules_total": int(rewrite_rules_total),
++            "selector_id": selector_id,
++            "context_keys": trace_context_keys,
++            "executed_predictor_ids": trace_executed_predictor_ids,
++            "rewrite_rule_hit_ids": trace_rewrite_rule_hit_ids,
++            "rewrite_rules_changed_count": trace_rewrite_rules_changed_count,
++            "selected_tokens": trace_selected_tokens,
++            "selected_source_act_ids": trace_selected_act_ids,
++            "selected_act_ids": trace_selected_act_ids,
++            "candidates_pre_rewrite": trace_candidates_pre,
++            "candidates_post_rewrite": trace_candidates_post,
++            "predictor_iterated": trace_predictor_iterated,
++            "predictor_matched": trace_predictor_matched,
++            "predictor_emitted": trace_predictor_emitted,
++            "router_live_used": trace_router_live_used,
++            "router_live_fallback": trace_router_live_fallback,
++            "router_live_fallback_reason": trace_router_live_fallback_reason,
++            "router_live_allowed_predictor_ids": trace_router_live_allowed_predictor_ids,
++            "router_live_predictors_iterated": trace_router_live_predictors_iterated,
++            "router_live_predictors_matched": trace_router_live_predictors_matched,
++            "router_live_predictors_emitted": trace_router_live_predictors_emitted,
++            "baseline_predictors_iterated": trace_baseline_predictors_iterated,
++            "baseline_predictors_matched": trace_baseline_predictors_matched,
++            "baseline_predictors_emitted": trace_baseline_predictors_emitted,
++            "router_live_mismatch": trace_router_live_mismatch,
++            "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
++            "router_live_debug_gate_token": trace_router_live_debug_gate_token,
++            "gate_table_act": dict(self._gate_table_act_status),
++            "gate_table_hit": trace_gate_table_hit,
++            "gate_table_allowed_k": trace_gate_table_allowed_k,
++            "instruction_contract": contract_meta,
++            "instruction_contract_used": trace_instruction_contract_used,
++            "instruction_contract_kind": trace_instruction_contract_kind,
++            "instruction_contract_reason": trace_instruction_contract_reason,
++            "force_gate_used": trace_force_gate_used,
++            "force_gate_fallback": trace_force_gate_fallback,
++            "force_gate_fallback_reason": trace_force_gate_fallback_reason,
++            "force_gate_allowed_size": trace_force_gate_allowed_size,
++            "force_gate_predictors_iterated": trace_force_gate_predictors_iterated,
++            "force_gate_predictors_matched": trace_force_gate_predictors_matched,
++            "force_gate_predictors_emitted": trace_force_gate_predictors_emitted,
++            "force_gate_baseline_predictors_iterated": trace_force_gate_baseline_predictors_iterated,
++            "force_gate_baseline_predictors_matched": trace_force_gate_baseline_predictors_matched,
++            "force_gate_baseline_predictors_emitted": trace_force_gate_baseline_predictors_emitted,
++            "force_gate_mismatch": trace_force_gate_mismatch,
++            "force_gate_debug_baseline_token": trace_force_gate_debug_baseline_token,
++            "force_gate_debug_gate_token": trace_force_gate_debug_gate_token,
++            "force_gate_mismatch_examples": list(force_gate_mismatch_examples),
++            "subgraph": {
++                "executed_predictor_act_ids": exec_pred_unique,
++                "rewrite_rule_hit_ids": rr_hit_unique,
++            },
++        }
++        if isinstance(trace_plan_trace, dict):
++            trace_out["plan_trace"] = trace_plan_trace
++            trace_out["plan_trace_sig"] = str(trace_plan_trace_sig)
+ 
+         return {
+             "prompt": prompt,
+@@ -2094,62 +2177,7 @@
+             "prompt_tokens": prompt_tokens,
+             "gen_tokens": gen_tokens,
+             "all_tokens": out_tokens + gen_tokens,
+-            "trace": {
+-                "active_set_size": int(active_set_size),
+-                "predictor_total": int(predictor_total),
+-                "rewrite_rules_total": int(rewrite_rules_total),
+-                "selector_id": selector_id,
+-                "context_keys": trace_context_keys,
+-                "executed_predictor_ids": trace_executed_predictor_ids,
+-                "rewrite_rule_hit_ids": trace_rewrite_rule_hit_ids,
+-                "rewrite_rules_changed_count": trace_rewrite_rules_changed_count,
+-                "selected_tokens": trace_selected_tokens,
+-                "selected_source_act_ids": trace_selected_act_ids,
+-                "selected_act_ids": trace_selected_act_ids,
+-                "candidates_pre_rewrite": trace_candidates_pre,
+-                "candidates_post_rewrite": trace_candidates_post,
+-                "predictor_iterated": trace_predictor_iterated,
+-                "predictor_matched": trace_predictor_matched,
+-                "predictor_emitted": trace_predictor_emitted,
+-                "router_live_used": trace_router_live_used,
+-                "router_live_fallback": trace_router_live_fallback,
+-                "router_live_fallback_reason": trace_router_live_fallback_reason,
+-                "router_live_allowed_predictor_ids": trace_router_live_allowed_predictor_ids,
+-                "router_live_predictors_iterated": trace_router_live_predictors_iterated,
+-                "router_live_predictors_matched": trace_router_live_predictors_matched,
+-                "router_live_predictors_emitted": trace_router_live_predictors_emitted,
+-                "baseline_predictors_iterated": trace_baseline_predictors_iterated,
+-                "baseline_predictors_matched": trace_baseline_predictors_matched,
+-                "baseline_predictors_emitted": trace_baseline_predictors_emitted,
+-                "router_live_mismatch": trace_router_live_mismatch,
+-                "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
+-                "router_live_debug_gate_token": trace_router_live_debug_gate_token,
+-                "gate_table_act": dict(self._gate_table_act_status),
+-                "gate_table_hit": trace_gate_table_hit,
+-                "gate_table_allowed_k": trace_gate_table_allowed_k,
+-                "instruction_contract": contract_meta,
+-                "instruction_contract_used": trace_instruction_contract_used,
+-                "instruction_contract_kind": trace_instruction_contract_kind,
+-                "instruction_contract_reason": trace_instruction_contract_reason,
+-                "force_gate_used": trace_force_gate_used,
+-                "force_gate_fallback": trace_force_gate_fallback,
+-                "force_gate_fallback_reason": trace_force_gate_fallback_reason,
+-                "force_gate_allowed_size": trace_force_gate_allowed_size,
+-                "force_gate_predictors_iterated": trace_force_gate_predictors_iterated,
+-                "force_gate_predictors_matched": trace_force_gate_predictors_matched,
+-                "force_gate_predictors_emitted": trace_force_gate_predictors_emitted,
+-                "force_gate_baseline_predictors_iterated": trace_force_gate_baseline_predictors_iterated,
+-                "force_gate_baseline_predictors_matched": trace_force_gate_baseline_predictors_matched,
+-                "force_gate_baseline_predictors_emitted": trace_force_gate_baseline_predictors_emitted,
+-                "force_gate_mismatch": trace_force_gate_mismatch,
+-                "force_gate_debug_baseline_token": trace_force_gate_debug_baseline_token,
+-                "force_gate_debug_gate_token": trace_force_gate_debug_gate_token,
+-                "force_gate_mismatch_examples": list(force_gate_mismatch_examples),
+-                "subgraph": {
+-                    "executed_predictor_act_ids": exec_pred_unique,
+-                    "rewrite_rule_hit_ids": rr_hit_unique,
+-                },
+-            },
++            "trace": trace_out,
+             "mode": mode_state,
+             "mode_act_id": mode_act_id,
+             "mode_source": mode_source,
+--- patches/v69_base/atos_core/suite.py	2026-01-11 23:35:46
++++ atos_core/suite.py	2026-01-11 23:40:04
+@@ -1600,17 +1600,15 @@
+             tr = dict(out.get("trace") or {})
+             contract_meta = tr.get("instruction_contract")
+             if isinstance(contract_meta, dict):
+-                plan_trace["contract"] = contract_meta
+                 if bool(contract_meta.get("used")):
+                     contract_used_turns += 1
+                     k = str(contract_meta.get("kind") or "")
+                     if k:
+                         contract_used_by_kind[k] += 1
+-            tr["plan_trace"] = plan_trace
+             history[-1]["trace"] = tr
+ 
+             plan_turns_total += 1
+-            if "plan_trace" not in tr:
++            if not isinstance(tr.get("plan_trace"), dict):
+                 plan_turns_missing += 1
+ 
+         full_text = build_chat_prompt(history)
+@@ -1628,19 +1626,6 @@
+         else:
+             ok, reason = fn(out_text, expected_spec)
+ 
+-        # Shadow goal progress (deterministic): 1.0 if validated, else 0.0.
+-        try:
+-            tr = turn_rec.get("trace") or {}
+-            if isinstance(tr, dict) and isinstance(tr.get("plan_trace"), dict):
+-                pt = tr["plan_trace"]
+-                if str(pt.get("goal_id") or ""):
+-                    pt["goal_progress"] = 1.0 if bool(ok) else 0.0
+-                    pt["goal_satisfied"] = bool(ok)
+-                    pt["validator_passed"] = bool(ok)
+-                    pt["validator_reason"] = str(reason or "")
+-        except Exception:
+-            pass
+-
+         if ok:
+             pass_count += 1
+             if isinstance(goal_spec, dict) and goal_spec:
+--- /dev/null	2026-01-11 23:46:32
++++ scripts/smoke_trace_plantrace_v69.py	2026-01-11 23:43:25
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import UTILITY_DIALOGUES_V68, run_skill_suite
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def sha256_canon(obj: Any) -> str:
++    return hashlib.sha256(canonical_json_dumps(obj).encode("utf-8")).hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def _assert_contract_snapshots_match(trace: Dict[str, Any]) -> Tuple[bool, str]:
++    ic = trace.get("instruction_contract")
++    pt = trace.get("plan_trace")
++    if not isinstance(ic, dict):
++        return False, "instruction_contract_missing"
++    if not isinstance(pt, dict):
++        return False, "plan_trace_missing"
++    pic = pt.get("trace_instruction_contract")
++    if not isinstance(pic, dict):
++        return False, "plan_trace.trace_instruction_contract_missing"
++    if sha256_canon(ic) != sha256_canon(pic):
++        return False, "instruction_contract_snapshot_mismatch"
++    return True, ""
++
++
++def _aliasing_test(*, engine: Engine) -> Dict[str, Any]:
++    pt = {
++        "compiler_id": "alias_test_compiler",
++        "validator_id": "plan_validator",
++        "expected_format": "plan",
++        "constraints": ["plan_validator", "json_canonical"],
++        "expected_spec_sig": "alias_test_sig",
++        "goal_id": "alias_goal",
++    }
++    prompt = "User: hello\nSystem:\n"
++    out = engine.generate(prompt=prompt, max_new_tokens=8, mode="greedy", dialogue_id=999, turn=0, plan_trace=pt)
++    tr = out.get("trace") if isinstance(out, dict) else {}
++    tr = tr if isinstance(tr, dict) else {}
++
++    snap0 = tr.get("plan_trace")
++    snap0 = snap0 if isinstance(snap0, dict) else {}
++    before = str(snap0.get("compiler_id") or "")
++    if before != "alias_test_compiler":
++        return {"ok": False, "reason": "plan_trace_snapshot_wrong_before_mutation", "before": before}
++
++    pt["compiler_id"] = "MUTATED"
++    after = str((tr.get("plan_trace") or {}).get("compiler_id") or "")
++    if after != "alias_test_compiler":
++        return {"ok": False, "reason": "plan_trace_snapshot_mutated_via_aliasing", "after": after}
++
++    ic = tr.get("instruction_contract")
++    pic = (tr.get("plan_trace") or {}).get("trace_instruction_contract")
++    if isinstance(ic, dict) and isinstance(pic, dict):
++        orig_kind = str(pic.get("kind") or "")
++        ic["kind"] = "MUTATED_KIND"
++        after_kind = str(((tr.get("plan_trace") or {}).get("trace_instruction_contract") or {}).get("kind") or "")
++        if after_kind != orig_kind:
++            return {"ok": False, "reason": "contract_snapshot_mutated_via_aliasing"}
++
++    return {"ok": True}
++
++
++def eval_v69_trace(*, run_dir: str, seed: int, max_new_tokens: int) -> Dict[str, Any]:
++    acts_path = os.path.join(str(run_dir), "acts.jsonl")
++    store = ActStore.load_jsonl(acts_path)
++    engine = Engine(store, seed=int(seed), config=EngineConfig(enable_contracts=True))
++
++    alias_res = _aliasing_test(engine=engine)
++    if not bool(alias_res.get("ok", False)):
++        _fail(f"ERROR: aliasing_test_failed: {alias_res}")
++
++    transcripts, metrics = run_skill_suite(engine, tasks=UTILITY_DIALOGUES_V68, max_new_tokens=int(max_new_tokens))
++    pass_rate = float(metrics.get("pass_rate", 0.0) or 0.0)
++    contract_used_rate = float(metrics.get("contract_used_rate", 0.0) or 0.0)
++    contract_used_by_kind = metrics.get("contract_used_by_kind") or {}
++    if not isinstance(contract_used_by_kind, dict):
++        contract_used_by_kind = {}
++
++    if abs(pass_rate - 1.0) > 1e-12:
++        _fail(f"ERROR: pass_rate != 1.0 (got {pass_rate})")
++    if abs(contract_used_rate - 1.0) > 1e-12:
++        _fail(f"ERROR: contract_used_rate != 1.0 (got {contract_used_rate})")
++    if int(contract_used_by_kind.get("plan_contract_v67", 0) or 0) <= 0:
++        _fail("ERROR: expected contract_used_by_kind.plan_contract_v67 > 0")
++
++    turns_total = 0
++    plan_trace_present = 0
++    plan_trace_sig_ok = 0
++    contract_inside_plan_trace = 0
++    contracts_match = 0
++    contract_kind_ok = 0
++    sample_plan_trace_sig = ""
++
++    for rec in transcripts:
++        turns = rec.get("turns") if isinstance(rec, dict) else None
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            turns_total += 1
++            tr = t.get("trace") if isinstance(t.get("trace"), dict) else {}
++
++            pt = tr.get("plan_trace")
++            if isinstance(pt, dict):
++                plan_trace_present += 1
++                if not sample_plan_trace_sig:
++                    sample_plan_trace_sig = str(tr.get("plan_trace_sig") or "")
++                want_sig = str(tr.get("plan_trace_sig") or "")
++                got_sig = sha256_canon(pt)
++                if want_sig and want_sig == got_sig:
++                    plan_trace_sig_ok += 1
++                pic = pt.get("trace_instruction_contract")
++                if isinstance(pic, dict):
++                    contract_inside_plan_trace += 1
++                    if bool(pic.get("used")) and str(pic.get("kind") or "") == "plan_contract_v67":
++                        contract_kind_ok += 1
++
++            ok, _ = _assert_contract_snapshots_match(tr)
++            if ok:
++                contracts_match += 1
++
++    if turns_total <= 0:
++        _fail("ERROR: no_turns")
++    if plan_trace_present != turns_total:
++        _fail(f"ERROR: plan_trace_missing_turns: have={plan_trace_present} total={turns_total}")
++    if plan_trace_sig_ok != turns_total:
++        _fail(f"ERROR: plan_trace_sig_mismatch: ok={plan_trace_sig_ok} total={turns_total}")
++    if contract_inside_plan_trace != turns_total:
++        _fail(
++            f"ERROR: missing trace_instruction_contract in plan_trace: have={contract_inside_plan_trace} total={turns_total}"
++        )
++    if contracts_match != turns_total:
++        _fail(f"ERROR: contract_snapshot_mismatch: ok={contracts_match} total={turns_total}")
++    if contract_kind_ok != turns_total:
++        _fail(f"ERROR: contract_kind_not_ok: ok={contract_kind_ok} total={turns_total}")
++
++    return {
++        "run": str(run_dir),
++        "seed": int(seed),
++        "max_new_tokens": int(max_new_tokens),
++        "utility_suite_version": "v68",
++        "aliasing_test": dict(alias_res),
++        "turns_total": int(turns_total),
++        "plan_trace_present_turns": int(plan_trace_present),
++        "plan_trace_sig_ok_turns": int(plan_trace_sig_ok),
++        "contract_inside_plan_trace_turns": int(contract_inside_plan_trace),
++        "contract_snapshot_match_turns": int(contracts_match),
++        "contract_kind_ok_turns": int(contract_kind_ok),
++        "plan_trace_sig_sample": str(sample_plan_trace_sig),
++        "metrics": dict(metrics),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument(
++        "--run",
++        default="results/run_pure_20k_v39_contracts_paraphrase_telemetry_smoke",
++        help="Run dir containing acts.jsonl (read-only)",
++    )
++    ap.add_argument("--out_base", default="results/run_smoke_trace_plantrace_v69")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=200)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    run_dir = str(args.run)
++    seed = int(args.seed)
++    max_new_tokens = int(args.max_new_tokens)
++
++    results: Dict[str, Any] = {"run": run_dir, "seed": seed, "max_new_tokens": max_new_tokens, "tries": {}}
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        ev = eval_v69_trace(run_dir=run_dir, seed=seed, max_new_tokens=max_new_tokens)
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        m = ev.get("metrics") if isinstance(ev.get("metrics"), dict) else {}
++        by_kind = (m.get("contract_used_by_kind") or {}) if isinstance(m, dict) else {}
++        if not isinstance(by_kind, dict):
++            by_kind = {}
++
++        core = {
++            "seed": seed,
++            "run": run_dir,
++            "pass_rate": float((m.get("pass_rate") if isinstance(m, dict) else 0.0) or 0.0),
++            "contract_used_rate": float((m.get("contract_used_rate") if isinstance(m, dict) else 0.0) or 0.0),
++            "contract_used_by_kind": dict(sorted((str(k), int(v)) for k, v in by_kind.items())),
++            "turns_total": int(ev.get("turns_total", 0) or 0),
++            "plan_trace_sig_sample": str(ev.get("plan_trace_sig_sample") or ""),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": summary_sha}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(len(summary_shas) == 2 and summary_shas[0] == summary_shas[1])
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: {summary_shas}")
++    results["determinism"] = {"ok": True, "summary_sha256": summary_shas[0]}
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()

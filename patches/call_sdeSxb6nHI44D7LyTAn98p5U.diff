@@ -1,0 +1,23 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         def _apply_rewrite_rules(
+             cands: Dict[str, Candidate],
+             *,
+-            record_trace: bool,
+             context: Sequence[str],
+             penalties: Dict[str, Any],
+-        ) -> Dict[str, Candidate]:
++        ) -> Tuple[Dict[str, Candidate], List[str]]:
+             rr_hits: List[str] = []
+             top_tok = _top1_token(cands)
+             for rr in self._rewrite_rules:
+@@
+                     rr_hits.append(str(rr.id))
+                 top_tok = after_tok
+-            if record_trace:
+-                trace_rewrite_rule_hit_ids.append(rr_hits)
+-                trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
+-            return cands
++            return cands, rr_hits
+*** End Patch

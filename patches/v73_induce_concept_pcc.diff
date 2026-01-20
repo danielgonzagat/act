@@ -1,0 +1,1085 @@
+--- /dev/null	2026-01-12 10:44:15
++++ atos_core/induce_concept_v73.py	2026-01-12 10:40:20
+@@ -0,0 +1,280 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
++
++from .act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from .concept_registry_v70 import interface_sig_from_act, program_sha256_from_act
++from .pcc_v73 import build_certificate_v1
++from .store import ActStore
++from .trace_v73 import PlanStepTraceV73, TraceV73
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _sorted_strs(xs: Sequence[str]) -> List[str]:
++    return [str(x) for x in sorted([str(x) for x in xs if str(x)], key=str)]
++
++
++@dataclass(frozen=True)
++class InducedCandidateV73:
++    subpath: Tuple[str, ...]
++    support: int
++    contexts: Tuple[str, ...]
++    rep_steps: Tuple[PlanStepTraceV73, ...]
++    score_key: Tuple[int, int, str]
++
++
++def _enumerate_subpaths(path: Sequence[str], *, max_k: int) -> List[Tuple[int, Tuple[str, ...]]]:
++    out: List[Tuple[int, Tuple[str, ...]]] = []
++    p = [str(x) for x in path if str(x)]
++    n = int(len(p))
++    for k in range(2, min(int(max_k), n) + 1):
++        for i in range(0, n - k + 1):
++            out.append((int(i), tuple(p[i : i + k])))
++    return out
++
++
++def _select_best_subpath(
++    *,
++    traces: Sequence[TraceV73],
++    max_k: int,
++    min_support: int,
++) -> Tuple[Optional[InducedCandidateV73], Dict[str, Any]]:
++    stats: Dict[Tuple[str, ...], Dict[str, Any]] = {}
++    for tr in traces:
++        if not isinstance(tr, TraceV73):
++            continue
++        path = tr.acts_path()
++        steps = list(tr.steps)
++        for start, sub in _enumerate_subpaths(path, max_k=int(max_k)):
++            if start < 0 or start + len(sub) > len(steps):
++                continue
++            rec = stats.setdefault(
++                sub,
++                {
++                    "contexts": set(),
++                    "occurrences": [],
++                },
++            )
++            rec["contexts"].add(str(tr.context_id))
++            rec["occurrences"].append(
++                {
++                    "trace_sig": str(tr.trace_sig()),
++                    "start": int(start),
++                    "steps": steps[int(start) : int(start) + int(len(sub))],
++                }
++            )
++
++    candidates: List[InducedCandidateV73] = []
++    for sub, rec in stats.items():
++        ctxs = sorted(set(str(x) for x in rec.get("contexts", set()) if str(x)))
++        support = int(len(ctxs))
++        if support < int(min_support):
++            continue
++        occs = rec.get("occurrences") if isinstance(rec.get("occurrences"), list) else []
++        rep = None
++        rep_key = None
++        for o in occs:
++            if not isinstance(o, dict):
++                continue
++            k = (str(o.get("trace_sig") or ""), int(o.get("start", 0) or 0))
++            if rep is None or k < rep_key:
++                rep = o
++                rep_key = k
++        if rep is None:
++            continue
++        rep_steps = tuple(s for s in rep.get("steps", []) if isinstance(s, PlanStepTraceV73))
++        sub_sig = _stable_hash_obj([str(x) for x in sub])
++        score_key = (-int(len(sub)), -int(support), str(sub_sig))
++        candidates.append(
++            InducedCandidateV73(
++                subpath=tuple(sub),
++                support=int(support),
++                contexts=tuple(ctxs),
++                rep_steps=rep_steps,
++                score_key=score_key,
++            )
++        )
++
++    debug: Dict[str, Any] = {"subpaths_total": int(len(stats)), "candidates_total": int(len(candidates))}
++    if not candidates:
++        return None, {**debug, "reason": "no_candidate_meets_support"}
++    candidates.sort(key=lambda c: (int(c.score_key[0]), int(c.score_key[1]), str(c.score_key[2])))
++    best = candidates[0]
++    return best, {**debug, "reason": "ok", "best": {"subpath": list(best.subpath), "support": int(best.support), "score_key": list(best.score_key)}}
++
++
++def _slotize_interface(
++    *,
++    store: ActStore,
++    steps: Sequence[PlanStepTraceV73],
++) -> Tuple[Dict[str, str], Dict[str, str], str, Dict[str, Any]]:
++    produced: Set[str] = set()
++    required_external: Set[str] = set()
++    for st in steps:
++        bm = st.bind_map if isinstance(st.bind_map, dict) else {}
++        for _, vname in bm.items():
++            vn = str(vname or "")
++            if not vn:
++                continue
++            if vn not in produced:
++                required_external.add(vn)
++        produced.add(str(st.produces or ""))
++
++    output_key = str(steps[-1].produces or "") if steps else ""
++    input_vars = sorted(set(str(x) for x in required_external if str(x)))
++
++    input_schema: Dict[str, str] = {}
++    for v in input_vars:
++        want_t = "str"
++        for st in steps:
++            bm = st.bind_map if isinstance(st.bind_map, dict) else {}
++            slot = None
++            for k, vv in bm.items():
++                if str(vv or "") == v:
++                    slot = str(k or "")
++                    break
++            if not slot:
++                continue
++            act = store.get_concept_act(str(st.concept_id))
++            ev = act.evidence if (act is not None and isinstance(act.evidence, dict)) else {}
++            iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++            iface = iface if isinstance(iface, dict) else {}
++            in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++            if slot in in_schema:
++                want_t = str(in_schema.get(slot) or "str")
++            break
++        input_schema[str(v)] = str(want_t)
++
++    output_schema: Dict[str, str] = {}
++    validator_id = "text_exact"
++    out_t = "str"
++    if steps:
++        last = steps[-1]
++        act = store.get_concept_act(str(last.concept_id))
++        ev = act.evidence if (act is not None and isinstance(act.evidence, dict)) else {}
++        iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++        iface = iface if isinstance(iface, dict) else {}
++        validator_id = str(iface.get("validator_id") or "text_exact")
++        out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++        if output_key and output_key in out_schema:
++            out_t = str(out_schema.get(output_key) or "str")
++    if output_key:
++        output_schema[str(output_key)] = str(out_t)
++
++    debug = {"required_external": list(input_vars), "output_key": str(output_key), "validator_id": str(validator_id)}
++    return input_schema, output_schema, str(validator_id), debug
++
++
++def induce_concept_v73(
++    traces: Sequence[TraceV73],
++    store: ActStore,
++    *,
++    max_k: int = 6,
++    min_support: int = 2,
++    seed: int = 0,
++) -> Tuple[Act, Dict[str, Any], Dict[str, Any]]:
++    traces2 = [t for t in traces if isinstance(t, TraceV73)]
++    if int(len(traces2)) < int(min_support):
++        raise ValueError("not_enough_traces")
++
++    best, dbg_select = _select_best_subpath(traces=traces2, max_k=int(max_k), min_support=int(min_support))
++    if best is None:
++        raise ValueError(f"no_inducible_subpath:{dbg_select.get('reason')}")
++
++    steps = list(best.rep_steps)
++    in_schema, out_schema, validator_id, dbg_iface = _slotize_interface(store=store, steps=steps)
++    if not in_schema or not out_schema:
++        raise ValueError("slotization_failed")
++
++    # Synthesize a composed concept_csv: sequence of CSV_CALLs + CSV_RETURN.
++    program: List[Instruction] = []
++    for name in sorted(in_schema.keys(), key=str):
++        program.append(Instruction("CSV_GET_INPUT", {"name": str(name), "out": str(name)}))
++    for st in steps:
++        bm = {str(k): str(st.bind_map.get(k) or "") for k in sorted(st.bind_map.keys(), key=str)}
++        program.append(
++            Instruction(
++                "CSV_CALL",
++                {
++                    "concept_id": str(st.concept_id),
++                    "bind": dict(bm),
++                    "out": str(st.produces),
++                },
++            )
++        )
++    output_key = str(steps[-1].produces or "")
++    program.append(Instruction("CSV_RETURN", {"var": str(output_key)}))
++
++    interface = {"input_schema": dict(in_schema), "output_schema": dict(out_schema), "validator_id": str(validator_id)}
++
++    act_id_sig = _stable_hash_obj(
++        {
++            "schema_version": 1,
++            "induced_kind": "subpath_concepts_v1",
++            "subpath": [str(x) for x in best.subpath],
++            "interface": interface,
++            "program": [ins.to_dict() for ins in program],
++        }
++    )
++    act_id = f"concept_v73_induced_{act_id_sig}"
++
++    store_hash_base = store.content_hash()
++    candidate = Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence={
++            "interface": dict(interface),
++            "induced_v73": {
++                "schema_version": 1,
++                "method": "subpath_concepts_v1",
++                "subpath": [str(x) for x in best.subpath],
++                "support": int(best.support),
++                "contexts": _sorted_strs(best.contexts),
++                "store_hash_base": str(store_hash_base),
++            },
++        },
++        cost={"overhead_bits": 1024},
++        deps=_sorted_strs(set(best.subpath)),
++        active=True,
++    )
++
++    cert = build_certificate_v1(candidate_act=candidate, traces=traces2, store_base=store, seed=int(seed))
++    if isinstance(candidate.evidence, dict):
++        candidate.evidence["pcc_v73"] = {
++            "certificate_kind": str(cert.get("certificate_kind") or ""),
++            "certificate_sig": str(cert.get("certificate_sig") or ""),
++            "store_hash_base": str(cert.get("store_hash_base") or ""),
++        }
++
++    iface_sig = interface_sig_from_act(candidate)
++    prog_sha = program_sha256_from_act(candidate)
++    concept_sig = _stable_hash_obj(
++        {"concept_id": str(candidate.id), "interface_sig": str(iface_sig), "program_sha256": str(prog_sha)}
++    )
++
++    delta_steps = int(len(best.subpath)) - 1
++    debug = {
++        "selection": dict(dbg_select),
++        "interface": dict(dbg_iface),
++        "store_hash_base": str(store_hash_base),
++        "candidate": {
++            "act_id": str(candidate.id),
++            "interface_sig": str(iface_sig),
++            "program_sha256": str(prog_sha),
++            "concept_sig": str(concept_sig),
++            "subpath": [str(x) for x in best.subpath],
++            "steps_len": int(len(best.subpath)),
++            "delta_mdl_steps": int(delta_steps),
++        },
++        "certificate_sig": str(cert.get("certificate_sig") or ""),
++    }
++    return candidate, cert, debug
++
+--- /dev/null	2026-01-12 10:44:15
++++ atos_core/pcc_v73.py	2026-01-12 10:39:11
+@@ -0,0 +1,237 @@
++from __future__ import annotations
++
++import copy
++from typing import Any, Dict, List, Sequence, Tuple
++
++from .act import Act, canonical_json_dumps, sha256_hex
++from .concept_registry_v70 import interface_sig_from_act, program_sha256_from_act
++from .engine import Engine, EngineConfig
++from .store import ActStore
++from .trace_v73 import TraceV73
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _safe_deepcopy(obj: Any) -> Any:
++    try:
++        return copy.deepcopy(obj)
++    except Exception:
++        if isinstance(obj, dict):
++            return dict(obj)
++        if isinstance(obj, list):
++            return list(obj)
++        return obj
++
++
++def certificate_sig_v1(cert: Dict[str, Any]) -> str:
++    body = dict(cert) if isinstance(cert, dict) else {}
++    body.pop("certificate_sig", None)
++    return _stable_hash_obj(body)
++
++
++def _clone_store_with_candidate(*, store_base: ActStore, candidate_act: Act) -> ActStore:
++    """
++    Create an isolated store containing base acts + candidate act.
++    Deterministic and avoids mutating caller state during verification.
++    """
++    store2 = ActStore()
++    for act_id in sorted(store_base.acts.keys(), key=str):
++        act = store_base.acts[act_id]
++        store2.add(Act.from_dict(act.to_dict()))
++    store2.add(Act.from_dict(candidate_act.to_dict()))
++    return store2
++
++
++def build_certificate_v1(
++    *,
++    candidate_act: Act,
++    traces: Sequence[TraceV73],
++    store_base: ActStore,
++    seed: int = 0,
++) -> Dict[str, Any]:
++    iface_sig = interface_sig_from_act(candidate_act)
++    prog_sha = program_sha256_from_act(candidate_act)
++    store_hash_base = store_base.content_hash()
++
++    store_exec = _clone_store_with_candidate(store_base=store_base, candidate_act=candidate_act)
++    engine = Engine(store_exec, seed=int(seed), config=EngineConfig(enable_contracts=False))
++
++    traces_sorted = sorted([t for t in traces if isinstance(t, TraceV73)], key=lambda t: str(t.trace_sig()))
++    trace_sigs = [str(t.trace_sig()) for t in traces_sorted]
++    contexts = sorted(set(str(t.context_id) for t in traces_sorted if str(t.context_id)))
++
++    test_vectors: List[Dict[str, Any]] = []
++    ethics_ok_all = True
++    ic_count = 0
++
++    for i, tr in enumerate(traces_sorted):
++        inputs = tr.bindings if isinstance(tr.bindings, dict) else {}
++        expected = tr.expected
++        res = engine.execute_concept_csv(
++            concept_act_id=str(candidate_act.id),
++            inputs={str(k): inputs.get(k) for k in sorted(inputs.keys(), key=str)},
++            expected=expected,
++            step=int(i),
++            max_depth=8,
++            max_events=512,
++            validate_output=True,
++        )
++        meta = res.get("meta") if isinstance(res, dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++        ethics = meta.get("ethics") if isinstance(meta.get("ethics"), dict) else {}
++        uncertainty = meta.get("uncertainty") if isinstance(meta.get("uncertainty"), dict) else {}
++        validator = meta.get("validator") if isinstance(meta.get("validator"), dict) else {}
++
++        ok = bool(meta.get("ok", False))
++        got = str(meta.get("output_text") or res.get("output") or "")
++        output_sig = str(meta.get("output_sig") or "")
++
++        ethics_ok = bool(ethics.get("ok", False))
++        ethics_ok_all = bool(ethics_ok_all and ethics_ok)
++        if str(uncertainty.get("mode_out") or "") == "IC":
++            ic_count += 1
++
++        tv = {
++            "trace_sig": str(tr.trace_sig()),
++            "context_id": str(tr.context_id),
++            "inputs": {str(k): inputs.get(k) for k in sorted(inputs.keys(), key=str)},
++            "expected": expected,
++            "got": str(got),
++            "ok": bool(ok),
++            "output_sig": str(output_sig),
++            "validator": _safe_deepcopy(validator),
++            "ethics": _safe_deepcopy(ethics),
++            "uncertainty": _safe_deepcopy(uncertainty),
++        }
++        test_vectors.append(tv)
++
++    cert: Dict[str, Any] = {
++        "schema_version": 1,
++        "certificate_kind": "pcc_v73_certificate_v1",
++        "store_hash_base": str(store_hash_base),
++        "mined_from": {"trace_sigs": list(trace_sigs), "contexts_distinct": int(len(contexts))},
++        "candidate": {
++            "act_id": str(candidate_act.id),
++            "kind": str(candidate_act.kind),
++            "interface": _safe_deepcopy(
++                (candidate_act.evidence or {}).get("interface") if isinstance(candidate_act.evidence, dict) else {}
++            ),
++            "interface_sig": str(iface_sig),
++            "program_sha256": str(prog_sha),
++            "program_len": int(len(candidate_act.program or [])),
++        },
++        "test_vectors": list(test_vectors),
++        "ethics_verdict": {"ok": bool(ethics_ok_all), "mode": "fail_closed"},
++        "uncertainty_verdict": {"ic_count": int(ic_count), "ok": bool(ic_count == 0), "mode": "fail_closed"},
++    }
++    cert["certificate_sig"] = certificate_sig_v1(cert)
++    return cert
++
++
++def verify_pcc_v73(
++    *,
++    candidate_act: Act,
++    certificate: Dict[str, Any],
++    store_base: ActStore,
++    seed: int = 0,
++) -> Tuple[bool, str, Dict[str, Any]]:
++    if not isinstance(certificate, dict):
++        return False, "certificate_not_dict", {}
++    if int(certificate.get("schema_version", 0) or 0) != 1:
++        return False, "bad_schema_version", {}
++    if str(certificate.get("certificate_kind") or "") != "pcc_v73_certificate_v1":
++        return False, "bad_certificate_kind", {}
++
++    # Signature integrity.
++    want_sig = str(certificate.get("certificate_sig") or "")
++    got_sig = certificate_sig_v1(certificate)
++    if want_sig != got_sig:
++        return False, "certificate_sig_mismatch", {"want": want_sig, "got": got_sig}
++
++    # Store base hash integrity.
++    want_store_hash = str(certificate.get("store_hash_base") or "")
++    got_store_hash = str(store_base.content_hash())
++    if want_store_hash != got_store_hash:
++        return False, "store_hash_base_mismatch", {"want": want_store_hash, "got": got_store_hash}
++
++    # Candidate integrity.
++    cand = certificate.get("candidate") if isinstance(certificate.get("candidate"), dict) else {}
++    want_iface_sig = str(cand.get("interface_sig") or "")
++    want_prog_sha = str(cand.get("program_sha256") or "")
++    got_iface_sig = interface_sig_from_act(candidate_act)
++    got_prog_sha = program_sha256_from_act(candidate_act)
++    if want_iface_sig != got_iface_sig:
++        return False, "interface_sig_mismatch", {"want": want_iface_sig, "got": got_iface_sig}
++    if want_prog_sha != got_prog_sha:
++        return False, "program_sha256_mismatch", {"want": want_prog_sha, "got": got_prog_sha}
++    if str(cand.get("act_id") or "") != str(candidate_act.id):
++        return False, "candidate_id_mismatch", {"want": str(cand.get("act_id") or ""), "got": str(candidate_act.id)}
++
++    # Re-execute vectors deterministically and compare.
++    store_exec = _clone_store_with_candidate(store_base=store_base, candidate_act=candidate_act)
++    engine = Engine(store_exec, seed=int(seed), config=EngineConfig(enable_contracts=False))
++
++    tvs = certificate.get("test_vectors") if isinstance(certificate.get("test_vectors"), list) else []
++    failures: List[Dict[str, Any]] = []
++    ok_count = 0
++    ic_count = 0
++    ethics_ok_all = True
++
++    for i, tv in enumerate(tvs):
++        if not isinstance(tv, dict):
++            failures.append({"idx": int(i), "reason": "test_vector_not_dict"})
++            continue
++        inputs = tv.get("inputs") if isinstance(tv.get("inputs"), dict) else {}
++        expected = tv.get("expected")
++        res = engine.execute_concept_csv(
++            concept_act_id=str(candidate_act.id),
++            inputs={str(k): inputs.get(k) for k in sorted(inputs.keys(), key=str)},
++            expected=expected,
++            step=int(i),
++            max_depth=8,
++            max_events=512,
++            validate_output=True,
++        )
++        meta = res.get("meta") if isinstance(res, dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++
++        got = str(meta.get("output_text") or res.get("output") or "")
++        got_ok = bool(meta.get("ok", False))
++        got_sig2 = str(meta.get("output_sig") or "")
++        ethics = meta.get("ethics") if isinstance(meta.get("ethics"), dict) else {}
++        uncertainty = meta.get("uncertainty") if isinstance(meta.get("uncertainty"), dict) else {}
++        validator = meta.get("validator") if isinstance(meta.get("validator"), dict) else {}
++
++        ethics_ok = bool(ethics.get("ok", False))
++        ethics_ok_all = bool(ethics_ok_all and ethics_ok)
++        if str(uncertainty.get("mode_out") or "") == "IC":
++            ic_count += 1
++
++        if got != str(tv.get("got") or ""):
++            failures.append({"idx": int(i), "reason": "got_mismatch", "want": str(tv.get("got") or ""), "got": got})
++            continue
++        if got_ok != bool(tv.get("ok", False)):
++            failures.append({"idx": int(i), "reason": "ok_mismatch", "want": bool(tv.get("ok", False)), "got": got_ok})
++            continue
++        if got_sig2 != str(tv.get("output_sig") or ""):
++            failures.append({"idx": int(i), "reason": "output_sig_mismatch", "want": str(tv.get("output_sig") or ""), "got": got_sig2})
++            continue
++        # Validator pass is part of the contract.
++        want_v = tv.get("validator") if isinstance(tv.get("validator"), dict) else {}
++        if bool(validator.get("passed", False)) != bool(want_v.get("passed", False)):
++            failures.append({"idx": int(i), "reason": "validator_pass_mismatch"})
++            continue
++
++        ok_count += 1
++
++    if not bool(ethics_ok_all):
++        failures.append({"reason": "ethics_fail_closed"})
++    if int(ic_count) != 0:
++        failures.append({"reason": "uncertainty_ic_fail_closed", "ic_count": int(ic_count)})
++
++    ok = (not failures) and (ok_count == len(tvs))
++    details = {"vectors_total": int(len(tvs)), "vectors_ok": int(ok_count), "failures": list(failures), "ic_count": int(ic_count)}
++    return bool(ok), "ok" if ok else "pcc_verify_failed", details
++
+--- /dev/null	2026-01-12 10:44:15
++++ atos_core/trace_v73.py	2026-01-12 10:37:45
+@@ -0,0 +1,176 @@
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass
++from typing import Any, Dict, List, Sequence
++
++from .act import canonical_json_dumps, sha256_hex
++from .goal_spec_v72 import GoalSpecV72
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _safe_deepcopy(obj: Any) -> Any:
++    try:
++        return copy.deepcopy(obj)
++    except Exception:
++        if isinstance(obj, dict):
++            return dict(obj)
++        if isinstance(obj, list):
++            return list(obj)
++        return obj
++
++
++@dataclass(frozen=True)
++class PlanStepTraceV73:
++    idx: int
++    concept_id: str
++    bind_map: Dict[str, str]
++    produces: str
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "idx", int(self.idx or 0))
++        object.__setattr__(self, "concept_id", str(self.concept_id or ""))
++        object.__setattr__(self, "produces", str(self.produces or ""))
++        bm = self.bind_map if isinstance(self.bind_map, dict) else {}
++        try:
++            bm2 = copy.deepcopy(bm)
++        except Exception:
++            bm2 = dict(bm)
++        if not isinstance(bm2, dict):
++            bm2 = {}
++        # Stable stringification + ordering on serialization only.
++        object.__setattr__(self, "bind_map", {str(k): str(bm2.get(k) or "") for k in bm2.keys()})
++
++    def to_canonical_dict(self) -> Dict[str, Any]:
++        return {
++            "idx": int(self.idx),
++            "concept_id": str(self.concept_id),
++            "bind_map": {str(k): str(self.bind_map.get(k) or "") for k in sorted(self.bind_map.keys(), key=str)},
++            "produces": str(self.produces),
++        }
++
++
++@dataclass(frozen=True)
++class TraceV73:
++    context_id: str
++    goal_sig: str
++    goal_id: str
++    goal_kind: str
++    bindings: Dict[str, Any]
++    output_key: str
++    expected: Any
++    validator_id: str
++    steps: List[PlanStepTraceV73]
++    outcome: Dict[str, Any]
++    cost_units: Dict[str, Any]
++
++    schema_version: int = 1
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "schema_version", int(self.schema_version or 1))
++        object.__setattr__(self, "context_id", str(self.context_id or ""))
++        object.__setattr__(self, "goal_sig", str(self.goal_sig or ""))
++        object.__setattr__(self, "goal_id", str(self.goal_id or ""))
++        object.__setattr__(self, "goal_kind", str(self.goal_kind or ""))
++        object.__setattr__(self, "output_key", str(self.output_key or ""))
++        object.__setattr__(self, "validator_id", str(self.validator_id or ""))
++
++        b = self.bindings if isinstance(self.bindings, dict) else {}
++        object.__setattr__(self, "bindings", _safe_deepcopy(b) if isinstance(b, dict) else {})
++
++        steps = self.steps if isinstance(self.steps, list) else []
++        steps2 = [s for s in steps if isinstance(s, PlanStepTraceV73)]
++        object.__setattr__(self, "steps", list(steps2))
++
++        outcome = self.outcome if isinstance(self.outcome, dict) else {}
++        object.__setattr__(self, "outcome", _safe_deepcopy(outcome) if isinstance(outcome, dict) else {})
++
++        cu = self.cost_units if isinstance(self.cost_units, dict) else {}
++        object.__setattr__(self, "cost_units", _safe_deepcopy(cu) if isinstance(cu, dict) else {})
++
++    def acts_path(self) -> List[str]:
++        return [str(s.concept_id) for s in self.steps if str(s.concept_id)]
++
++    def to_canonical_dict(self, *, include_sig: bool) -> Dict[str, Any]:
++        body: Dict[str, Any] = {
++            "schema_version": int(self.schema_version),
++            "context_id": str(self.context_id),
++            "goal_sig": str(self.goal_sig),
++            "goal_id": str(self.goal_id),
++            "goal_kind": str(self.goal_kind),
++            "bindings": {str(k): self.bindings.get(k) for k in sorted(self.bindings.keys(), key=str)},
++            "output_key": str(self.output_key),
++            "expected": self.expected,
++            "validator_id": str(self.validator_id),
++            "steps": [s.to_canonical_dict() for s in self.steps],
++            "acts_path": [str(x) for x in self.acts_path()],
++            "outcome": dict(self.outcome),
++            "cost_units": dict(self.cost_units),
++        }
++        if include_sig:
++            body["trace_sig"] = _stable_hash_obj(body)
++        return body
++
++    def trace_sig(self) -> str:
++        return _stable_hash_obj(self.to_canonical_dict(include_sig=False))
++
++
++def context_id_from_bindings(bindings: Dict[str, Any]) -> str:
++    b = bindings if isinstance(bindings, dict) else {}
++    sig = _stable_hash_obj({str(k): b.get(k) for k in sorted(b.keys(), key=str)})
++    return f"ctx_v73_{sig}"
++
++
++def trace_from_agent_loop_v72(*, goal_spec: GoalSpecV72, result: Dict[str, Any]) -> TraceV73:
++    plan = result.get("plan") if isinstance(result, dict) else {}
++    plan = plan if isinstance(plan, dict) else {}
++    raw_steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
++
++    steps: List[PlanStepTraceV73] = []
++    for s in raw_steps:
++        if not isinstance(s, dict):
++            continue
++        idx = int(s.get("idx", 0) or 0)
++        concept_id = str(s.get("concept_id") or "")
++        bind_map = s.get("bind_map") if isinstance(s.get("bind_map"), dict) else {}
++        produces = str(s.get("produces") or "")
++        steps.append(
++            PlanStepTraceV73(
++                idx=int(idx),
++                concept_id=str(concept_id),
++                bind_map={str(k): str(bind_map.get(k) or "") for k in bind_map.keys()},
++                produces=str(produces),
++            )
++        )
++
++    final = result.get("final") if isinstance(result.get("final"), dict) else {}
++    final = final if isinstance(final, dict) else {}
++    ok = bool(result.get("ok", False))
++    got = str(final.get("got") or "")
++    expected = goal_spec.expected
++
++    outcome = {"ok": bool(ok), "got": str(got), "expected": expected}
++    cost_units = {"steps_total": int(len(steps))}
++
++    bindings = goal_spec.bindings if isinstance(goal_spec.bindings, dict) else {}
++    ctx_id = context_id_from_bindings(bindings)
++    goal_sig = str(goal_spec.goal_sig())
++    goal_id = str(goal_spec.goal_id())
++
++    return TraceV73(
++        context_id=str(ctx_id),
++        goal_sig=str(goal_sig),
++        goal_id=str(goal_id),
++        goal_kind=str(goal_spec.goal_kind),
++        bindings=_safe_deepcopy(bindings) if isinstance(bindings, dict) else {},
++        output_key=str(goal_spec.output_key),
++        expected=expected,
++        validator_id=str(goal_spec.validator_id),
++        steps=list(steps),
++        outcome=dict(outcome),
++        cost_units=dict(cost_units),
++    )
++
+--- /dev/null	2026-01-12 10:44:15
++++ scripts/smoke_induce_concept_pcc_v73.py	2026-01-12 10:43:19
+@@ -0,0 +1,380 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.agent_loop_v72 import run_goal_spec_v72
++from atos_core.goal_spec_v72 import GoalSpecV72
++from atos_core.induce_concept_v73 import induce_concept_v73
++from atos_core.pcc_v73 import verify_pcc_v73
++from atos_core.store import ActStore
++from atos_core.trace_v73 import trace_from_agent_loop_v72
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def make_concept_act(
++    *,
++    act_id: str,
++    input_schema: Dict[str, str],
++    output_schema: Dict[str, str],
++    validator_id: str,
++    program: List[Instruction],
++) -> Act:
++    return Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence={
++            "interface": {
++                "input_schema": dict(input_schema),
++                "output_schema": dict(output_schema),
++                "validator_id": str(validator_id),
++            }
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def _eval_from_run(res: Dict[str, Any]) -> Dict[str, Any]:
++    plan = res.get("plan") if isinstance(res.get("plan"), dict) else {}
++    plan = plan if isinstance(plan, dict) else {}
++    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
++    final = res.get("final") if isinstance(res.get("final"), dict) else {}
++    final = final if isinstance(final, dict) else {}
++    graph = res.get("graph") if isinstance(res.get("graph"), dict) else {}
++    graph = graph if isinstance(graph, dict) else {}
++    chains = graph.get("chains") if isinstance(graph.get("chains"), dict) else {}
++    return {
++        "ok": bool(res.get("ok", False)),
++        "plan_sig": str(plan.get("plan_sig") or ""),
++        "steps_total": int(len(steps)),
++        "got": str(final.get("got") or ""),
++        "expected": final.get("expected"),
++        "graph_sig": str(graph.get("graph_sig") or ""),
++        "chains": dict(chains) if isinstance(chains, dict) else {},
++    }
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    store = ActStore()
++
++    # Base micro-world (same semantics as V72 smoke; concept path is mined).
++    normalize_x_id = "concept_v72_normalize_x_v0"
++    normalize_y_id = "concept_v72_normalize_y_v0"
++    add_nx_ny_id = "concept_v72_add_nx_ny_v0"
++
++    normalize_x = make_concept_act(
++        act_id=normalize_x_id,
++        input_schema={"x": "str"},
++        output_schema={"nx": "str"},
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["x"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "nx"}),
++            Instruction("CSV_RETURN", {"var": "nx"}),
++        ],
++    )
++    store.add(normalize_x)
++
++    normalize_y = make_concept_act(
++        act_id=normalize_y_id,
++        input_schema={"y": "str"},
++        output_schema={"ny": "str"},
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "y", "out": "y"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["y"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "ny"}),
++            Instruction("CSV_RETURN", {"var": "ny"}),
++        ],
++    )
++    store.add(normalize_y)
++
++    add_nx_ny = make_concept_act(
++        act_id=add_nx_ny_id,
++        input_schema={"nx": "str", "ny": "str"},
++        output_schema={"sum": "str"},
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "nx", "out": "nx"}),
++            Instruction("CSV_GET_INPUT", {"name": "ny", "out": "ny"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["nx"], "out": "dx"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["ny"], "out": "dy"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["dx"], "out": "ix"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["dy"], "out": "iy"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["ix", "iy"], "out": "sum_i"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["sum_i"], "out": "sum"}),
++            Instruction("CSV_RETURN", {"var": "sum"}),
++        ],
++    )
++    store.add(add_nx_ny)
++
++    store_hash_base = store.content_hash()
++
++    # Generate >=2 traces from agent_loop_v72 (different contexts).
++    goal1 = GoalSpecV72(
++        goal_kind="v73_sum_norm",
++        bindings={"x": "0004", "y": "0008"},
++        output_key="sum",
++        expected="12",
++        validator_id="text_exact",
++        created_step=0,
++    )
++    goal2 = GoalSpecV72(
++        goal_kind="v73_sum_norm",
++        bindings={"x": "0010", "y": "0003"},
++        output_key="sum",
++        expected="13",
++        validator_id="text_exact",
++        created_step=0,
++    )
++
++    g1_before_dir = os.path.join(out_dir, "goal1_before")
++    g2_before_dir = os.path.join(out_dir, "goal2_before")
++    ensure_absent(g1_before_dir)
++    ensure_absent(g2_before_dir)
++    os.makedirs(g1_before_dir, exist_ok=False)
++    os.makedirs(g2_before_dir, exist_ok=False)
++
++    res1_before = run_goal_spec_v72(goal_spec=goal1, store=store, seed=int(seed), out_dir=g1_before_dir)
++    res2_before = run_goal_spec_v72(goal_spec=goal2, store=store, seed=int(seed), out_dir=g2_before_dir)
++    if not bool(res1_before.get("ok", False)):
++        _fail("ERROR: goal1_before not ok")
++    if not bool(res2_before.get("ok", False)):
++        _fail("ERROR: goal2_before not ok")
++
++    eval1_before = _eval_from_run(res1_before)
++    eval2_before = _eval_from_run(res2_before)
++
++    steps_before = int(eval1_before.get("steps_total", 0) or 0)
++    if steps_before < 2:
++        _fail(f"ERROR: expected >=2 steps before induction, got={steps_before}")
++
++    traces = [
++        trace_from_agent_loop_v72(goal_spec=goal1, result=res1_before),
++        trace_from_agent_loop_v72(goal_spec=goal2, result=res2_before),
++    ]
++    traces_sorted = sorted([t.to_canonical_dict(include_sig=True) for t in traces], key=lambda d: str(d.get("trace_sig") or ""))
++    traces_path = os.path.join(out_dir, "traces_v73.json")
++    traces_sha = write_json(traces_path, {"schema_version": 1, "traces": list(traces_sorted)})
++
++    # Induce a composed concept + PCC certificate, verify, then promote.
++    candidate_act, certificate, induce_debug = induce_concept_v73(traces, store, max_k=6, min_support=2, seed=int(seed))
++    cand_path = os.path.join(out_dir, "candidate_act.json")
++    cand_sha = write_json(cand_path, candidate_act.to_dict())
++    cert_path = os.path.join(out_dir, "certificate_v1.json")
++    cert_sha = write_json(cert_path, certificate)
++
++    ok_pcc, reason_pcc, details_pcc = verify_pcc_v73(
++        candidate_act=candidate_act, certificate=certificate, store_base=store, seed=int(seed)
++    )
++    if not bool(ok_pcc):
++        _fail(f"ERROR: PCC verify failed: {reason_pcc}: {details_pcc}")
++
++    # Promote (learn = edit store/graph state).
++    store.add(candidate_act)
++    store_hash_after = store.content_hash()
++
++    # Re-run agent loop on goal1 and prove plan compression (strictly fewer steps).
++    g1_after_dir = os.path.join(out_dir, "goal1_after")
++    ensure_absent(g1_after_dir)
++    os.makedirs(g1_after_dir, exist_ok=False)
++    res1_after = run_goal_spec_v72(goal_spec=goal1, store=store, seed=int(seed), out_dir=g1_after_dir)
++    if not bool(res1_after.get("ok", False)):
++        _fail("ERROR: goal1_after not ok")
++    eval1_after = _eval_from_run(res1_after)
++
++    steps_after = int(eval1_after.get("steps_total", 0) or 0)
++    if int(steps_after) >= int(steps_before):
++        _fail(f"ERROR: expected plan compression, got steps_before={steps_before} steps_after={steps_after}")
++    if str(eval1_after.get("got") or "") != str(goal1.expected):
++        _fail("ERROR: goal1_after output mismatch")
++
++    # Persist eval snapshots.
++    before_path = os.path.join(out_dir, "eval_before.json")
++    before_sha = write_json(
++        before_path,
++        {
++            "schema_version": 1,
++            "goal1": dict(eval1_before),
++            "goal2": dict(eval2_before),
++        },
++    )
++    after_path = os.path.join(out_dir, "eval_after.json")
++    after_sha = write_json(after_path, {"schema_version": 1, "goal1": dict(eval1_after)})
++
++    cert_sig = str(certificate.get("certificate_sig") or "")
++    cand_iface_sig = str(
++        ((candidate_act.evidence or {}).get("pcc_v73") or {}).get("certificate_sig") if isinstance(candidate_act.evidence, dict) else ""
++    )
++    if cand_iface_sig and cand_iface_sig != cert_sig:
++        _fail("ERROR: candidate_evidence_certificate_sig_mismatch")
++
++    return {
++        "seed": int(seed),
++        "store": {"hash_base": str(store_hash_base), "hash_after": str(store_hash_after)},
++        "traces": {
++            "traces_total": 2,
++            "trace_sigs": [str(t.get("trace_sig") or "") for t in traces_sorted if isinstance(t, dict)],
++        },
++        "induced": {
++            "act_id": str(candidate_act.id),
++            "interface_sig": str(certificate.get("candidate", {}).get("interface_sig") if isinstance(certificate.get("candidate"), dict) else ""),
++            "program_sha256": str(certificate.get("candidate", {}).get("program_sha256") if isinstance(certificate.get("candidate"), dict) else ""),
++            "certificate_sig": str(cert_sig),
++        },
++        "pcc_verify": {"ok": True, "reason": str(reason_pcc), "details": dict(details_pcc)},
++        "before": {"goal1": dict(eval1_before), "goal2": dict(eval2_before)},
++        "after": {"goal1": dict(eval1_after)},
++        "delta": {
++            "steps_before": int(steps_before),
++            "steps_after": int(steps_after),
++            "delta_steps": int(steps_before - steps_after),
++        },
++        "delta_mdl_steps": int(steps_before - steps_after),
++        "artifacts": {
++            # Keep eval.json deterministic across tries: store only hashes (no paths containing tryN).
++            "traces_v73_json": {"sha256": str(traces_sha)},
++            "candidate_act_json": {"sha256": str(cand_sha)},
++            "certificate_v1_json": {"sha256": str(cert_sha)},
++            "eval_before_json": {"sha256": str(before_sha)},
++            "eval_after_json": {"sha256": str(after_sha)},
++        },
++        "debug": {"induce": dict(induce_debug)},
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_induce_concept_pcc_v73")
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    results: Dict[str, Any] = {"seed": seed, "tries": {}}
++    sigs: List[Tuple[str, str, int, int]] = []
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        ev = smoke_try(out_dir=out_dir, seed=seed)
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        induced = ev.get("induced") if isinstance(ev.get("induced"), dict) else {}
++        delta = ev.get("delta") if isinstance(ev.get("delta"), dict) else {}
++        before = ev.get("before") if isinstance(ev.get("before"), dict) else {}
++        after = ev.get("after") if isinstance(ev.get("after"), dict) else {}
++        before_g1 = before.get("goal1") if isinstance(before.get("goal1"), dict) else {}
++        after_g1 = after.get("goal1") if isinstance(after.get("goal1"), dict) else {}
++
++        core = {
++            "seed": int(seed),
++            "induced_act_id": str(induced.get("act_id") or ""),
++            "certificate_sig": str(induced.get("certificate_sig") or ""),
++            "plan_sig_before": str(before_g1.get("plan_sig") or ""),
++            "plan_sig_after": str(after_g1.get("plan_sig") or ""),
++            "steps_before": int(delta.get("steps_before", 0) or 0),
++            "steps_after": int(delta.get("steps_after", 0) or 0),
++            "delta_steps": int(delta.get("delta_steps", 0) or 0),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": str(summary_sha)}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++
++        sigs.append(
++            (
++                str(core["certificate_sig"]),
++                str(core["plan_sig_before"]),
++                int(core["steps_before"]),
++                int(core["steps_after"]),
++            )
++        )
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(
++        len(sigs) == 2 and sigs[0] == sigs[1] and len(summary_shas) == 2 and summary_shas[0] == summary_shas[1]
++    )
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: sigs={sigs} summary_shas={summary_shas}")
++    results["determinism"] = {
++        "ok": True,
++        "summary_sha256": summary_shas[0],
++        "certificate_sig": sigs[0][0],
++        "plan_sig_before": sigs[0][1],
++        "steps_before": sigs[0][2],
++        "steps_after": sigs[0][3],
++    }
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()

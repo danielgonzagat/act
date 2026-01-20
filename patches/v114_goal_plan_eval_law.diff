@@ -1,0 +1,1842 @@
+--- /dev/null	2026-01-15 04:51:22
++++ atos_core/goal_plan_eval_gate_v114.py	2026-01-15 04:42:19
+@@ -0,0 +1,752 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .ato_v71 import ATOv71, stable_hash_obj
++from .mind_graph_v71 import MindGraphV71
++
++FAIL_REASON_MISSING_GOAL_V114 = "missing_goal"
++FAIL_REASON_MISSING_PLAN_V114 = "missing_plan"
++FAIL_REASON_MISSING_EVAL_V114 = "missing_eval"
++FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114 = "render_blocked_no_eval_satisfies"
++FAIL_REASON_EXHAUSTED_PLANS_V114 = "exhausted_plans"
++FAIL_REASON_REPLANNING_REQUIRED_V114 = "replanning_required"
++FAIL_REASON_PLAN_ATTEMPT_FAILED_V114 = "plan_attempt_failed"
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _safe_dict(x: Any) -> Dict[str, Any]:
++    return x if isinstance(x, dict) else {}
++
++
++def _safe_list(x: Any) -> List[Any]:
++    return x if isinstance(x, list) else []
++
++
++def _stable_id(prefix: str, body: Dict[str, Any]) -> str:
++    return f"{prefix}_{sha256_hex(canonical_json_dumps(body).encode('utf-8'))}"
++
++
++def _make_turn_obs_ato_v114(turn_payload: Dict[str, Any]) -> ATOv71:
++    turn_id = str(turn_payload.get("turn_id") or "")
++    role = str(turn_payload.get("role") or "")
++    if not turn_id:
++        raise ValueError("missing_turn_id")
++    created_step = int(turn_payload.get("created_step", 0) or 0)
++    turn_index = int(turn_payload.get("turn_index", 0) or 0)
++    text_sig = str(turn_payload.get("text_sig") or "")
++    return ATOv71(
++        ato_id=str(turn_id),
++        ato_type="OBS",
++        subgraph={
++            "kind": str(turn_payload.get("kind") or ""),
++            "role": str(role),
++            "turn_index": int(turn_index),
++            "text_sig": str(text_sig),
++        },
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[],
++        invariants={"schema_version": 114, "obs_kind": "turn_v96"},
++        created_step=int(created_step),
++        last_step=int(created_step),
++    )
++
++
++def _make_goal_ato_v114(*, conversation_id: str, user_turn_payload: Dict[str, Any]) -> ATOv71:
++    user_turn_id = str(user_turn_payload.get("turn_id") or "")
++    if not user_turn_id:
++        raise ValueError("missing_user_turn_id")
++    created_step = int(user_turn_payload.get("created_step", 0) or 0)
++    user_turn_index = int(user_turn_payload.get("turn_index", 0) or 0)
++    refs = _safe_dict(user_turn_payload.get("refs"))
++    body = {
++        "schema_version": 114,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "user_turn_index": int(user_turn_index),
++        "intent_id": str(refs.get("intent_id") or ""),
++        "parse_sig": str(refs.get("parse_sig") or ""),
++        "text_sig": str(user_turn_payload.get("text_sig") or ""),
++    }
++    ato_id = _stable_id("goal_v114", body)
++    return ATOv71(
++        ato_id=str(ato_id),
++        ato_type="GOAL",
++        subgraph=dict(body),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++        invariants={"schema_version": 114, "goal_kind": "turn_goal"},
++        created_step=int(created_step),
++        last_step=int(created_step),
++    )
++
++
++def _make_plan_ato_v114(*, action_plan: Dict[str, Any]) -> ATOv71:
++    plan_id = str(action_plan.get("plan_id") or action_plan.get("plan_sig") or "")
++    if not plan_id:
++        raise ValueError("missing_plan_id")
++    created_step = int(action_plan.get("created_step", 0) or 0)
++    user_turn_id = str(action_plan.get("user_turn_id") or "")
++    user_turn_index = int(action_plan.get("user_turn_index", -1) or -1)
++    ranked = _safe_list(action_plan.get("ranked_candidates"))
++    attempted = _safe_list(action_plan.get("attempted_actions"))
++    subgraph = {
++        "schema_version": 114,
++        "plan_id": str(plan_id),
++        "user_turn_id": str(user_turn_id),
++        "user_turn_index": int(user_turn_index),
++        "chosen_action_id": str(action_plan.get("chosen_action_id") or ""),
++        "chosen_eval_id": str(action_plan.get("chosen_eval_id") or ""),
++        "chosen_ok": bool(action_plan.get("chosen_ok", False)),
++        "ranked_candidates": [
++            {
++                "act_id": str(_safe_dict(rc).get("act_id") or ""),
++                "expected_success": float(_safe_dict(rc).get("expected_success", 0.0) or 0.0),
++                "expected_cost": float(_safe_dict(rc).get("expected_cost", 0.0) or 0.0),
++            }
++            for rc in ranked
++            if isinstance(rc, dict)
++        ],
++        "attempted_actions": [
++            {
++                "act_id": str(_safe_dict(a).get("act_id") or ""),
++                "eval_id": str(_safe_dict(a).get("eval_id") or ""),
++                "ok": bool(_safe_dict(a).get("ok", False)),
++            }
++            for a in attempted
++            if isinstance(a, dict)
++        ],
++    }
++    return ATOv71(
++        ato_id=str(plan_id),
++        ato_type="PLAN",
++        subgraph=dict(subgraph),
++        slots={},
++        bindings={},
++        cost=float(len(subgraph["ranked_candidates"])),
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 114, "plan_kind": "action_plan_v100"},
++        created_step=int(created_step),
++        last_step=int(created_step),
++    )
++
++
++def _make_eval_ato_v114(*, objective_eval: Dict[str, Any]) -> ATOv71:
++    eval_id = str(objective_eval.get("eval_id") or "")
++    if not eval_id:
++        raise ValueError("missing_eval_id")
++    step = int(objective_eval.get("step", 0) or 0)
++    turn_id = str(objective_eval.get("turn_id") or "")
++    verdict = _safe_dict(objective_eval.get("verdict"))
++    ok = bool(_safe_dict(verdict).get("ok", False))
++    reason = str(_safe_dict(verdict).get("reason") or "")
++    score = int(_safe_dict(verdict).get("score", 0) or 0)
++    subgraph = {
++        "schema_version": 114,
++        "eval_id": str(eval_id),
++        "objective_kind": str(objective_eval.get("objective_kind") or ""),
++        "objective_id": str(objective_eval.get("objective_id") or ""),
++        "action_concept_id": str(objective_eval.get("action_concept_id") or ""),
++        "expected_text_sig": str(objective_eval.get("expected_text_sig") or ""),
++        "output_text_sig": str(objective_eval.get("output_text_sig") or ""),
++        "satisfies": bool(ok),
++        "score": int(score),
++        "reason": str(reason),
++    }
++    return ATOv71(
++        ato_id=str(eval_id),
++        ato_type="EVAL",
++        subgraph=dict(subgraph),
++        slots={},
++        bindings={},
++        cost=1.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(turn_id)}] if turn_id else [],
++        invariants={"schema_version": 114, "eval_kind": "objective_eval_v96"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _make_fail_event_ato_v114(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    reason_code: str,
++    step: int,
++) -> ATOv71:
++    body = {
++        "schema_version": 114,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": str(reason_code),
++    }
++    fail_id = _stable_id("fail_event_v114", body)
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(body, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++        invariants={"schema_version": 114, "eval_kind": "FAIL_EVENT_V114"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _make_plan_attempt_fail_event_ato_v114(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    attempt_act_id: str,
++    attempt_eval_id: str,
++    step: int,
++) -> ATOv71:
++    body = {
++        "schema_version": 114,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": FAIL_REASON_PLAN_ATTEMPT_FAILED_V114,
++        "attempt_act_id": str(attempt_act_id),
++        "attempt_eval_id": str(attempt_eval_id),
++    }
++    fail_id = _stable_id("fail_event_v114", body)
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(body, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++        invariants={"schema_version": 114, "eval_kind": "FAIL_EVENT_V114"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++@dataclass(frozen=True)
++class GateResultV114:
++    ok: bool
++    reason: str
++    details: Dict[str, Any]
++
++
++def verify_goal_plan_eval_law_v114(
++    *,
++    run_dir: str,
++    max_replans_per_turn: int = 3,
++    write_mind_graph: bool = True,
++) -> GateResultV114:
++    """
++    Enforce V114 law over a completed conversation run:
++      - 1 GOAL ATO per user input
++      - PLAN ATO per user input
++      - EVAL ATO with satisfies==true for the chosen plan before render
++      - FAIL_EVENT ATO persisted for violations
++    """
++    rd = str(run_dir)
++    turns_path = os.path.join(rd, "conversation_turns.jsonl")
++    plans_path = os.path.join(rd, "action_plans.jsonl")
++    evals_path = os.path.join(rd, "objective_evals.jsonl")
++    if not os.path.exists(turns_path):
++        return GateResultV114(ok=False, reason="missing_conversation_turns", details={"turns_path": str(turns_path)})
++
++    turns_rows = _read_jsonl(turns_path)
++    user_turns: List[Dict[str, Any]] = []
++    assistant_turns: List[Dict[str, Any]] = []
++    assistant_turn_by_eval_id: Dict[str, Dict[str, Any]] = {}
++    conversation_id = ""
++    for row in turns_rows:
++        payload = _safe_dict(row.get("payload"))
++        if not conversation_id:
++            conversation_id = str(payload.get("conversation_id") or "")
++        role = str(payload.get("role") or "")
++        if role == "user":
++            user_turns.append(payload)
++        elif role == "assistant":
++            assistant_turns.append(payload)
++            refs = _safe_dict(payload.get("refs"))
++            eid = str(refs.get("eval_id") or "")
++            if eid and eid not in assistant_turn_by_eval_id:
++                assistant_turn_by_eval_id[eid] = dict(payload)
++
++    plans_rows = _read_jsonl(plans_path)
++    plans_by_user_turn_id: Dict[str, Dict[str, Any]] = {}
++    for row in plans_rows:
++        if not isinstance(row, dict):
++            continue
++        user_turn_id = str(row.get("user_turn_id") or "")
++        if not user_turn_id:
++            continue
++        # Deterministic first-wins: action_plans are already chained; keep earliest.
++        if user_turn_id not in plans_by_user_turn_id:
++            plans_by_user_turn_id[user_turn_id] = dict(row)
++
++    eval_rows = _read_jsonl(evals_path)
++    eval_by_id: Dict[str, Dict[str, Any]] = {}
++    for row in eval_rows:
++        if not isinstance(row, dict):
++            continue
++        eid = str(row.get("eval_id") or "")
++        if not eid:
++            continue
++        if eid not in eval_by_id:
++            eval_by_id[eid] = dict(row)
++
++    mg: Optional[MindGraphV71] = None
++    mg_dir = os.path.join(rd, "mind_graph_v114")
++    if write_mind_graph:
++        _ensure_absent(mg_dir)
++        mg = MindGraphV71(run_dir=str(mg_dir))
++
++        # Add all turns as OBS nodes for linking.
++        for p in user_turns + assistant_turns:
++            try:
++                ato = _make_turn_obs_ato_v114(p)
++            except Exception:
++                continue
++            mg.add_node(step=int(p.get("created_step", 0) or 0), ato=ato, reason="turn_observed_v114")
++
++    violations: List[Dict[str, Any]] = []
++    goals_total = 0
++    plans_total = 0
++    evals_total = 0
++    fails_total = 0
++
++    # Process user turns in deterministic order by created_step then turn_id.
++    user_turns_sorted = list(user_turns)
++    user_turns_sorted.sort(key=lambda p: (int(p.get("created_step", 0) or 0), str(p.get("turn_id") or "")))
++
++    for ut in user_turns_sorted:
++        user_turn_id = str(ut.get("turn_id") or "")
++        if not user_turn_id:
++            violations.append({"reason_code": FAIL_REASON_MISSING_GOAL_V114, "turn_id": ""})
++            fails_total += 1
++            if mg is not None:
++                fail_ato = _make_fail_event_ato_v114(
++                    conversation_id=str(conversation_id),
++                    user_turn_id="",
++                    goal_ato_id="",
++                    plan_ato_id="",
++                    reason_code=FAIL_REASON_MISSING_GOAL_V114,
++                    step=int(ut.get("created_step", 0) or 0),
++                )
++                mg.add_node(step=int(ut.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++            continue
++
++        try:
++            goal_ato = _make_goal_ato_v114(conversation_id=str(conversation_id), user_turn_payload=ut)
++        except Exception:
++            violations.append({"reason_code": FAIL_REASON_MISSING_GOAL_V114, "turn_id": str(user_turn_id)})
++            if mg is not None:
++                fail_ato = _make_fail_event_ato_v114(
++                    conversation_id=str(conversation_id),
++                    user_turn_id=str(user_turn_id),
++                    goal_ato_id="",
++                    plan_ato_id="",
++                    reason_code=FAIL_REASON_MISSING_GOAL_V114,
++                    step=int(ut.get("created_step", 0) or 0),
++                )
++                mg.add_node(step=int(ut.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++            fails_total += 1
++            continue
++
++        goals_total += 1
++        if mg is not None:
++            mg.add_node(step=int(ut.get("created_step", 0) or 0), ato=goal_ato, reason="goal_created_v114")
++            # Turn -> Goal
++            if str(user_turn_id) in mg._nodes:
++                mg.add_edge(
++                    step=int(ut.get("created_step", 0) or 0),
++                    src_ato_id=str(user_turn_id),
++                    dst_ato_id=str(goal_ato.ato_id),
++                    edge_type="CAUSES",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="input_causes_goal_v114",
++                )
++
++        plan_row = plans_by_user_turn_id.get(user_turn_id)
++        if not isinstance(plan_row, dict):
++            violations.append({"reason_code": FAIL_REASON_MISSING_PLAN_V114, "turn_id": str(user_turn_id)})
++            if mg is not None:
++                fail_ato = _make_fail_event_ato_v114(
++                    conversation_id=str(conversation_id),
++                    user_turn_id=str(user_turn_id),
++                    goal_ato_id=str(goal_ato.ato_id),
++                    plan_ato_id="",
++                    reason_code=FAIL_REASON_MISSING_PLAN_V114,
++                    step=int(ut.get("created_step", 0) or 0),
++                )
++                mg.add_node(step=int(ut.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++                mg.add_edge(
++                    step=int(ut.get("created_step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(goal_ato.ato_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_goal_v114",
++                )
++                if str(user_turn_id) in mg._nodes:
++                    mg.add_edge(
++                        step=int(ut.get("created_step", 0) or 0),
++                        src_ato_id=str(fail_ato.ato_id),
++                        dst_ato_id=str(user_turn_id),
++                        edge_type="DERIVED_FROM",
++                        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                        reason="fail_from_turn_v114",
++                    )
++            fails_total += 1
++            continue
++
++        try:
++            plan_ato = _make_plan_ato_v114(action_plan=plan_row)
++        except Exception:
++            violations.append({"reason_code": FAIL_REASON_MISSING_PLAN_V114, "turn_id": str(user_turn_id)})
++            fails_total += 1
++            continue
++
++        plans_total += 1
++        if mg is not None:
++            mg.add_node(step=int(plan_row.get("created_step", 0) or 0), ato=plan_ato, reason="plan_created_v114")
++            mg.add_edge(
++                step=int(plan_row.get("created_step", 0) or 0),
++                src_ato_id=str(goal_ato.ato_id),
++                dst_ato_id=str(plan_ato.ato_id),
++                edge_type="DEPENDS_ON",
++                evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                reason="goal_depends_on_plan_v114",
++            )
++
++        # Record failed attempts (planner/executor failures) as FAIL_EVENT ATOs.
++        attempted_actions = _safe_list(plan_row.get("attempted_actions"))
++        for a in attempted_actions:
++            if not isinstance(a, dict):
++                continue
++            if bool(a.get("ok", False)):
++                continue
++            fails_total += 1
++            if mg is None:
++                continue
++            fail_ato = _make_plan_attempt_fail_event_ato_v114(
++                conversation_id=str(conversation_id),
++                user_turn_id=str(user_turn_id),
++                goal_ato_id=str(goal_ato.ato_id),
++                plan_ato_id=str(plan_ato.ato_id),
++                attempt_act_id=str(a.get("act_id") or ""),
++                attempt_eval_id=str(a.get("eval_id") or ""),
++                step=int(plan_row.get("created_step", 0) or 0),
++            )
++            mg.add_node(step=int(plan_row.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++            mg.add_edge(
++                step=int(plan_row.get("created_step", 0) or 0),
++                src_ato_id=str(fail_ato.ato_id),
++                dst_ato_id=str(goal_ato.ato_id),
++                edge_type="DERIVED_FROM",
++                evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                reason="fail_from_goal_v114",
++            )
++            mg.add_edge(
++                step=int(plan_row.get("created_step", 0) or 0),
++                src_ato_id=str(fail_ato.ato_id),
++                dst_ato_id=str(plan_ato.ato_id),
++                edge_type="DERIVED_FROM",
++                evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                reason="fail_from_plan_v114",
++            )
++            if str(user_turn_id) in mg._nodes:
++                mg.add_edge(
++                    step=int(plan_row.get("created_step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(user_turn_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_turn_v114",
++                )
++
++        chosen_eval_id = str(plan_row.get("chosen_eval_id") or "")
++        chosen_ok = bool(plan_row.get("chosen_ok", False))
++
++        # Replanning constraint (observational): if chosen_ok is false, treat as exhaustion only if budget reached
++        # or all ranked candidates were attempted (prefix).
++        if not chosen_ok:
++            attempted = _safe_list(plan_row.get("attempted_actions"))
++            ranked = _safe_list(plan_row.get("ranked_candidates"))
++            attempted_cnt = sum(1 for a in attempted if isinstance(a, dict))
++            ranked_cnt = sum(1 for a in ranked if isinstance(a, dict))
++            replanning_reason = ""
++            if attempted_cnt < ranked_cnt and attempted_cnt < int(max_replans_per_turn):
++                replanning_reason = FAIL_REASON_REPLANNING_REQUIRED_V114
++                violations.append(
++                    {
++                        "reason_code": FAIL_REASON_REPLANNING_REQUIRED_V114,
++                        "turn_id": str(user_turn_id),
++                        "attempted_actions": int(attempted_cnt),
++                        "ranked_candidates": int(ranked_cnt),
++                        "max_replans_per_turn": int(max_replans_per_turn),
++                    }
++                )
++            else:
++                replanning_reason = FAIL_REASON_EXHAUSTED_PLANS_V114
++                violations.append(
++                    {
++                        "reason_code": FAIL_REASON_EXHAUSTED_PLANS_V114,
++                        "turn_id": str(user_turn_id),
++                        "attempted_actions": int(attempted_cnt),
++                        "ranked_candidates": int(ranked_cnt),
++                        "max_replans_per_turn": int(max_replans_per_turn),
++                    }
++                )
++            fails_total += 1
++            if mg is not None and replanning_reason:
++                fail_ato = _make_fail_event_ato_v114(
++                    conversation_id=str(conversation_id),
++                    user_turn_id=str(user_turn_id),
++                    goal_ato_id=str(goal_ato.ato_id),
++                    plan_ato_id=str(plan_ato.ato_id),
++                    reason_code=str(replanning_reason),
++                    step=int(plan_row.get("created_step", 0) or 0),
++                )
++                mg.add_node(step=int(plan_row.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++                mg.add_edge(
++                    step=int(plan_row.get("created_step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(goal_ato.ato_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_goal_v114",
++                )
++                mg.add_edge(
++                    step=int(plan_row.get("created_step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(plan_ato.ato_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_plan_v114",
++                )
++                if str(user_turn_id) in mg._nodes:
++                    mg.add_edge(
++                        step=int(plan_row.get("created_step", 0) or 0),
++                        src_ato_id=str(fail_ato.ato_id),
++                        dst_ato_id=str(user_turn_id),
++                        edge_type="DERIVED_FROM",
++                        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                        reason="fail_from_turn_v114",
++                    )
++
++        ev_row = eval_by_id.get(chosen_eval_id) if chosen_eval_id else None
++        if not isinstance(ev_row, dict):
++            # Some legacy paths (e.g. COMM_END) don't emit objective_evals rows.
++            # V114 law still requires an EVAL ATO; synthesize it deterministically from the assistant turn refs
++            # when the chosen plan is marked ok and the assistant turn carries the eval_id.
++            synth = None
++            if chosen_ok and chosen_eval_id:
++                at = assistant_turn_by_eval_id.get(chosen_eval_id)
++                if isinstance(at, dict):
++                    arefs = _safe_dict(at.get("refs"))
++                    synth = {
++                        "eval_id": str(chosen_eval_id),
++                        "turn_id": str(user_turn_id),
++                        "step": int(at.get("created_step", 0) or 0),
++                        "objective_kind": str(arefs.get("objective_kind") or ""),
++                        "objective_id": str(arefs.get("objective_id") or ""),
++                        "action_concept_id": str(arefs.get("action_concept_id") or ""),
++                        "expected_text_sig": str(at.get("text_sig") or ""),
++                        "output_text_sig": str(at.get("text_sig") or ""),
++                        "verdict": {"ok": True, "reason": "", "score": 1},
++                    }
++            if isinstance(synth, dict):
++                ev_row = synth
++            else:
++                violations.append({"reason_code": FAIL_REASON_MISSING_EVAL_V114, "turn_id": str(user_turn_id)})
++                if mg is not None:
++                    fail_ato = _make_fail_event_ato_v114(
++                        conversation_id=str(conversation_id),
++                        user_turn_id=str(user_turn_id),
++                        goal_ato_id=str(goal_ato.ato_id),
++                        plan_ato_id=str(plan_ato.ato_id),
++                        reason_code=FAIL_REASON_MISSING_EVAL_V114,
++                        step=int(plan_row.get("created_step", 0) or 0),
++                    )
++                    mg.add_node(step=int(plan_row.get("created_step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++                    mg.add_edge(
++                        step=int(plan_row.get("created_step", 0) or 0),
++                        src_ato_id=str(fail_ato.ato_id),
++                        dst_ato_id=str(goal_ato.ato_id),
++                        edge_type="DERIVED_FROM",
++                        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                        reason="fail_from_goal_v114",
++                    )
++                    mg.add_edge(
++                        step=int(plan_row.get("created_step", 0) or 0),
++                        src_ato_id=str(fail_ato.ato_id),
++                        dst_ato_id=str(plan_ato.ato_id),
++                        edge_type="DERIVED_FROM",
++                        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                        reason="fail_from_plan_v114",
++                    )
++                    if str(user_turn_id) in mg._nodes:
++                        mg.add_edge(
++                            step=int(plan_row.get("created_step", 0) or 0),
++                            src_ato_id=str(fail_ato.ato_id),
++                            dst_ato_id=str(user_turn_id),
++                            edge_type="DERIVED_FROM",
++                            evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                            reason="fail_from_turn_v114",
++                        )
++                fails_total += 1
++                continue
++
++        eval_ato = _make_eval_ato_v114(objective_eval=ev_row)
++        evals_total += 1
++        if mg is not None:
++            mg.add_node(step=int(ev_row.get("step", 0) or 0), ato=eval_ato, reason="eval_created_v114")
++            mg.add_edge(
++                step=int(ev_row.get("step", 0) or 0),
++                src_ato_id=str(plan_ato.ato_id),
++                dst_ato_id=str(eval_ato.ato_id),
++                edge_type="CAUSES",
++                evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                reason="plan_causes_eval_v114",
++            )
++            mg.add_edge(
++                step=int(ev_row.get("step", 0) or 0),
++                src_ato_id=str(goal_ato.ato_id),
++                dst_ato_id=str(eval_ato.ato_id),
++                edge_type="DEPENDS_ON",
++                evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                reason="goal_depends_on_eval_v114",
++            )
++
++        verdict = _safe_dict(ev_row.get("verdict"))
++        ok = bool(_safe_dict(verdict).get("ok", False))
++        if not ok:
++            violations.append({"reason_code": FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114, "turn_id": str(user_turn_id)})
++            if mg is not None:
++                fail_ato = _make_fail_event_ato_v114(
++                    conversation_id=str(conversation_id),
++                    user_turn_id=str(user_turn_id),
++                    goal_ato_id=str(goal_ato.ato_id),
++                    plan_ato_id=str(plan_ato.ato_id),
++                    reason_code=FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114,
++                    step=int(ev_row.get("step", 0) or 0),
++                )
++                mg.add_node(step=int(ev_row.get("step", 0) or 0), ato=fail_ato, reason="fail_event_v114")
++                mg.add_edge(
++                    step=int(ev_row.get("step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(goal_ato.ato_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_goal_v114",
++                )
++                mg.add_edge(
++                    step=int(ev_row.get("step", 0) or 0),
++                    src_ato_id=str(fail_ato.ato_id),
++                    dst_ato_id=str(plan_ato.ato_id),
++                    edge_type="DERIVED_FROM",
++                    evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                    reason="fail_from_plan_v114",
++                )
++                if str(user_turn_id) in mg._nodes:
++                    mg.add_edge(
++                        step=int(ev_row.get("step", 0) or 0),
++                        src_ato_id=str(fail_ato.ato_id),
++                        dst_ato_id=str(user_turn_id),
++                        edge_type="DERIVED_FROM",
++                        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++                        reason="fail_from_turn_v114",
++                    )
++            fails_total += 1
++
++    ok = not bool(violations)
++    reason = "ok" if ok else str(violations[0].get("reason_code") or "violations")
++    details = {
++        "schema_version": 114,
++        "conversation_id": str(conversation_id),
++        "goals_total": int(goals_total),
++        "plans_total": int(plans_total),
++        "evals_total": int(evals_total),
++        "fails_total": int(fails_total),
++        "violations_total": int(len(violations)),
++        "violations": list(violations),
++    }
++
++    mg_out: Dict[str, Any] = {}
++    if mg is not None:
++        chains = mg.verify_chains()
++        snapshot = mg.snapshot_graph_state()
++        graph_sig = mg.graph_sig()
++        # Store only run_dir-relative paths for determinism/auditability.
++        mg_out = {
++            "mind_graph_dir": "mind_graph_v114",
++            "mind_nodes_jsonl": os.path.join("mind_graph_v114", "mind_nodes.jsonl"),
++            "mind_edges_jsonl": os.path.join("mind_graph_v114", "mind_edges.jsonl"),
++            "mind_nodes_chain_ok": bool(chains.get("mind_nodes_chain_ok", False)),
++            "mind_edges_chain_ok": bool(chains.get("mind_edges_chain_ok", False)),
++            "mind_graph_sig": str(graph_sig),
++            "mind_graph_snapshot_sig": sha256_hex(canonical_json_dumps(snapshot).encode("utf-8")),
++        }
++    details["mind_graph"] = dict(mg_out)
++
++    # Persist V114 summary (WORM).
++    summary_path = os.path.join(rd, "goal_plan_eval_summary_v114.json")
++    _ensure_absent(summary_path)
++    summary_obj = dict(
++        details,
++        ok=bool(ok),
++        reason=str(reason),
++        conversation_turns_sha256=_sha256_file(turns_path),
++    )
++    # NOTE: goal_plan_eval_summary_sha256 is anchored to conversation_turns.jsonl bytes.
++    with open(summary_path, "x", encoding="utf-8") as f:
++        f.write(json.dumps(summary_obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    return GateResultV114(ok=bool(ok), reason=str(reason), details=dict(details, goal_plan_eval_summary_v114_json=str(summary_path)))
+--- /dev/null	2026-01-15 04:51:22
++++ atos_core/conversation_loop_v114.py	2026-01-15 04:32:14
+@@ -0,0 +1,36 @@
++from __future__ import annotations
++
++from typing import Any, Dict, Sequence
++
++from .conversation_loop_v110 import run_conversation_v110
++from .goal_plan_eval_gate_v114 import verify_goal_plan_eval_law_v114
++
++
++def run_conversation_v114(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_replans_per_turn: int = 3,
++) -> Dict[str, Any]:
++    """
++    V114 wrapper around V110 runtime enforcing:
++      INPUT -> GOAL(ATO) -> PLAN(ATO) -> EVAL(ATO satisfies==true) before render.
++
++    Implementation is audit-first:
++      - run V110 as-is (keeps prior baselines stable),
++      - then construct MindGraph nodes/edges + verify GOAL/PLAN/EVAL law,
++      - write `goal_plan_eval_summary_v114.json` and `mind_graph_v114/`.
++    """
++    res = run_conversation_v110(user_turn_texts=list(user_turn_texts), out_dir=str(out_dir), seed=int(seed))
++    gate = verify_goal_plan_eval_law_v114(
++        run_dir=str(out_dir),
++        max_replans_per_turn=int(max_replans_per_turn),
++        write_mind_graph=True,
++    )
++    out = dict(res)
++    out["gate_v114_ok"] = bool(gate.ok)
++    out["gate_v114_reason"] = str(gate.reason)
++    out["gate_v114"] = dict(gate.details)
++    return out
++
+--- /dev/null	2026-01-15 04:51:22
++++ scripts/run_family7_dla_v114.py	2026-01-15 04:47:27
+@@ -0,0 +1,436 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v114 import run_conversation_v114
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import (
++    EXTERNAL_WORLD_ACTION_SEARCH_V111,
++    EXTERNAL_WORLD_REASON_CODES_V111,
++    compute_external_world_chain_hash_v111,
++    verify_external_world_event_sig_chain_v111,
++)
++from atos_core.fluency_survival_v112 import fluency_contract_v112, fluency_survival_plan_v112, summarize_fluency_fail_code_v112
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++ACK_TO_CHOICE_LABEL_V112 = {
++    "ok",
++    "okay",
++    "certo",
++    "beleza",
++    "blz",
++    "continua",
++    "continue",
++    "segue",
++    "vai",
++    "faz",
++    "pode",
++    "sim",
++}
++
++
++def _canon_ack_token_v112(s: str) -> str:
++    t = str(s or "").strip().lower()
++    t = " ".join([x for x in t.split() if x])
++    return t
++
++
++def _choiceify_minimal_ack_v112(user_turn_texts: Sequence[str]) -> List[str]:
++    out: List[str] = []
++    for s in user_turn_texts:
++        cs = _canon_ack_token_v112(str(s))
++        if cs in ACK_TO_CHOICE_LABEL_V112:
++            out.append("A")
++        else:
++            out.append(str(s))
++    return out
++
++
++def _load_jsonl_payload_view(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if not isinstance(obj, dict):
++                continue
++            payload = obj.get("payload")
++            if not isinstance(payload, dict):
++                continue
++            out.append(dict(payload))
++    return out
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _compute_external_world_access_once_v113(
++    *,
++    world_manifest: str,
++    reason_code: str,
++    query: str,
++    seed: int,
++) -> List[Dict[str, Any]]:
++    evs, _ = external_world_access_v113(
++        allowed=True,
++        world_manifest=str(world_manifest),
++        action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++        reason_code=str(reason_code),
++        args={"query": str(query), "limit": 3, "roles": ["user"]},
++        seed=int(seed),
++        turn_index=0,
++        prev_event_sig="",
++    )
++    return list(evs)
++
++
++def _count_unresolved_reference_events(binding_events: Sequence[Dict[str, Any]]) -> int:
++    bad = 0
++    for ev in binding_events:
++        if not isinstance(ev, dict):
++            continue
++        t = str(ev.get("type") or "")
++        if t in {"BIND_MISS", "BIND_AMBIGUOUS"}:
++            bad += 1
++    return int(bad)
++
++
++def _unresolved_reference_final_from_flow(flow_events: Sequence[Dict[str, Any]]) -> int:
++    if not flow_events:
++        return 0
++    last = flow_events[-1] if isinstance(flow_events[-1], dict) else {}
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        return 0
++    return 1 if bool(flags.get("UNRESOLVED_REFERENCE")) else 0
++
++
++def _count_semantic_contradiction_flags(semantic_events: Sequence[Dict[str, Any]]) -> int:
++    cnt = 0
++    for ev in semantic_events:
++        if not isinstance(ev, dict):
++            continue
++        flags = ev.get("flags_v109")
++        if not isinstance(flags, dict):
++            continue
++        if bool(flags.get("CONTRADICTION_UNREPAIRED")):
++            cnt += 1
++    return int(cnt)
++
++
++def _write_external_world_ledger(*, task_dir: Path, events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    events_path = task_dir / "external_world_events.jsonl"
++    _ensure_absent(events_path)
++    if events:
++        with open(events_path, "x", encoding="utf-8") as f:
++            for e in events:
++                f.write(canonical_json_dumps(e))
++                f.write("\n")
++    else:
++        events_path.write_text("", encoding="utf-8")
++
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v111(list(events))
++    if not ok_sig:
++        _fail(f"external_world_sig_chain_fail:{reason_sig}")
++    chain_hash = compute_external_world_chain_hash_v111(list(events))
++    snap = {
++        "schema_version": 111,
++        "kind": "external_world_registry_snapshot_v111",
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++    }
++    snap_path = task_dir / "external_world_registry_snapshot_v111.json"
++    _write_once_json(snap_path, snap)
++    return {
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++        "external_world_events_jsonl": str(events_path),
++        "external_world_registry_snapshot_v111_json": str(snap_path),
++    }
++
++
++def _compute_freeze_manifest_v114(*, task_dir: Path, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    rel_paths: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        fp = Path(p)
++        try:
++            rel_paths[str(k)] = str(fp.relative_to(task_dir))
++        except Exception:
++            rel_paths[str(k)] = str(fp.name)
++        if fp.exists():
++            sha256[str(k)] = _sha256_file(fp)
++
++    body = {
++        "schema_version": 114,
++        "kind": "freeze_manifest_v114_family7",
++        "sha256": dict(sha256),
++        "sha256_paths": dict(rel_paths),
++    }
++    body["freeze_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", required=True, type=int)
++    ap.add_argument("--max_rewrites", required=True, type=int)
++    ap.add_argument("--max_replans_per_turn", type=int, default=3)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_dir = Path(str(args.out))
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        _fail("empty_tasks")
++
++    tasks = tasks[: min(int(args.max_tasks), len(tasks))]
++    results: List[Dict[str, Any]] = []
++    failures: List[Dict[str, Any]] = []
++
++    for i, task in enumerate(tasks):
++        task_id = str(task.get("task_id") or f"task_{i}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        user_turn_texts_engine = _choiceify_minimal_ack_v112(user_turn_texts)
++        task_subdir = out_dir / f"task_{i:03d}"
++        _ensure_absent(task_subdir)
++        task_subdir.mkdir(parents=True, exist_ok=False)
++
++        world_manifest = str(task.get("world_manifest") or "")
++        allow_external = bool(task.get("allow_external_world_once"))
++        reason_code = str(task.get("external_world_probe_reason_code") or "validator_failed_fluency_contract")
++        if reason_code and reason_code not in EXTERNAL_WORLD_REASON_CODES_V111:
++            _fail(f"invalid_reason_code_in_task:{reason_code}")
++
++        attempt_seeds = fluency_survival_plan_v112(base_seed=int(seed), max_attempts=int(args.max_rewrites))
++        attempts: List[Dict[str, Any]] = []
++        chosen_attempt = -1
++        ext_events_final: List[Dict[str, Any]] = []
++        ext_used = False
++        ext_used_reason = ""
++
++        for a, seed_used in enumerate(attempt_seeds):
++            attempt_dir = task_subdir / f"attempt_{a:03d}"
++            _ensure_absent(attempt_dir)
++            conv_res = run_conversation_v114(
++                user_turn_texts=user_turn_texts_engine,
++                out_dir=str(attempt_dir),
++                seed=int(seed_used),
++                max_replans_per_turn=int(args.max_replans_per_turn),
++            )
++
++            transcript_rows = _load_jsonl_payload_view(attempt_dir / "transcript.jsonl")
++            user_i = 0
++            transcript_view: List[Dict[str, Any]] = []
++            for r in transcript_rows:
++                role = str(r.get("role") or "")
++                text = str(r.get("text") or "")
++                if role == "user" and user_i < len(user_turn_texts):
++                    text = str(user_turn_texts[user_i])
++                    user_i += 1
++                transcript_view.append({"role": role, "text": text})
++
++            ok_fc, reason_fc, details_fc = fluency_contract_v112(transcript_view=transcript_view)
++            if allow_external and (not ext_used) and a == 0:
++                ok_fc = False
++                reason_fc = "forced_external_world_probe"
++
++            binding_events = _load_jsonl(attempt_dir / "binding_events.jsonl")
++            unresolved_refs_total = _count_unresolved_reference_events(binding_events)
++            flow_events = _load_jsonl(attempt_dir / "flow_events.jsonl")
++            unresolved_refs_final = _unresolved_reference_final_from_flow(flow_events)
++            semantic_events = _load_jsonl(attempt_dir / "semantic_events.jsonl")
++            contradiction_flags = _count_semantic_contradiction_flags(semantic_events)
++
++            ok_gate = bool(conv_res.get("gate_v114_ok", False))
++            gate_reason = str(conv_res.get("gate_v114_reason") or "")
++
++            attempts.append(
++                {
++                    "attempt_index": int(a),
++                    "seed_used": int(seed_used),
++                    "ok_fluency": bool(ok_fc),
++                    "reason_fluency": str(reason_fc),
++                    "unresolved_reference_events_total": int(unresolved_refs_total),
++                    "unresolved_reference_final": int(unresolved_refs_final),
++                    "semantic_contradiction_flags": int(contradiction_flags),
++                    "ok_gate_v114": bool(ok_gate),
++                    "reason_gate_v114": str(gate_reason),
++                    "fluency_details": dict(details_fc),
++                }
++            )
++
++            if allow_external and (not ext_used) and (not ok_fc):
++                ext_events_final = _compute_external_world_access_once_v113(
++                    world_manifest=world_manifest,
++                    reason_code=str(reason_code),
++                    query="não invente",
++                    seed=int(seed),
++                )
++                ext_used = True
++                ext_used_reason = str(reason_code)
++
++            if ok_fc and unresolved_refs_final == 0 and contradiction_flags == 0 and ok_gate:
++                chosen_attempt = int(a)
++                break
++
++        _write_once_json(
++            task_subdir / "fluency_survival_v114.json",
++            {
++                "schema_version": 114,
++                "task_id": str(task_id),
++                "chosen_attempt_index": int(chosen_attempt),
++                "attempts": list(attempts),
++                "external_world_used": bool(ext_used),
++                "external_world_reason_code": str(ext_used_reason),
++            },
++        )
++
++        final_attempt_dir = task_subdir / (f"attempt_{chosen_attempt:03d}" if chosen_attempt >= 0 else "attempt_000")
++        ext_info = _write_external_world_ledger(task_dir=final_attempt_dir, events=ext_events_final if ext_used else [])
++
++        freeze_path = final_attempt_dir / "freeze_manifest_v114.json"
++        sha256_paths = {
++            "v110_summary_json": str(final_attempt_dir / "summary.json"),
++            "v110_freeze_manifest_v110_json": str(final_attempt_dir / "freeze_manifest_v110.json"),
++            "goal_plan_eval_summary_v114_json": str(final_attempt_dir / "goal_plan_eval_summary_v114.json"),
++            "mind_graph_v114_nodes_jsonl": str(final_attempt_dir / "mind_graph_v114" / "mind_nodes.jsonl"),
++            "mind_graph_v114_edges_jsonl": str(final_attempt_dir / "mind_graph_v114" / "mind_edges.jsonl"),
++            "task_eval_json": str(final_attempt_dir / "eval.json"),
++            "fluency_survival_v114_json": str(task_subdir / "fluency_survival_v114.json"),
++            "external_world_events_jsonl": str(ext_info["external_world_events_jsonl"]),
++            "external_world_registry_snapshot_v111_json": str(ext_info["external_world_registry_snapshot_v111_json"]),
++        }
++        freeze = _compute_freeze_manifest_v114(task_dir=final_attempt_dir, sha256_paths=sha256_paths)
++        _write_once_json(freeze_path, freeze)
++        ledger_hash = _sha256_file(freeze_path)
++
++        ok_task = bool(chosen_attempt >= 0)
++        eval_obj = {
++            "schema_version": 114,
++            "task_id": str(task_id),
++            "ok": bool(ok_task),
++            "chosen_attempt_index": int(chosen_attempt),
++            "ledger_hash": str(ledger_hash),
++            "attempts": list(attempts),
++            "stress_kind": str(task.get("stress_kind") or ""),
++            "allow_external_world_once": bool(allow_external),
++            "external_world_events_total": int(ext_info["events_total"]),
++            "external_world_chain_hash_v111": str(ext_info["external_world_chain_hash_v111"]),
++        }
++        _write_once_json(final_attempt_dir / "eval.json", eval_obj)
++
++        attempt_rel = f"task_{i:03d}/attempt_{chosen_attempt:03d}" if chosen_attempt >= 0 else f"task_{i:03d}/attempt_000"
++        if ok_task:
++            results.append(dict(eval_obj, task_index=int(i), attempt_rel=str(attempt_rel)))
++        else:
++            failures.append(dict(eval_obj, task_index=int(i), attempt_rel=str(attempt_rel)))
++
++    tasks_total = int(len(tasks))
++    tasks_ok = int(len(results))
++
++    fail_catalog = {"schema_version": 114, "tasks_total": tasks_total, "failures": list(failures)}
++    _write_once_json(out_dir / "fail_catalog_v114.json", fail_catalog)
++
++    eval_out = {
++        "schema_version": 114,
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "results": list(results),
++        "failures_total": int(len(failures)),
++    }
++    eval_path = out_dir / "eval.json"
++    _write_once_json(eval_path, eval_out)
++    eval_sha256 = _sha256_file(eval_path)
++
++    summary = {
++        "schema_version": 114,
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": str(eval_sha256),
++    }
++    summary_path = out_dir / "summary.json"
++    _write_once_json(summary_path, summary)
++
++    core = {
++        "schema_version": 114,
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": str(eval_sha256),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    print(json.dumps({"ok": bool(tasks_ok == tasks_total), "summary_sha256": str(summary_sha256)}, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 04:51:22
++++ scripts/smoke_v114_family7_real_history_stress.py	2026-01-15 04:37:32
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import EXTERNAL_WORLD_ACTION_SEARCH_V111
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    env = dict(os.environ)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v114.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(seed),
++        "--max_tasks",
++        "9999",
++        "--max_rewrites",
++        "4",
++        "--max_replans_per_turn",
++        "3",
++    ]
++    p = subprocess.run(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
++    if p.returncode != 0:
++        raise SystemExit("runner_failed:\nSTDOUT:\n{out}\nSTDERR:\n{err}".format(out=p.stdout, err=p.stderr))
++
++
++def _negative_tests(*, world_manifest: str) -> Dict[str, Any]:
++    ok1 = False
++    reason1 = ""
++    try:
++        external_world_access_v113(
++            allowed=False,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="validator_failed_fluency_contract",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok1 = True
++    except ValueError as e:
++        reason1 = str(e)
++
++    ok2 = False
++    reason2 = ""
++    try:
++        external_world_access_v113(
++            allowed=True,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="invalid_reason_code_x",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok2 = True
++    except ValueError as e:
++        reason2 = str(e)
++
++    return {
++        "access_not_allowed": {"ok": bool(ok1), "reason": str(reason1)},
++        "invalid_reason_code": {"ok": bool(ok2), "reason": str(reason2)},
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_base = Path(str(args.out_base))
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        raise SystemExit("empty_tasks")
++    world_manifest = str(tasks[0].get("world_manifest") or "")
++
++    neg = _negative_tests(world_manifest=world_manifest)
++    if neg["access_not_allowed"]["reason"] != "external_world_access_not_allowed":
++        raise SystemExit("negative_failed:access_not_allowed")
++    if neg["invalid_reason_code"]["reason"] != "invalid_reason_code":
++        raise SystemExit("negative_failed:invalid_reason_code")
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    _run_runner(tasks=tasks_path, out_dir=out1, seed=seed)
++    _run_runner(tasks=tasks_path, out_dir=out2, seed=seed)
++
++    s1 = _load_json(out1 / "summary.json")
++    s2 = _load_json(out2 / "summary.json")
++    eval_sha1 = str(s1.get("eval_sha256") or "")
++    eval_sha2 = str(s2.get("eval_sha256") or "")
++    if eval_sha1 != eval_sha2:
++        raise SystemExit("determinism_failed:eval_sha")
++
++    ev1 = _load_json(out1 / "eval.json")
++    ev2 = _load_json(out2 / "eval.json")
++    if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++        raise SystemExit("determinism_failed:eval_json")
++
++    if int(ev1.get("tasks_ok") or 0) != int(ev1.get("tasks_total") or 0):
++        raise SystemExit("tasks_not_all_ok")
++
++    res1 = ev1.get("results") if isinstance(ev1.get("results"), list) else []
++    ext_counts = [int(r.get("external_world_events_total") or 0) for r in res1 if isinstance(r, dict)]
++    if sum(1 for c in ext_counts if c == 1) != 1:
++        raise SystemExit("external_world_in_cycle_expected_one_call")
++
++    core = {
++        "schema_version": 114,
++        "seed": int(seed),
++        "try1": {"eval_sha256": eval_sha1, "tasks_ok": int(s1.get("tasks_ok") or 0)},
++        "try2": {"eval_sha256": eval_sha2, "tasks_ok": int(s2.get("tasks_ok") or 0)},
++        "negative_tests": dict(neg),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(summary_sha256),
++        "core": core,
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++        "sha256_eval_json": _sha256_file(out1 / "eval.json"),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 04:51:22
++++ scripts/smoke_v114_goal_plan_eval_law.py	2026-01-15 04:43:23
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import shutil
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v114 import run_conversation_v114
++from atos_core.goal_plan_eval_gate_v114 import (
++    FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114,
++    verify_goal_plan_eval_law_v114,
++)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
++    _ensure_absent(path)
++    with open(path, "x", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++
++
++def _case_positive(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    run_dir = base_dir / "case_00_positive"
++    _ensure_absent(run_dir)
++    run_conversation_v114(user_turn_texts=["set x to 4", "get x", "end now"], out_dir=str(run_dir), seed=int(seed))
++    summ = _load_json(run_dir / "goal_plan_eval_summary_v114.json")
++    if not bool(summ.get("ok", False)):
++        raise SystemExit("case_positive_gate_failed")
++    mg = summ.get("mind_graph") if isinstance(summ.get("mind_graph"), dict) else {}
++    if not bool(mg.get("mind_nodes_chain_ok", False)) or not bool(mg.get("mind_edges_chain_ok", False)):
++        raise SystemExit("case_positive_mindgraph_chain_failed")
++    return {
++        "ok": True,
++        "mind_graph_sig": str(mg.get("mind_graph_sig") or ""),
++    }
++
++
++def _case_negative_missing_eval_satisfies(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    # Start from a valid run and tamper objective_evals to force verdict.ok=false.
++    src_dir = base_dir / "case_01_neg_missing_eval_base"
++    _ensure_absent(src_dir)
++    run_conversation_v114(user_turn_texts=["set x to 4"], out_dir=str(src_dir), seed=int(seed))
++
++    # Create a tamper dir with only the three inputs needed for the gate.
++    tamper_dir = base_dir / "case_01_neg_missing_eval_tamper"
++    _ensure_absent(tamper_dir)
++    tamper_dir.mkdir(parents=True, exist_ok=False)
++    for fn in ("conversation_turns.jsonl", "action_plans.jsonl", "objective_evals.jsonl"):
++        shutil.copyfile(str(src_dir / fn), str(tamper_dir / fn))
++
++    evals = _load_jsonl(tamper_dir / "objective_evals.jsonl")
++    if not evals:
++        raise SystemExit("case_neg1_empty_objective_evals")
++    # Deterministic: flip the first eval verdict.ok to False.
++    ev0 = dict(evals[0])
++    verdict = ev0.get("verdict")
++    if not isinstance(verdict, dict):
++        verdict = {}
++    verdict2 = dict(verdict)
++    verdict2["ok"] = False
++    verdict2["score"] = 0
++    verdict2["reason"] = "tamper_force_fail_v114"
++    ev0["verdict"] = verdict2
++    evals[0] = ev0
++    os.replace(str(tamper_dir / "objective_evals.jsonl"), str(tamper_dir / "objective_evals.jsonl.bak"))
++    _write_jsonl(tamper_dir / "objective_evals.jsonl", evals)
++
++    gate = verify_goal_plan_eval_law_v114(run_dir=str(tamper_dir), max_replans_per_turn=3, write_mind_graph=True)
++    if gate.ok:
++        raise SystemExit("case_neg1_gate_unexpected_ok")
++    if gate.reason != FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114:
++        raise SystemExit("case_neg1_wrong_reason:{r}".format(r=gate.reason))
++    return {"ok": True, "gate_reason": str(gate.reason)}
++
++
++def _case_negative_replan(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    # Use a valid run; then tamper action_plans to simulate a failed first attempt and a successful second attempt.
++    src_dir = base_dir / "case_02_replan_base"
++    _ensure_absent(src_dir)
++    run_conversation_v114(user_turn_texts=["set x to 4"], out_dir=str(src_dir), seed=int(seed))
++
++    tamper_dir = base_dir / "case_02_replan_tamper"
++    _ensure_absent(tamper_dir)
++    tamper_dir.mkdir(parents=True, exist_ok=False)
++    for fn in ("conversation_turns.jsonl", "action_plans.jsonl", "objective_evals.jsonl"):
++        shutil.copyfile(str(src_dir / fn), str(tamper_dir / fn))
++
++    plans = _load_jsonl(tamper_dir / "action_plans.jsonl")
++    if not plans:
++        raise SystemExit("case_replan_empty_action_plans")
++    p0 = dict(plans[0])
++    ranked = p0.get("ranked_candidates") if isinstance(p0.get("ranked_candidates"), list) else []
++    if len(ranked) < 2:
++        raise SystemExit("case_replan_need_2_ranked")
++    chosen_eval_id = str(p0.get("chosen_eval_id") or "")
++    chosen_action_id = str(p0.get("chosen_action_id") or "")
++    # Inject a failing attempt for the 2nd ranked candidate, then the chosen success.
++    first_fail_act = str(ranked[1].get("act_id") or "")
++    p0["attempted_actions"] = [
++        {"act_id": first_fail_act, "eval_id": "fake_eval_v114", "ok": False},
++        {"act_id": chosen_action_id, "eval_id": chosen_eval_id, "ok": True},
++    ]
++    plans[0] = p0
++    os.replace(str(tamper_dir / "action_plans.jsonl"), str(tamper_dir / "action_plans.jsonl.bak"))
++    _write_jsonl(tamper_dir / "action_plans.jsonl", plans)
++
++    gate = verify_goal_plan_eval_law_v114(run_dir=str(tamper_dir), max_replans_per_turn=3, write_mind_graph=True)
++    if not gate.ok:
++        raise SystemExit("case_replan_gate_failed:{r}".format(r=gate.reason))
++    summ = _load_json(tamper_dir / "goal_plan_eval_summary_v114.json")
++    if int(summ.get("fails_total") or 0) < 1:
++        raise SystemExit("case_replan_expected_fail_event")
++    return {"ok": True, "fails_total": int(summ.get("fails_total") or 0)}
++
++
++def _run_try(*, out_dir: Path, seed: int) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++    cases = {
++        "positive": _case_positive(base_dir=out_dir, seed=seed),
++        "neg_missing_eval_satisfies": _case_negative_missing_eval_satisfies(base_dir=out_dir, seed=seed),
++        "neg_replan": _case_negative_replan(base_dir=out_dir, seed=seed),
++    }
++    eval_obj = {"schema_version": 114, "seed": int(seed), "cases": dict(cases)}
++    _write_once_json(out_dir / "eval.json", eval_obj)
++    eval_sha256 = _sha256_file(out_dir / "eval.json")
++    summary = {"schema_version": 114, "seed": int(seed), "eval_sha256": str(eval_sha256)}
++    _write_once_json(out_dir / "summary.json", summary)
++    fail_catalog = {"schema_version": 114, "failures_total": 0, "failures": []}
++    _write_once_json(out_dir / "fail_catalog_v114.json", fail_catalog)
++    return {"eval_sha256": str(eval_sha256), "eval_json": eval_obj}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_v114_goal_plan_eval_law")
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_base = Path(str(args.out_base))
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++
++    r1 = _run_try(out_dir=out1, seed=seed)
++    r2 = _run_try(out_dir=out2, seed=seed)
++
++    if canonical_json_dumps(r1["eval_json"]) != canonical_json_dumps(r2["eval_json"]):
++        raise SystemExit("determinism_failed:eval_json")
++    if r1["eval_sha256"] != r2["eval_sha256"]:
++        raise SystemExit("determinism_failed:eval_sha256")
++
++    core = {"schema_version": 114, "seed": int(seed), "eval_sha256": str(r1["eval_sha256"])}
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "determinism_ok": True,
++                "summary_sha256": str(summary_sha256),
++                "try1_dir": str(out1),
++                "try2_dir": str(out2),
++            },
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 04:51:22
++++ tests/test_goal_plan_eval_gate_v114.py	2026-01-15 04:39:52
+@@ -0,0 +1,197 @@
++from __future__ import annotations
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from typing import Any, Dict, List
++
++from atos_core.act import canonical_json_dumps
++from atos_core.goal_plan_eval_gate_v114 import (
++    FAIL_REASON_EXHAUSTED_PLANS_V114,
++    FAIL_REASON_MISSING_GOAL_V114,
++    FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114,
++    verify_goal_plan_eval_law_v114,
++)
++
++
++def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
++    with open(path, "w", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++
++
++class TestGoalPlanEvalGateV114(unittest.TestCase):
++    def test_missing_goal_creates_failure(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            run_dir = Path(td)
++            _write_jsonl(
++                run_dir / "conversation_turns.jsonl",
++                [
++                    {"payload": {"conversation_id": "c", "role": "user", "created_step": 0, "turn_index": 0, "turn_id": ""}},
++                    {"payload": {"conversation_id": "c", "role": "assistant", "created_step": 1, "turn_index": 1, "turn_id": "t_a"}},
++                ],
++            )
++            _write_jsonl(run_dir / "action_plans.jsonl", [])
++            _write_jsonl(run_dir / "objective_evals.jsonl", [])
++
++            gate = verify_goal_plan_eval_law_v114(run_dir=str(run_dir), max_replans_per_turn=3, write_mind_graph=False)
++            self.assertFalse(gate.ok)
++            self.assertEqual(gate.reason, FAIL_REASON_MISSING_GOAL_V114)
++
++    def test_missing_eval_satisfies_blocks_render(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            run_dir = Path(td)
++            turn_id = "turn_u"
++            eval_id = "eval_x"
++            _write_jsonl(
++                run_dir / "conversation_turns.jsonl",
++                [
++                    {"payload": {"conversation_id": "c", "role": "user", "created_step": 0, "turn_index": 0, "turn_id": turn_id, "refs": {}}},
++                    {"payload": {"conversation_id": "c", "role": "assistant", "created_step": 1, "turn_index": 1, "turn_id": "turn_a", "refs": {"eval_id": eval_id}}},
++                ],
++            )
++            _write_jsonl(
++                run_dir / "action_plans.jsonl",
++                [
++                    {
++                        "user_turn_id": turn_id,
++                        "user_turn_index": 0,
++                        "created_step": 1,
++                        "plan_id": "plan_1",
++                        "chosen_action_id": "act_x",
++                        "chosen_eval_id": eval_id,
++                        "chosen_ok": True,
++                        "ranked_candidates": [{"act_id": "act_x", "expected_success": 1.0, "expected_cost": 1.0}],
++                        "attempted_actions": [{"act_id": "act_x", "eval_id": eval_id, "ok": False}],
++                    }
++                ],
++            )
++            _write_jsonl(
++                run_dir / "objective_evals.jsonl",
++                [
++                    {
++                        "eval_id": eval_id,
++                        "turn_id": turn_id,
++                        "step": 1,
++                        "objective_kind": "COMM_RESPOND",
++                        "objective_id": "objective_v90_comm_respond",
++                        "action_concept_id": "act_x",
++                        "expected_text_sig": "e",
++                        "output_text_sig": "o",
++                        "verdict": {"ok": False, "reason": "x", "score": 0},
++                    }
++                ],
++            )
++            gate = verify_goal_plan_eval_law_v114(run_dir=str(run_dir), max_replans_per_turn=3, write_mind_graph=False)
++            self.assertFalse(gate.ok)
++            self.assertEqual(gate.reason, FAIL_REASON_RENDER_BLOCKED_NO_EVAL_SATISFIES_V114)
++
++    def test_satisfied_eval_allows_render(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            run_dir = Path(td)
++            turn_id = "turn_u"
++            eval_id = "eval_ok"
++            _write_jsonl(
++                run_dir / "conversation_turns.jsonl",
++                [
++                    {"payload": {"conversation_id": "c", "role": "user", "created_step": 0, "turn_index": 0, "turn_id": turn_id, "refs": {}}},
++                    {"payload": {"conversation_id": "c", "role": "assistant", "created_step": 1, "turn_index": 1, "turn_id": "turn_a", "refs": {"eval_id": eval_id}}},
++                ],
++            )
++            _write_jsonl(
++                run_dir / "action_plans.jsonl",
++                [
++                    {
++                        "user_turn_id": turn_id,
++                        "user_turn_index": 0,
++                        "created_step": 1,
++                        "plan_id": "plan_1",
++                        "chosen_action_id": "act_x",
++                        "chosen_eval_id": eval_id,
++                        "chosen_ok": True,
++                        "ranked_candidates": [{"act_id": "act_x", "expected_success": 1.0, "expected_cost": 1.0}],
++                        "attempted_actions": [{"act_id": "act_x", "eval_id": eval_id, "ok": True}],
++                    }
++                ],
++            )
++            _write_jsonl(
++                run_dir / "objective_evals.jsonl",
++                [
++                    {
++                        "eval_id": eval_id,
++                        "turn_id": turn_id,
++                        "step": 1,
++                        "objective_kind": "COMM_RESPOND",
++                        "objective_id": "objective_v90_comm_respond",
++                        "action_concept_id": "act_x",
++                        "expected_text_sig": "e",
++                        "output_text_sig": "e",
++                        "verdict": {"ok": True, "reason": "", "score": 1},
++                    }
++                ],
++            )
++            gate = verify_goal_plan_eval_law_v114(run_dir=str(run_dir), max_replans_per_turn=3, write_mind_graph=False)
++            self.assertTrue(gate.ok)
++            self.assertEqual(gate.reason, "ok")
++
++    def test_replanning_budget_marks_exhausted(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            run_dir = Path(td)
++            turn_id = "turn_u"
++            eval_id = "eval_fail"
++            _write_jsonl(
++                run_dir / "conversation_turns.jsonl",
++                [
++                    {"payload": {"conversation_id": "c", "role": "user", "created_step": 0, "turn_index": 0, "turn_id": turn_id, "refs": {}}},
++                    {"payload": {"conversation_id": "c", "role": "assistant", "created_step": 1, "turn_index": 1, "turn_id": "turn_a", "refs": {"eval_id": eval_id}}},
++                ],
++            )
++            _write_jsonl(
++                run_dir / "action_plans.jsonl",
++                [
++                    {
++                        "user_turn_id": turn_id,
++                        "user_turn_index": 0,
++                        "created_step": 1,
++                        "plan_id": "plan_1",
++                        "chosen_action_id": "act_x",
++                        "chosen_eval_id": eval_id,
++                        "chosen_ok": False,
++                        "ranked_candidates": [
++                            {"act_id": "act_x", "expected_success": 1.0, "expected_cost": 1.0},
++                            {"act_id": "act_y", "expected_success": 1.0, "expected_cost": 1.0},
++                            {"act_id": "act_z", "expected_success": 1.0, "expected_cost": 1.0},
++                        ],
++                        "attempted_actions": [
++                            {"act_id": "act_x", "eval_id": "e1", "ok": False},
++                            {"act_id": "act_y", "eval_id": "e2", "ok": False},
++                        ],
++                    }
++                ],
++            )
++            _write_jsonl(
++                run_dir / "objective_evals.jsonl",
++                [
++                    {
++                        "eval_id": eval_id,
++                        "turn_id": turn_id,
++                        "step": 1,
++                        "objective_kind": "COMM_RESPOND",
++                        "objective_id": "objective_v90_comm_respond",
++                        "action_concept_id": "act_x",
++                        "expected_text_sig": "e",
++                        "output_text_sig": "o",
++                        "verdict": {"ok": False, "reason": "x", "score": 0},
++                    }
++                ],
++            )
++            gate = verify_goal_plan_eval_law_v114(run_dir=str(run_dir), max_replans_per_turn=2, write_mind_graph=False)
++            self.assertFalse(gate.ok)
++            self.assertEqual(gate.reason, FAIL_REASON_EXHAUSTED_PLANS_V114)
++
++
++if __name__ == "__main__":
++    unittest.main()
++

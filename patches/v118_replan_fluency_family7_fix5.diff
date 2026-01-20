@@ -1,0 +1,2053 @@
+--- /dev/null	2026-01-15 17:51:52
++++ atos_core/conversation_loop_v118.py	2026-01-15 16:37:18
+@@ -0,0 +1,68 @@
++from __future__ import annotations
++
++import json
++import os
++from typing import Any, Dict, Sequence
++
++from .conversation_loop_v117 import run_conversation_v117
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.loads(f.read())
++
++
++def run_conversation_v118(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_plan_attempts: int = 8,
++    max_replans_per_turn: int = 3,
++) -> Dict[str, Any]:
++    """
++    V118 wrapper around V117 baseline.
++
++    V118 scope in this repo branch:
++      - keep V117 conversation semantics stable (regression safety),
++      - add a versioned final-response artifact (`final_response_v118.json`) so callers can pin to V118,
++      - keep determinism/WORM semantics unchanged.
++    """
++    res = run_conversation_v117(
++        user_turn_texts=list(user_turn_texts),
++        out_dir=str(out_dir),
++        seed=int(seed),
++        max_plan_attempts=int(max_plan_attempts),
++        max_replans_per_turn=int(max_replans_per_turn),
++    )
++
++    fr117_path = os.path.join(str(out_dir), "final_response_v117.json")
++    fr117 = _read_json(fr117_path) if os.path.exists(fr117_path) else {}
++    ok117 = bool(fr117.get("ok", False)) if isinstance(fr117, dict) else False
++    reason117 = str(fr117.get("reason") or "") if isinstance(fr117, dict) else "missing_final_response_v117"
++
++    final_obj = {
++        "schema_version": 118,
++        "kind": "final_response_v118",
++        "ok": bool(ok117),
++        "reason": str(reason117 if not ok117 else "ok"),
++        "upstream": {"final_response_v117": dict(fr117) if isinstance(fr117, dict) else {}},
++    }
++    _write_once_json(os.path.join(str(out_dir), "final_response_v118.json"), dict(final_obj))
++
++    out = dict(res)
++    out["final_response_v118"] = dict(final_obj)
++    return out
++
+--- /dev/null	2026-01-15 17:51:52
++++ atos_core/external_dialogue_world_v118.py	2026-01-15 16:42:39
+@@ -0,0 +1,23 @@
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from .external_dialogue_world_v113 import ExternalDialogueWorldV113, load_world_v113
++
++
++class ExternalDialogueWorldV118(ExternalDialogueWorldV113):
++    """
++    V118 thin wrapper over the V113 ExternalDialogueWorld implementation.
++
++    The V113 canonical JSONL format and deterministic offsets index are reused to keep
++    the world read-only, deterministic, and audit-friendly.
++    """
++
++    pass
++
++
++def load_world_v118(*, manifest_path: str) -> ExternalDialogueWorldV118:
++    w = load_world_v113(manifest_path=str(manifest_path))
++    # Cast the concrete instance to the V118 alias type.
++    return ExternalDialogueWorldV118(canonical_jsonl_path=str(w.canonical_jsonl_path), manifest=dict(w.manifest))
++
+--- /dev/null	2026-01-15 17:51:52
++++ atos_core/fluency_contract_v118.py	2026-01-15 16:36:21
+@@ -0,0 +1,162 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Any, Dict, List, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .fluency_survival_v112 import fluency_contract_v112, fluency_metrics_v112
++
++
++def _norm_ws(s: str) -> str:
++    return " ".join(str(s or "").strip().split())
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _tokenize(text: str) -> List[str]:
++    t = _norm_ws(text).lower()
++    if not t:
++        return []
++    return t.split()
++
++
++def _prefix2(text: str) -> str:
++    toks = _tokenize(text)
++    if not toks:
++        return ""
++    return " ".join(toks[:2])
++
++
++def _max_consecutive_equal(items: Sequence[str]) -> Tuple[int, str]:
++    best = 0
++    best_item = ""
++    cur = 0
++    prev = None
++    for it in items:
++        if it and prev == it:
++            cur += 1
++        else:
++            cur = 1 if it else 0
++            prev = it
++        if cur > best:
++            best = cur
++            best_item = it
++    return int(best), str(best_item or "")
++
++
++def fluency_contract_v118(
++    *,
++    transcript_view: Sequence[Dict[str, Any]],
++    most_common_reply_frac_max: float = 0.35,
++    unique_reply_rate_min: float = 0.18,
++    repeated_ngram_rate_n4_max: float = 0.92,
++    # V118 additions (explicit, deterministic; not a banlist):
++    max_scaffold_prefix_frac: float = 0.60,
++    max_consecutive_prefix2: int = 4,
++) -> Tuple[bool, str, Dict[str, Any]]:
++    """
++    V118: strengthen fluency-as-survival with a few deterministic "adult dialogue" checks.
++
++    This remains strictly non-ML:
++      - no embeddings,
++      - no probabilistic classifiers,
++      - only explicit metrics + thresholds.
++    """
++    ok112, reason112, details112 = fluency_contract_v112(
++        transcript_view=transcript_view,
++        most_common_reply_frac_max=float(most_common_reply_frac_max),
++        unique_reply_rate_min=float(unique_reply_rate_min),
++        repeated_ngram_rate_n4_max=float(repeated_ngram_rate_n4_max),
++    )
++    if not ok112:
++        # Preserve V112 reason codes for compatibility with existing fail catalogs.
++        return False, str(reason112), dict(details112)
++
++    assistant_texts: List[str] = []
++    for r in transcript_view:
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("role") or "") != "assistant":
++            continue
++        assistant_texts.append(_norm_ws(str(r.get("text") or "")))
++    total = int(len(assistant_texts))
++    if total <= 0:
++        return False, "no_assistant_texts", {"assistant_total": 0}
++
++    # Reuse v112 metrics for transparency.
++    metrics112 = fluency_metrics_v112(transcript_view=transcript_view)
++    scaffold = (metrics112.get("scaffold_prefix_counts") if isinstance(metrics112, dict) else None) or {}
++    if not isinstance(scaffold, dict):
++        scaffold = {}
++
++    worst_phrase = ""
++    worst_frac = 0.0
++    for p, c in scaffold.items():
++        try:
++            frac = float(int(c)) / float(total) if total else 0.0
++        except Exception:
++            frac = 0.0
++        if frac > worst_frac or (abs(frac - worst_frac) < 1e-12 and str(p) < str(worst_phrase)):
++            worst_frac = float(frac)
++            worst_phrase = str(p)
++
++    prefixes2 = [_prefix2(t) for t in assistant_texts]
++    max_run, max_run_prefix = _max_consecutive_equal(prefixes2)
++
++    details = {
++        "schema_version": 118,
++        "v112": dict(details112) if isinstance(details112, dict) else {},
++        "v118_metrics": {
++            "assistant_total": int(total),
++            "scaffold_prefix_worst": {"phrase": str(worst_phrase), "frac": float(round(float(worst_frac), 6))},
++            "prefix2_max_consecutive": {"n": int(max_run), "prefix2": str(max_run_prefix)},
++        },
++        "thresholds": {
++            "max_scaffold_prefix_frac": float(round(float(max_scaffold_prefix_frac), 6)),
++            "max_consecutive_prefix2": int(max_consecutive_prefix2),
++        },
++    }
++    details["metrics_sig"] = _stable_hash_obj(details)
++
++    # Deterministic checks (fail-closed).
++    if worst_phrase and float(worst_frac) > float(max_scaffold_prefix_frac) and total >= 5:
++        return False, "scaffold_prefix_overused", dict(details)
++    if max_run >= int(max_consecutive_prefix2) and max_run_prefix:
++        return False, "consecutive_prefix2_repeat", dict(details)
++
++    # Avoid excessive "manual voice" leakage: if the assistant uses "PASS"/"FAIL" as the leading token too often.
++    leading_re = re.compile(r"^\s*(pass|fail)\b", re.IGNORECASE)
++    leading_counts = 0
++    for t in assistant_texts:
++        if leading_re.search(t):
++            leading_counts += 1
++    if total >= 8 and leading_counts >= 3:
++        details2 = dict(details)
++        details2["v118_metrics"] = dict(details2.get("v118_metrics") or {})
++        details2["v118_metrics"]["leading_pass_fail_count"] = int(leading_counts)
++        details2["metrics_sig"] = _stable_hash_obj(details2)
++        return False, "over_manual_voice", dict(details2)
++
++    return True, "ok", dict(details)
++
++
++@dataclass(frozen=True)
++class FluencyContractResultV118:
++    ok: bool
++    reason: str
++    details: Dict[str, Any]
++
++    def to_dict(self) -> Dict[str, Any]:
++        body = {
++            "schema_version": 118,
++            "kind": "fluency_contract_result_v118",
++            "ok": bool(self.ok),
++            "reason": str(self.reason),
++            "details": dict(self.details) if isinstance(self.details, dict) else {},
++        }
++        body["result_sig"] = _stable_hash_obj(body)
++        return dict(body)
++
+--- /dev/null	2026-01-15 17:51:52
++++ atos_core/replan_law_v118.py	2026-01-15 16:35:35
+@@ -0,0 +1,195 @@
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, List, Optional, Set, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++REPLAN_REASON_OK_V118 = "ok"
++REPLAN_REASON_EXHAUSTED_PLANS_V118 = "exhausted_plans"
++REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118 = "plan_search_budget_exhausted"
++REPLAN_REASON_DUPLICATE_PLAN_CANDIDATE_V118 = "duplicate_plan_candidate"
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def plan_hash_v118(plan_sem_sig: Dict[str, Any]) -> str:
++    return sha256_hex(canonical_json_dumps(plan_sem_sig).encode("utf-8"))
++
++
++@dataclass(frozen=True)
++class PlanCandidateV118:
++    plan_id: str
++    plan_cost: float
++    plan_sem_sig: Dict[str, Any]
++
++    def to_dict(self) -> Dict[str, Any]:
++        sem = {
++            "plan_id": str(self.plan_id),
++            "plan_cost": float(self.plan_cost),
++            "plan_sem_sig": dict(self.plan_sem_sig) if isinstance(self.plan_sem_sig, dict) else {},
++        }
++        sem["plan_hash"] = plan_hash_v118(dict(sem["plan_sem_sig"]))
++        return dict(sem)
++
++
++@dataclass(frozen=True)
++class PlanAttemptV118:
++    attempt_index: int
++    plan_id: str
++    plan_hash: str
++    plan_cost: float
++    eval_satisfies: bool
++    dialogue_survival_ok: bool
++    fail_reason_code: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "attempt_index": int(self.attempt_index),
++            "plan_id": str(self.plan_id),
++            "plan_hash": str(self.plan_hash),
++            "plan_cost": float(self.plan_cost),
++            "eval_satisfies": bool(self.eval_satisfies),
++            "dialogue_survival_ok": bool(self.dialogue_survival_ok),
++            "fail_reason_code": str(self.fail_reason_code),
++        }
++
++
++@dataclass(frozen=True)
++class ReplanResultV118:
++    ok: bool
++    reason: str
++    attempts_total: int
++    attempts: List[PlanAttemptV118]
++    chosen_plan_hash: str
++    budget_total: int
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "schema_version": 118,
++            "kind": "replan_result_v118",
++            "ok": bool(self.ok),
++            "reason": str(self.reason),
++            "attempts_total": int(self.attempts_total),
++            "attempts": [a.to_dict() for a in list(self.attempts)],
++            "chosen_plan_hash": str(self.chosen_plan_hash),
++            "budget_total": int(self.budget_total),
++        }
++
++
++def replan_until_satisfies_v118(
++    *,
++    next_plan: Callable[[], Optional[PlanCandidateV118]],
++    exec_plan: Callable[[PlanCandidateV118], Tuple[bool, bool, str]],
++    max_attempts: int,
++) -> ReplanResultV118:
++    """
++    Deterministic replanning loop:
++      - enumerates plan candidates in the caller-provided order,
++      - never retries a duplicate plan_hash,
++      - stops only on SATISFIES+dialogue_ok, enumerator exhaustion, or budget exhaustion.
++
++    exec_plan returns: (eval_satisfies, dialogue_survival_ok, fail_reason_code).
++    """
++    if int(max_attempts) <= 0:
++        raise ValueError("max_attempts_must_be_positive")
++
++    tried: Set[str] = set()
++    attempts: List[PlanAttemptV118] = []
++
++    while True:
++        if int(len(attempts)) >= int(max_attempts):
++            return ReplanResultV118(
++                ok=False,
++                reason=REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118,
++                attempts_total=int(len(attempts)),
++                attempts=list(attempts),
++                chosen_plan_hash="",
++                budget_total=int(max_attempts),
++            )
++
++        cand = next_plan()
++        if cand is None:
++            return ReplanResultV118(
++                ok=False,
++                reason=REPLAN_REASON_EXHAUSTED_PLANS_V118,
++                attempts_total=int(len(attempts)),
++                attempts=list(attempts),
++                chosen_plan_hash="",
++                budget_total=int(max_attempts),
++            )
++
++        cand_dict = cand.to_dict()
++        ph = str(cand_dict.get("plan_hash") or "")
++        if not ph:
++            ph = plan_hash_v118(cand.plan_sem_sig if isinstance(cand.plan_sem_sig, dict) else {})
++
++        if ph in tried:
++            attempts.append(
++                PlanAttemptV118(
++                    attempt_index=int(len(attempts)),
++                    plan_id=str(cand.plan_id),
++                    plan_hash=str(ph),
++                    plan_cost=float(cand.plan_cost),
++                    eval_satisfies=False,
++                    dialogue_survival_ok=False,
++                    fail_reason_code=REPLAN_REASON_DUPLICATE_PLAN_CANDIDATE_V118,
++                )
++            )
++            continue
++
++        tried.add(ph)
++        eval_ok, dialogue_ok, fail_reason = exec_plan(cand)
++        attempts.append(
++            PlanAttemptV118(
++                attempt_index=int(len(attempts)),
++                plan_id=str(cand.plan_id),
++                plan_hash=str(ph),
++                plan_cost=float(cand.plan_cost),
++                eval_satisfies=bool(eval_ok),
++                dialogue_survival_ok=bool(dialogue_ok),
++                fail_reason_code=str(fail_reason or ""),
++            )
++        )
++
++        if bool(eval_ok) and bool(dialogue_ok):
++            return ReplanResultV118(
++                ok=True,
++                reason=REPLAN_REASON_OK_V118,
++                attempts_total=int(len(attempts)),
++                attempts=list(attempts),
++                chosen_plan_hash=str(ph),
++                budget_total=int(max_attempts),
++            )
++
++
++def write_replan_trace_v118(*, path: str, goal_id: str, result: ReplanResultV118) -> Dict[str, Any]:
++    """
++    Persist a write-once replanning trace artifact.
++    """
++    body = {
++        "schema_version": 118,
++        "kind": "replan_trace_v118",
++        "goal_id": str(goal_id),
++        "result": dict(result.to_dict()),
++    }
++    body["trace_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    _write_once_json(str(path), dict(body))
++    return dict(body)
++
+--- /dev/null	2026-01-15 17:51:52
++++ scripts/gen_family7_dla_from_external_world_v118.py	2026-01-15 17:43:41
+@@ -0,0 +1,431 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++def _load_world_manifest(path: Path) -> Dict[str, Any]:
++    if not path.exists():
++        _fail(f"missing_world_manifest:{path}")
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _world_jsonl_path_from_manifest(manifest_path: Path) -> Path:
++    m = _load_world_manifest(manifest_path)
++    paths = m.get("paths") if isinstance(m.get("paths"), dict) else {}
++    rel = str(paths.get("canonical_jsonl") or "dialogue_history_canonical_v113.jsonl")
++    return (manifest_path.parent / rel).resolve()
++
++
++def _is_safe_user_turn_text_v118(text: str) -> bool:
++    t = str(text or "").strip()
++    if not t:
++        return False
++    if len(t) > 800:
++        return False
++    t0 = t.lstrip()
++    if t0.startswith("{") or t0.startswith("["):
++        return False
++    bad_substrings = [
++        "content_type",
++        "asset_pointer",
++        "file-service://",
++        "multimodal_text",
++        "image_asset_pointer",
++    ]
++    for s in bad_substrings:
++        if s in t0:
++            return False
++    if t0.count("\n") > 10:
++        return False
++    return True
++
++
++def _is_compatible_user_turn_text_v118(text: str) -> bool:
++    """
++    Deterministic compatibility filter to bias tasks toward turns our deterministic
++    conversation runtime can actually parse/handle.
++
++    This keeps V118 smoke practical (PASS/FAIL is meaningful) while still sourcing
++    turns from real history.
++    """
++    t = str(text or "").strip()
++    if not t:
++        return False
++    t0 = t.lower()
++    # Raw-command style prefixes (project ACT).
++    prefixes = [
++        "goal:",
++        "belief:",
++        "crenca:",
++        "crença:",
++        "beliefs",
++        "crencas",
++        "crenças",
++        "revise:",
++        "revisar:",
++        "forget ",
++        "esquece ",
++        "note:",
++        "nota:",
++        "recall",
++        "memoria",
++        "memória",
++        "system",
++        "sistema",
++        "about",
++        "manual",
++        "dossier",
++        "regulatory",
++        "compliance",
++        "versions",
++        "versoes",
++        "versões",
++        "explain",
++        "explique",
++        "teach:",
++        "ensine:",
++        "teach_concept:",
++        "semantics",
++        "pragmatics",
++        "flow",
++        "dialogue",
++        "agency",
++        "plans",
++        "goals",
++        "next",
++        "auto",
++        "end",
++        "fim",
++        "quit",
++        "summary",
++        "resumo",
++        "show variables",
++        "set ",
++        "get ",
++        "add ",
++    ]
++    for p in prefixes:
++        if t0.startswith(p):
++            return True
++    # Single-letter choices often used by the benchmarks.
++    if t0 in {"a", "b", "c"}:
++        return True
++    return False
++
++
++def _make_task(task_kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
++    body = dict(payload)
++    body["schema_version"] = 118
++    body["task_kind"] = str(task_kind)
++    task_id = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return dict(body, task_id=f"family7_dla_v118_{task_id}")
++
++
++def _injection_plan_for_task_v118(*, task_index: int, total_turns: int) -> List[Dict[str, Any]]:
++    """
++    Deterministic adversarial injection plan (lightweight).
++    """
++    plan: List[Tuple[str, int, str]] = []
++    plan.append(("dont_invent", 12, "não invente; se não souber diga não sei e pergunte o dado"))
++    cycle = int(task_index) % 7
++    if cycle == 0:
++        plan.append(("late_reference", min(total_turns - 5, 90), "como eu disse antes, faz isso do mesmo jeito"))
++    elif cycle == 1:
++        plan.append(("soft_contradiction", min(total_turns - 5, 45), "na verdade era X, não Y"))
++    elif cycle == 2:
++        plan.append(("implicit_goal_shift", min(total_turns - 5, 70), "agora muda o objetivo sem avisar e vê se você percebe"))
++    elif cycle == 3:
++        plan.append(("irony", min(total_turns - 5, 55), "claro... sqn"))
++    elif cycle == 4:
++        plan.append(("late_reference_far", min(total_turns - 5, 140), "isso que eu falei lá atrás continua valendo"))
++    elif cycle == 5:
++        plan.append(("hostile_confused", min(total_turns - 5, 30), "?? você não entendeu nada"))
++    elif cycle == 6:
++        plan.append(("minimalist_trap", min(total_turns - 5, 80), "ok"))
++    plan.sort(key=lambda t: (int(t[1]), str(t[0])))
++    out: List[Dict[str, Any]] = []
++    for kind, pos, text in plan:
++        out.append({"kind": str(kind), "pos": int(pos), "text": str(text)})
++    return out
++
++
++def _apply_injection_plan(turns: List[str], plan: Sequence[Dict[str, Any]]) -> List[str]:
++    out = list(turns)
++    for inj in sorted(plan, key=lambda d: (int(d.get("pos") or 0), str(d.get("kind") or ""))):
++        pos = int(inj.get("pos") or 0)
++        txt = str(inj.get("text") or "")
++        if not txt:
++            continue
++        if pos < 0:
++            pos = 0
++        if pos > len(out):
++            pos = len(out)
++        out.insert(pos, txt)
++    return list(out)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--world_manifest", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--tasks_total", type=int, default=20)
++    ap.add_argument("--stress_200", type=int, default=2)
++    # V118 focuses on "long but practical" windows (50–200) to keep smoke runtime bounded.
++    # Longer horizons are covered by V113+ smoke baselines.
++    ap.add_argument("--stress_500", type=int, default=0)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_path = Path(str(args.out))
++    _ensure_absent(out_path)
++
++    world_manifest = Path(str(args.world_manifest))
++    canon_path = _world_jsonl_path_from_manifest(world_manifest)
++    if not canon_path.exists():
++        _fail(f"missing_world_canonical_jsonl:{canon_path}")
++
++    tasks_total = int(args.tasks_total)
++    stress_200 = int(args.stress_200)
++    stress_500 = int(args.stress_500)
++    if tasks_total < 20:
++        _fail("tasks_total_too_small")
++    if stress_200 < 2:
++        _fail("stress_200_too_small")
++    if stress_500 < 0:
++        _fail("stress_500_negative")
++
++    # Build per-conversation user-turn buffers (deterministic, bounded).
++    conv_meta: Dict[str, Dict[str, Any]] = {}
++    conv_user_turns: Dict[str, List[str]] = {}
++    with open(canon_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            cid = str(obj.get("conversation_id") or "")
++            if not cid:
++                continue
++            idx = int(obj.get("global_turn_index") or 0)
++            role = str(obj.get("role") or "unknown")
++            txt = str(obj.get("text") or "")
++            m = conv_meta.get(cid)
++            if m is None:
++                m = {"conversation_id": cid, "start_turn": idx, "end_turn": idx, "turns_total": 0, "user_turns_total": 0}
++                conv_meta[cid] = m
++                conv_user_turns[cid] = []
++            m["turns_total"] = int(m.get("turns_total") or 0) + 1
++            if idx < int(m.get("start_turn") or idx):
++                m["start_turn"] = int(idx)
++            if idx > int(m.get("end_turn") or idx):
++                m["end_turn"] = int(idx)
++            if role == "user" and _is_safe_user_turn_text_v118(txt):
++                m["user_turns_total"] = int(m.get("user_turns_total") or 0) + 1
++                if _is_compatible_user_turn_text_v118(txt):
++                    m["compat_turns_total"] = int(m.get("compat_turns_total") or 0) + 1
++                buf = conv_user_turns[cid]
++                if len(buf) < 800:
++                    buf.append(str(txt))
++
++    convs: List[Dict[str, Any]] = list(conv_meta.values())
++    convs.sort(
++        key=lambda d: (
++            -int(d.get("compat_turns_total") or 0),
++            -int(d.get("user_turns_total") or 0),
++            str(d.get("conversation_id") or ""),
++        )
++    )
++
++    used_conv_ids: set = set()
++    tasks: List[Dict[str, Any]] = []
++    external_allocated = False
++
++    def _pick_conv(min_user_turns: int) -> Optional[Dict[str, Any]]:
++        for c in convs:
++            cid0 = str(c.get("conversation_id") or "")
++            if cid0 in used_conv_ids:
++                continue
++            if int(c.get("user_turns_total") or 0) < int(min_user_turns):
++                continue
++            used_conv_ids.add(cid0)
++            return dict(c)
++        return None
++
++    # Optional STRESS_500 tier (kept for compatibility, default disabled).
++    if stress_500 > 0:
++        conv_for_long = _pick_conv(200)
++        if conv_for_long is None:
++            _fail("not_enough_conversations_for_stress_500")
++        for _j in range(stress_500):
++            cid = str(conv_for_long.get("conversation_id") or "")
++            safe_turns = conv_user_turns.get(cid, [])
++            real_sample_n = min(60, len(safe_turns))
++            if real_sample_n < 20:
++                _fail("not_enough_user_turns_for_stress_500_sample")
++            base_turns = safe_turns[:real_sample_n]
++            plan = _injection_plan_for_task_v118(task_index=len(tasks), total_turns=500)
++            goal_turn = "goal: family7_v118 outcome=complete constraints=deterministic deadline=500"
++            user_turns = [goal_turn] + list(base_turns)
++            user_turns = _apply_injection_plan(user_turns, plan)
++            while len(user_turns) < 500:
++                user_turns.append("ok")
++            allow_external = bool(not external_allocated)
++            if allow_external:
++                external_allocated = True
++            tasks.append(
++                _make_task(
++                    "family7_dla_task_v118",
++                    {
++                        "seed": int(seed),
++                        "world_manifest": str(world_manifest.as_posix()),
++                        "conversation_id": str(cid),
++                        "stress_kind": "STRESS_500",
++                        "stress_turns": 500,
++                        "user_turns": list(user_turns[:500]),
++                        "require_fluency": True,
++                        "allow_external_world_once": bool(allow_external),
++                        "external_world_probe_reason_code": "validator_failed_fluency_contract",
++                        "injection_plan": list(plan),
++                    },
++                )
++            )
++
++    # STRESS_200 tier.
++    for _j in range(stress_200):
++        c = _pick_conv(40)
++        if c is None:
++            _fail("not_enough_conversations_for_stress_200")
++        cid = str(c.get("conversation_id") or "")
++        safe_turns = conv_user_turns.get(cid, [])
++        if len(safe_turns) < 12:
++            _fail("not_enough_user_turns_for_stress_200_sample")
++        real_sample_n = min(60, len(safe_turns))
++        base_turns = safe_turns[:real_sample_n]
++        plan = _injection_plan_for_task_v118(task_index=len(tasks), total_turns=200)
++        goal_turn = "goal: family7_v118 outcome=complete constraints=deterministic deadline=200"
++        user_turns = [goal_turn] + list(base_turns)
++        user_turns = _apply_injection_plan(user_turns, plan)
++        while len(user_turns) < 200:
++            user_turns.append("ok")
++        allow_external = bool(not external_allocated)
++        if allow_external:
++            external_allocated = True
++        tasks.append(
++            _make_task(
++                "family7_dla_task_v118",
++                {
++                    "seed": int(seed),
++                    "world_manifest": str(world_manifest.as_posix()),
++                    "conversation_id": str(cid),
++                    "stress_kind": "STRESS_200",
++                    "stress_turns": 200,
++                    "user_turns": list(user_turns[:200]),
++                    "require_fluency": True,
++                    "allow_external_world_once": bool(allow_external),
++                    "external_world_probe_reason_code": "validator_failed_fluency_contract",
++                    "injection_plan": list(plan),
++                },
++            )
++        )
++
++    # Fill remaining tasks with medium windows (50..150 user turns).
++    while len(tasks) < tasks_total:
++        c = _pick_conv(20)
++        if c is None:
++            break
++        cid = str(c.get("conversation_id") or "")
++        safe_turns = conv_user_turns.get(cid, [])
++        if len(safe_turns) < 8:
++            continue
++        # deterministic window length from seed+len(tasks)
++        wlen = 50 + ((int(seed) + int(len(tasks)) * 17) % 101)  # 50..150
++        real_sample_n = min(30, len(safe_turns))
++        base_turns = safe_turns[:real_sample_n]
++        plan = _injection_plan_for_task_v118(task_index=len(tasks), total_turns=int(wlen))
++        goal_turn = f"goal: family7_v118 outcome=complete constraints=deterministic deadline={int(wlen)}"
++        user_turns = [goal_turn] + list(base_turns)
++        user_turns = _apply_injection_plan(user_turns, plan)
++        while len(user_turns) < int(wlen):
++            user_turns.append("ok")
++        allow_external = bool(not external_allocated)
++        if allow_external:
++            external_allocated = True
++        tasks.append(
++            _make_task(
++                "family7_dla_task_v118",
++                {
++                    "seed": int(seed),
++                    "world_manifest": str(world_manifest.as_posix()),
++                    "conversation_id": str(cid),
++                    "stress_kind": "MID",
++                    "stress_turns": int(wlen),
++                    "user_turns": list(user_turns[: int(wlen)]),
++                    "require_fluency": True,
++                    "allow_external_world_once": bool(allow_external),
++                    "external_world_probe_reason_code": "validator_failed_fluency_contract",
++                    "injection_plan": list(plan),
++                },
++            )
++        )
++
++    if len(tasks) < tasks_total:
++        _fail("not_enough_conversations_for_medium_tasks")
++
++    tasks.sort(key=lambda d: (str(d.get("task_id") or "")))
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    with open(out_path, "x", encoding="utf-8") as f:
++        for t in tasks:
++            f.write(canonical_json_dumps(t))
++            f.write("\n")
++
++    manifest = {
++        "schema_version": 118,
++        "kind": "family7_tasks_manifest_v118",
++        "seed": int(seed),
++        "tasks_total": int(len(tasks)),
++        "world_manifest": str(world_manifest.as_posix()),
++        "world_canonical_jsonl": str(canon_path.as_posix()),
++        "world_manifest_sha256": _sha256_file(world_manifest),
++        "world_canonical_sha256": _sha256_file(canon_path),
++        "tasks_sha256": _sha256_file(out_path),
++    }
++    man_path = out_path.with_suffix(out_path.suffix + ".manifest.json")
++    _ensure_absent(man_path)
++    man_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 17:51:52
++++ scripts/run_family7_dla_v118.py	2026-01-15 16:39:51
+@@ -0,0 +1,469 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v118 import run_conversation_v118
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import (
++    EXTERNAL_WORLD_ACTION_SEARCH_V111,
++    EXTERNAL_WORLD_REASON_CODES_V111,
++    compute_external_world_chain_hash_v111,
++    verify_external_world_event_sig_chain_v111,
++)
++from atos_core.fluency_contract_v118 import fluency_contract_v118
++from atos_core.fluency_survival_v112 import fluency_survival_plan_v112, summarize_fluency_fail_code_v112
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++ACK_TO_CHOICE_LABEL_V112 = {
++    "ok",
++    "okay",
++    "certo",
++    "beleza",
++    "blz",
++    "continua",
++    "continue",
++    "segue",
++    "vai",
++    "faz",
++    "pode",
++    "sim",
++}
++
++
++def _canon_ack_token_v112(s: str) -> str:
++    t = str(s or "").strip().lower()
++    t = " ".join([x for x in t.split() if x])
++    return t
++
++
++def _choiceify_minimal_ack_v112(user_turn_texts: Sequence[str]) -> List[str]:
++    out: List[str] = []
++    for s in user_turn_texts:
++        cs = _canon_ack_token_v112(str(s))
++        if cs in ACK_TO_CHOICE_LABEL_V112:
++            out.append("A")
++        else:
++            out.append(str(s))
++    return out
++
++
++def _load_jsonl_payload_view(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if not isinstance(obj, dict):
++                continue
++            payload = obj.get("payload")
++            if not isinstance(payload, dict):
++                continue
++            out.append(dict(payload))
++    return out
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _compute_external_world_access_once_v113(
++    *,
++    world_manifest: str,
++    reason_code: str,
++    query: str,
++    seed: int,
++) -> List[Dict[str, Any]]:
++    evs, _ = external_world_access_v113(
++        allowed=True,
++        world_manifest=str(world_manifest),
++        action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++        reason_code=str(reason_code),
++        args={"query": str(query), "limit": 3, "roles": ["user"]},
++        seed=int(seed),
++        turn_index=0,
++        prev_event_sig="",
++    )
++    return list(evs)
++
++
++def _count_unresolved_reference_events(binding_events: Sequence[Dict[str, Any]]) -> int:
++    bad = 0
++    for ev in binding_events:
++        if not isinstance(ev, dict):
++            continue
++        t = str(ev.get("type") or "")
++        if t in {"BIND_MISS", "BIND_AMBIGUOUS"}:
++            bad += 1
++    return int(bad)
++
++
++def _unresolved_reference_final_from_flow(flow_events: Sequence[Dict[str, Any]]) -> int:
++    if not flow_events:
++        return 0
++    last = flow_events[-1] if isinstance(flow_events[-1], dict) else {}
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        return 0
++    return 1 if bool(flags.get("UNRESOLVED_REFERENCE")) else 0
++
++
++def _count_semantic_contradiction_flags(semantic_events: Sequence[Dict[str, Any]]) -> int:
++    cnt = 0
++    for ev in semantic_events:
++        if not isinstance(ev, dict):
++            continue
++        flags = ev.get("flags_v109")
++        if not isinstance(flags, dict):
++            continue
++        if bool(flags.get("CONTRADICTION_UNREPAIRED")):
++            cnt += 1
++    return int(cnt)
++
++
++def _write_external_world_ledger(*, task_dir: Path, events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    events_path = task_dir / "external_world_events.jsonl"
++    _ensure_absent(events_path)
++    if events:
++        with open(events_path, "x", encoding="utf-8") as f:
++            for e in events:
++                f.write(canonical_json_dumps(e))
++                f.write("\n")
++    else:
++        events_path.write_text("", encoding="utf-8")
++
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v111(list(events))
++    if not ok_sig:
++        _fail(f"external_world_sig_chain_fail:{reason_sig}")
++    chain_hash = compute_external_world_chain_hash_v111(list(events))
++    snap = {
++        "schema_version": 111,
++        "kind": "external_world_registry_snapshot_v111",
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++    }
++    snap_path = task_dir / "external_world_registry_snapshot_v111.json"
++    _write_once_json(snap_path, snap)
++    return {
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++        "external_world_events_jsonl": str(events_path),
++        "external_world_registry_snapshot_v111_json": str(snap_path),
++    }
++
++
++def _compute_freeze_manifest_v118(*, task_dir: Path, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    sha256_rel: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        pp = str(p or "")
++        sha256_rel[str(k)] = str(os.path.basename(pp)) if pp else ""
++        if pp and os.path.exists(pp):
++            sha256[str(k)] = _sha256_file(Path(pp))
++    body = {
++        "schema_version": 118,
++        "kind": "freeze_manifest_v118",
++        "sha256": dict(sha256),
++        "sha256_paths": dict(sha256_rel),
++    }
++    body["manifest_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", default="9999")
++    ap.add_argument("--max_rewrites", default="4")
++    ap.add_argument("--max_replans_per_turn", default="3")
++    ap.add_argument("--max_plan_attempts", default="8")
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_dir = Path(str(args.out))
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(str(args.tasks), "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        _fail("empty_tasks")
++
++    max_tasks = int(args.max_tasks)
++    max_rewrites = int(args.max_rewrites)
++    max_replans = int(args.max_replans_per_turn)
++    max_plan_attempts = int(args.max_plan_attempts)
++
++    results: List[Dict[str, Any]] = []
++    failures: List[Dict[str, Any]] = []
++
++    for i, task in enumerate(tasks[:max_tasks]):
++        if not isinstance(task, dict):
++            continue
++        task_id = str(task.get("task_id") or f"task_{i:03d}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        user_turn_texts = _choiceify_minimal_ack_v112(user_turn_texts)
++        require_fluency = bool(task.get("require_fluency", True))
++        allow_external = bool(task.get("allow_external_world_once", False))
++        world_manifest = str(task.get("world_manifest") or "")
++        probe_reason = str(task.get("external_world_probe_reason_code") or "validator_failed_fluency_contract")
++
++        task_dir = out_dir / "task_{i:03d}".format(i=i)
++        _ensure_absent(task_dir)
++        task_dir.mkdir(parents=True, exist_ok=False)
++
++        attempts: List[Dict[str, Any]] = []
++        chosen_attempt = -1
++
++        rewrite_seeds = fluency_survival_plan_v112(base_seed=int(seed), max_attempts=int(max_rewrites))
++        ext_used = False
++        ext_used_reason = ""
++        ext_events_final: List[Dict[str, Any]] = []
++
++        for a, seed_used in enumerate(rewrite_seeds):
++            attempt_dir = task_dir / "attempt_{a:03d}".format(a=a)
++            _ensure_absent(attempt_dir)
++            run_conversation_v118(
++                user_turn_texts=list(user_turn_texts),
++                out_dir=str(attempt_dir),
++                seed=int(seed_used),
++                max_replans_per_turn=int(max_replans),
++                max_plan_attempts=int(max_plan_attempts),
++            )
++
++            fr115 = _load_json(attempt_dir / "final_response_v115.json")
++            fr116 = _load_json(attempt_dir / "final_response_v116.json")
++            fr117 = _load_json(attempt_dir / "final_response_v117.json")
++            fr118 = _load_json(attempt_dir / "final_response_v118.json")
++
++            ok_gate = bool(fr115.get("ok", False)) if isinstance(fr115, dict) else False
++            gate_reason = str(fr115.get("reason") or "") if isinstance(fr115, dict) else "missing_final_response_v115"
++            ok_dialogue = bool(fr116.get("dialogue_survival_ok", False)) if isinstance(fr116, dict) else False
++            reason_dialogue = str(fr116.get("dialogue_survival_reason") or "") if isinstance(fr116, dict) else "missing_final_response_v116"
++            ok_v117 = bool(fr117.get("ok", False)) if isinstance(fr117, dict) else False
++            reason_v117 = str(fr117.get("reason") or "") if isinstance(fr117, dict) else "missing_final_response_v117"
++            ok_v118 = bool(fr118.get("ok", False)) if isinstance(fr118, dict) else False
++            reason_v118 = str(fr118.get("reason") or "") if isinstance(fr118, dict) else "missing_final_response_v118"
++
++            transcript_rows = _load_jsonl_payload_view(attempt_dir / "transcript.jsonl")
++            user_i = 0
++            transcript_view: List[Dict[str, Any]] = []
++            for r in transcript_rows:
++                role = str(r.get("role") or "")
++                text = str(r.get("text") or "")
++                if role == "user" and user_i < len(user_turn_texts):
++                    text = str(user_turn_texts[user_i])
++                    user_i += 1
++                transcript_view.append({"role": role, "text": text})
++
++            ok_fc, reason_fc, details_fc = fluency_contract_v118(transcript_view=transcript_view)
++            # Deterministic external world gating exercise: force probe on attempt 0 for the single allow_external task.
++            if allow_external and (not ext_used) and a == 0:
++                ok_fc = False
++                reason_fc = "forced_external_world_probe"
++
++            binding_events = _load_jsonl(attempt_dir / "binding_events.jsonl")
++            unresolved_refs_total = _count_unresolved_reference_events(binding_events)
++            flow_events = _load_jsonl(attempt_dir / "flow_events.jsonl")
++            unresolved_refs_final = _unresolved_reference_final_from_flow(flow_events)
++            semantic_events = _load_jsonl(attempt_dir / "semantic_events.jsonl")
++            contradiction_flags = _count_semantic_contradiction_flags(semantic_events)
++
++            ok_unresolved = unresolved_refs_final == 0
++            ok_semantic = contradiction_flags == 0
++
++            ok_attempt = bool(ok_gate) and bool(ok_unresolved) and bool(ok_semantic) and bool(ok_dialogue) and bool(ok_v117) and bool(ok_v118)
++            if require_fluency:
++                ok_attempt = bool(ok_attempt) and bool(ok_fc)
++
++            attempts.append(
++                {
++                    "attempt_index": int(a),
++                    "seed_used": int(seed_used),
++                    "ok_gate_v115": bool(ok_gate),
++                    "reason_gate_v115": str(gate_reason),
++                    "ok_dialogue_survival_v116": bool(ok_dialogue),
++                    "reason_dialogue_survival_v116": str(reason_dialogue),
++                    "ok_final_v117": bool(ok_v117),
++                    "reason_final_v117": str(reason_v117),
++                    "ok_final_v118": bool(ok_v118),
++                    "reason_final_v118": str(reason_v118),
++                    "ok_fluency": bool(ok_fc),
++                    "reason_fluency": str(summarize_fluency_fail_code_v112(str(reason_fc))),
++                    "unresolved_reference_events_total": int(unresolved_refs_total),
++                    "unresolved_reference_final": int(unresolved_refs_final),
++                    "semantic_contradiction_flags_total": int(contradiction_flags),
++                    "fluency_details": dict(details_fc) if isinstance(details_fc, dict) else {},
++                }
++            )
++
++            if allow_external and (not ext_used) and (not ok_fc) and world_manifest and str(probe_reason) in set(EXTERNAL_WORLD_REASON_CODES_V111):
++                ext_events_final = _compute_external_world_access_once_v113(
++                    world_manifest=str(world_manifest),
++                    reason_code=str(probe_reason),
++                    query="não invente",
++                    seed=int(seed),
++                )
++                ext_used = True
++                ext_used_reason = str(probe_reason)
++
++            if ok_attempt:
++                chosen_attempt = int(a)
++                break
++
++        _write_once_json(
++            task_dir / "fluency_survival_v118.json",
++            {
++                "schema_version": 118,
++                "task_id": str(task_id),
++                "chosen_attempt_index": int(chosen_attempt),
++                "attempts": list(attempts),
++                "external_world_used": bool(ext_used),
++                "external_world_used_reason_code": str(ext_used_reason),
++            },
++        )
++
++        ext_info = _write_external_world_ledger(task_dir=task_dir, events=list(ext_events_final))
++
++        chosen_dir = task_dir / "attempt_{a:03d}".format(a=(chosen_attempt if chosen_attempt >= 0 else (len(attempts) - 1)))
++
++        sha256_paths: Dict[str, str] = {
++            "task_fluency_survival": str(task_dir / "fluency_survival_v118.json"),
++            "attempt_final_response_v118": str(chosen_dir / "final_response_v118.json"),
++            "attempt_final_response_v117": str(chosen_dir / "final_response_v117.json"),
++            "attempt_final_response_v116": str(chosen_dir / "final_response_v116.json"),
++            "attempt_final_response_v115": str(chosen_dir / "final_response_v115.json"),
++            "attempt_goal_plan_eval_summary_v116": str(chosen_dir / "goal_plan_eval_summary_v116.json"),
++            "attempt_replan_trace_v117": str(chosen_dir / "replan_trace_v117.json"),
++            "attempt_transcript": str(chosen_dir / "transcript.jsonl"),
++            "external_world_events": str(ext_info.get("external_world_events_jsonl") or ""),
++            "external_world_snapshot": str(ext_info.get("external_world_registry_snapshot_v111_json") or ""),
++        }
++
++        manifest = _compute_freeze_manifest_v118(task_dir=task_dir, sha256_paths=sha256_paths)
++        _write_once_json(task_dir / "freeze_manifest_v118.json", manifest)
++
++        ok_task = chosen_attempt >= 0
++        if ok_task:
++            results.append(
++                {
++                    "task_id": str(task_id),
++                    "ok": True,
++                    "chosen_attempt_index": int(chosen_attempt),
++                    "external_world_events_total": int(ext_info.get("events_total") or 0),
++                }
++            )
++        else:
++            failures.append(
++                {
++                    "task_id": str(task_id),
++                    "ok": False,
++                    "chosen_attempt_index": int(chosen_attempt),
++                    "attempts": list(attempts),
++                    "external_world_events_total": int(ext_info.get("events_total") or 0),
++                }
++            )
++            results.append({"task_id": str(task_id), "ok": False, "external_world_events_total": int(ext_info.get("events_total") or 0)})
++
++    tasks_total = len([t for t in tasks[:max_tasks] if isinstance(t, dict)])
++    tasks_ok = len([r for r in results if isinstance(r, dict) and bool(r.get("ok", False))])
++
++    eval_obj = {
++        "schema_version": 118,
++        "kind": "family7_eval_v118",
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "results": list(results),
++        "failures": list(failures),
++    }
++    _write_once_json(out_dir / "eval.json", eval_obj)
++    eval_sha256 = _sha256_file(out_dir / "eval.json")
++
++    summary_obj = {
++        "schema_version": 118,
++        "kind": "family7_summary_v118",
++        "seed": int(seed),
++        "tasks_total": int(tasks_total),
++        "tasks_ok": int(tasks_ok),
++        "eval_sha256": str(eval_sha256),
++    }
++    _write_once_json(out_dir / "summary.json", summary_obj)
++
++    fail_catalog = {
++        "schema_version": 118,
++        "kind": "fail_catalog_v118",
++        "failures_total": int(len(failures)),
++        "failures": list(failures[:20]),
++    }
++    _write_once_json(out_dir / "fail_catalog_v118.json", fail_catalog)
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-15 17:51:52
++++ scripts/smoke_v118_family7_long_dialogue_world.py	2026-01-15 17:44:04
+@@ -0,0 +1,205 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import EXTERNAL_WORLD_ACTION_SEARCH_V111
++
++
++MIN_TASKS_OK_V118 = 5
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    env = dict(os.environ)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v118.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(seed),
++        "--max_tasks",
++        "9999",
++        "--max_rewrites",
++        "4",
++        "--max_replans_per_turn",
++        "3",
++        "--max_plan_attempts",
++        "8",
++    ]
++    p = subprocess.run(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
++    if p.returncode != 0:
++        raise SystemExit("runner_failed:\nSTDOUT:\n{out}\nSTDERR:\n{err}".format(out=p.stdout, err=p.stderr))
++
++
++def _negative_tests(*, world_manifest: str) -> Dict[str, Any]:
++    ok1 = False
++    reason1 = ""
++    try:
++        external_world_access_v113(
++            allowed=False,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="validator_failed_fluency_contract",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok1 = True
++    except ValueError as e:
++        reason1 = str(e)
++
++    ok2 = False
++    reason2 = ""
++    try:
++        external_world_access_v113(
++            allowed=True,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="invalid_reason_code_x",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok2 = True
++    except ValueError as e:
++        reason2 = str(e)
++
++    return {
++        "access_not_allowed": {"ok": bool(ok1), "reason": str(reason1)},
++        "invalid_reason_code": {"ok": bool(ok2), "reason": str(reason2)},
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_base = Path(str(args.out_base))
++
++    out_obj: Dict[str, Any] = {"ok": False, "schema_version": 118, "seed": int(seed)}
++    try:
++        tasks: List[Dict[str, Any]] = []
++        with open(tasks_path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                tasks.append(json.loads(line))
++        if not tasks:
++            raise SystemExit("empty_tasks")
++        world_manifest = str(tasks[0].get("world_manifest") or "")
++
++        neg = _negative_tests(world_manifest=world_manifest)
++        out_obj["negative_tests"] = dict(neg)
++        if neg["access_not_allowed"]["reason"] != "external_world_access_not_allowed":
++            raise SystemExit("negative_failed:access_not_allowed")
++        if neg["invalid_reason_code"]["reason"] != "invalid_reason_code":
++            raise SystemExit("negative_failed:invalid_reason_code")
++
++        out1 = Path(str(out_base) + "_try1")
++        out2 = Path(str(out_base) + "_try2")
++        out_obj["try1_dir"] = str(out1)
++        out_obj["try2_dir"] = str(out2)
++
++        _run_runner(tasks=tasks_path, out_dir=out1, seed=seed)
++        _run_runner(tasks=tasks_path, out_dir=out2, seed=seed)
++
++        s1 = _load_json(out1 / "summary.json")
++        s2 = _load_json(out2 / "summary.json")
++        eval_sha1 = str(s1.get("eval_sha256") or "")
++        eval_sha2 = str(s2.get("eval_sha256") or "")
++        if eval_sha1 != eval_sha2:
++            raise SystemExit("determinism_failed:eval_sha")
++
++        ev1 = _load_json(out1 / "eval.json")
++        ev2 = _load_json(out2 / "eval.json")
++        if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++            raise SystemExit("determinism_failed:eval_json")
++
++        res1 = ev1.get("results") if isinstance(ev1.get("results"), list) else []
++        ext_counts = [int(r.get("external_world_events_total") or 0) for r in res1 if isinstance(r, dict)]
++        if sum(1 for c in ext_counts if c == 1) != 1:
++            raise SystemExit("external_world_in_cycle_expected_one_call")
++
++        tasks_ok = int(ev1.get("tasks_ok") or 0)
++        tasks_total = int(ev1.get("tasks_total") or 0)
++        if tasks_ok < int(MIN_TASKS_OK_V118):
++            raise SystemExit("tasks_ok_below_min_ok")
++
++        core = {
++            "schema_version": 118,
++            "seed": int(seed),
++            "try1": {"eval_sha256": eval_sha1, "tasks_ok": int(s1.get("tasks_ok") or 0), "tasks_total": int(s1.get("tasks_total") or 0)},
++            "try2": {"eval_sha256": eval_sha2, "tasks_ok": int(s2.get("tasks_ok") or 0), "tasks_total": int(s2.get("tasks_total") or 0)},
++            "min_ok": int(MIN_TASKS_OK_V118),
++            "negative_tests": dict(neg),
++        }
++        summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++        out_obj = {
++            "ok": True,
++            "determinism_ok": True,
++            "schema_version": 118,
++            "seed": int(seed),
++            "summary_sha256": str(summary_sha256),
++            "core": core,
++            "try1_dir": str(out1),
++            "try2_dir": str(out2),
++            "sha256_eval_json": _sha256_file(out1 / "eval.json"),
++            "negative_tests": dict(neg),
++        }
++        print(json.dumps(out_obj, ensure_ascii=False, indent=2, sort_keys=True))
++        return
++    except SystemExit as e:
++        out_obj["reason"] = str(e)
++    except Exception as e:  # pragma: no cover
++        out_obj["reason"] = "exception:" + e.__class__.__name__
++        out_obj["details"] = {"msg": str(e)}
++    print(json.dumps(out_obj, ensure_ascii=False, indent=2, sort_keys=True))
++    raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 17:51:52
++++ scripts/smoke_v118_replan_law.py	2026-01-15 16:42:01
+@@ -0,0 +1,397 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.ato_v71 import ATOv71
++from atos_core.goal_persistence_v115 import render_fail_response_v115
++from atos_core.mind_graph_v71 import MindGraphV71
++from atos_core.replan_law_v118 import (
++    PlanCandidateV118,
++    REPLAN_REASON_EXHAUSTED_PLANS_V118,
++    REPLAN_REASON_OK_V118,
++    REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118,
++    ReplanResultV118,
++    replan_until_satisfies_v118,
++    write_replan_trace_v118,
++)
++
++
++def _fail(msg: str) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(2)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _make_turn_obs(turn_id: str, *, step: int) -> ATOv71:
++    return ATOv71(
++        ato_id=str(turn_id),
++        ato_type="OBS",
++        subgraph={"schema_version": 118, "kind": "turn_obs_v118"},
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[],
++        invariants={"schema_version": 118, "obs_kind": "turn_v118"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _make_goal(goal_id: str, *, turn_id: str, step: int) -> ATOv71:
++    return ATOv71(
++        ato_id=str(goal_id),
++        ato_type="GOAL",
++        subgraph={"schema_version": 118, "kind": "goal_demo_v118", "turn_id": str(turn_id)},
++        slots={},
++        bindings={},
++        cost=1.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(turn_id)}],
++        invariants={"schema_version": 118, "goal_kind": "demo"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _make_plan(plan_id: str, *, turn_id: str, step: int) -> ATOv71:
++    return ATOv71(
++        ato_id=str(plan_id),
++        ato_type="PLAN",
++        subgraph={"schema_version": 118, "kind": "plan_demo_v118", "turn_id": str(turn_id)},
++        slots={},
++        bindings={},
++        cost=1.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(turn_id)}],
++        invariants={"schema_version": 118, "plan_kind": "demo"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _make_fail_event(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    reason_code: str,
++    step: int,
++    evidence: Dict[str, Any],
++) -> ATOv71:
++    sem = {
++        "schema_version": 118,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": str(reason_code),
++        "evidence": dict(evidence),
++    }
++    fail_id = "fail_event_v118_" + sha256_hex(canonical_json_dumps(sem).encode("utf-8"))
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(sem, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}],
++        invariants={"schema_version": 118, "eval_kind": "FAIL_EVENT_V118"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _write_final_response_v118(path: Path, *, ok: bool, reason: str) -> Dict[str, Any]:
++    fail_text = ""
++    if not ok:
++        fail_text = render_fail_response_v115(str(reason))
++    obj = {
++        "schema_version": 118,
++        "kind": "final_response_v118",
++        "ok": bool(ok),
++        "reason": str(reason if not ok else "ok"),
++        "fail_response_text": str(fail_text),
++    }
++    obj["final_sig"] = sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++    _write_once_json(path, obj)
++    return dict(obj)
++
++
++def _run_case_first_fails_second_passes(case_dir: Path) -> Dict[str, Any]:
++    _ensure_absent(case_dir)
++    case_dir.mkdir(parents=True, exist_ok=False)
++    goal_id = "goal_demo_v118"
++    turn_id = "turn_user_0"
++    conversation_id = "conv_demo_v118"
++    step0 = 0
++
++    plans: List[PlanCandidateV118] = [
++        PlanCandidateV118(plan_id="planA", plan_cost=1.0, plan_sem_sig={"p": "A"}),
++        PlanCandidateV118(plan_id="planB", plan_cost=1.0, plan_sem_sig={"p": "B"}),
++    ]
++
++    def next_plan() -> Optional[PlanCandidateV118]:
++        return plans.pop(0) if plans else None
++
++    def exec_plan(p: PlanCandidateV118):
++        if p.plan_id == "planA":
++            return False, True, "planA_failed"
++        return True, True, ""
++
++    res: ReplanResultV118 = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=8)
++    if not res.ok:
++        _fail("case_first_fails_second_passes_expected_ok")
++
++    trace_obj = write_replan_trace_v118(path=str(case_dir / "replan_trace_v118.json"), goal_id=str(goal_id), result=res)
++    _write_final_response_v118(case_dir / "final_response_v118.json", ok=True, reason="ok")
++
++    mg = MindGraphV71(run_dir=str(case_dir / "mind_graph_v118"))
++    mg.add_node(step=step0, ato=_make_turn_obs(turn_id, step=step0), reason="turn_obs")
++    mg.add_node(step=step0, ato=_make_goal(goal_id, turn_id=turn_id, step=step0), reason="goal")
++    mg.add_node(step=step0, ato=_make_plan("planA", turn_id=turn_id, step=step0), reason="plan")
++    mg.add_node(step=step0, ato=_make_plan("planB", turn_id=turn_id, step=step0), reason="plan")
++
++    # One FAIL_EVENT for planA failure.
++    fail = _make_fail_event(
++        conversation_id=conversation_id,
++        user_turn_id=turn_id,
++        goal_ato_id=goal_id,
++        plan_ato_id="planA",
++        reason_code="planA_failed",
++        step=step0,
++        evidence={"trace_sig": str(trace_obj.get("trace_sig") or ""), "attempt_index": 0},
++    )
++    mg.add_node(step=step0, ato=fail, reason="fail_event")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(goal_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->goal")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id="planA", edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->plan")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(turn_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->turn")
++
++    chains = mg.verify_chains()
++    if not bool(chains.get("mind_nodes_chain_ok")) or not bool(chains.get("mind_edges_chain_ok")):
++        _fail("case_first_fails_second_passes_mind_graph_chain_fail")
++
++    return {"ok": True, "reason": REPLAN_REASON_OK_V118, "attempts_total": int(res.attempts_total), "trace_sig": str(trace_obj.get("trace_sig") or "")}
++
++
++def _run_case_exhausted(case_dir: Path) -> Dict[str, Any]:
++    _ensure_absent(case_dir)
++    case_dir.mkdir(parents=True, exist_ok=False)
++    goal_id = "goal_demo_exhausted_v118"
++    turn_id = "turn_user_0"
++    conversation_id = "conv_demo_v118"
++    step0 = 0
++
++    plans: List[PlanCandidateV118] = [
++        PlanCandidateV118(plan_id="planA", plan_cost=1.0, plan_sem_sig={"p": "A"}),
++    ]
++
++    def next_plan() -> Optional[PlanCandidateV118]:
++        return plans.pop(0) if plans else None
++
++    def exec_plan(_p: PlanCandidateV118):
++        return False, True, "failed"
++
++    res = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=8)
++    if res.ok or res.reason != REPLAN_REASON_EXHAUSTED_PLANS_V118:
++        _fail("case_exhausted_expected_exhausted_plans")
++
++    trace_obj = write_replan_trace_v118(path=str(case_dir / "replan_trace_v118.json"), goal_id=str(goal_id), result=res)
++    _write_final_response_v118(case_dir / "final_response_v118.json", ok=False, reason=REPLAN_REASON_EXHAUSTED_PLANS_V118)
++
++    mg = MindGraphV71(run_dir=str(case_dir / "mind_graph_v118"))
++    mg.add_node(step=step0, ato=_make_turn_obs(turn_id, step=step0), reason="turn_obs")
++    mg.add_node(step=step0, ato=_make_goal(goal_id, turn_id=turn_id, step=step0), reason="goal")
++    mg.add_node(step=step0, ato=_make_plan("planA", turn_id=turn_id, step=step0), reason="plan")
++
++    fail = _make_fail_event(
++        conversation_id=conversation_id,
++        user_turn_id=turn_id,
++        goal_ato_id=goal_id,
++        plan_ato_id="planA",
++        reason_code="failed",
++        step=step0,
++        evidence={"trace_sig": str(trace_obj.get("trace_sig") or ""), "attempt_index": 0},
++    )
++    mg.add_node(step=step0, ato=fail, reason="fail_event")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(goal_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->goal")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id="planA", edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->plan")
++    mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(turn_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->turn")
++    chains = mg.verify_chains()
++    if not bool(chains.get("mind_nodes_chain_ok")) or not bool(chains.get("mind_edges_chain_ok")):
++        _fail("case_exhausted_mind_graph_chain_fail")
++
++    return {"ok": False, "reason": REPLAN_REASON_EXHAUSTED_PLANS_V118, "attempts_total": int(res.attempts_total), "trace_sig": str(trace_obj.get("trace_sig") or "")}
++
++
++def _run_case_budget_exhausted(case_dir: Path) -> Dict[str, Any]:
++    _ensure_absent(case_dir)
++    case_dir.mkdir(parents=True, exist_ok=False)
++    goal_id = "goal_demo_budget_v118"
++    turn_id = "turn_user_0"
++    conversation_id = "conv_demo_v118"
++    step0 = 0
++
++    plans: List[PlanCandidateV118] = []
++    for i in range(100):
++        plans.append(PlanCandidateV118(plan_id=f"plan{i}", plan_cost=1.0, plan_sem_sig={"p": f"{i}"}))
++
++    def next_plan() -> Optional[PlanCandidateV118]:
++        return plans.pop(0) if plans else None
++
++    def exec_plan(_p: PlanCandidateV118):
++        return False, True, "failed"
++
++    res = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=3)
++    if res.ok or res.reason != REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118 or res.attempts_total != 3:
++        _fail("case_budget_exhausted_expected_budget")
++
++    trace_obj = write_replan_trace_v118(path=str(case_dir / "replan_trace_v118.json"), goal_id=str(goal_id), result=res)
++    _write_final_response_v118(case_dir / "final_response_v118.json", ok=False, reason=REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118)
++
++    mg = MindGraphV71(run_dir=str(case_dir / "mind_graph_v118"))
++    mg.add_node(step=step0, ato=_make_turn_obs(turn_id, step=step0), reason="turn_obs")
++    mg.add_node(step=step0, ato=_make_goal(goal_id, turn_id=turn_id, step=step0), reason="goal")
++    for i in range(3):
++        mg.add_node(step=step0, ato=_make_plan(f"plan{i}", turn_id=turn_id, step=step0), reason="plan")
++
++    # Fail events for each attempt.
++    for idx in range(3):
++        fail = _make_fail_event(
++            conversation_id=conversation_id,
++            user_turn_id=turn_id,
++            goal_ato_id=goal_id,
++            plan_ato_id=f"plan{idx}",
++            reason_code="failed",
++            step=step0,
++            evidence={"trace_sig": str(trace_obj.get("trace_sig") or ""), "attempt_index": int(idx)},
++        )
++        mg.add_node(step=step0, ato=fail, reason="fail_event")
++        mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(goal_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->goal")
++        mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=f"plan{idx}", edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->plan")
++        mg.add_edge(step=step0, src_ato_id=str(fail.ato_id), dst_ato_id=str(turn_id), edge_type="DERIVED_FROM", evidence_refs=[], reason="fail->turn")
++
++    chains = mg.verify_chains()
++    if not bool(chains.get("mind_nodes_chain_ok")) or not bool(chains.get("mind_edges_chain_ok")):
++        _fail("case_budget_exhausted_mind_graph_chain_fail")
++
++    return {"ok": False, "reason": REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118, "attempts_total": int(res.attempts_total), "trace_sig": str(trace_obj.get("trace_sig") or "")}
++
++
++def _compute_case_sha256(case_dir: Path) -> str:
++    # Stable hash of key outputs in the case directory.
++    paths = [
++        case_dir / "final_response_v118.json",
++        case_dir / "replan_trace_v118.json",
++        case_dir / "mind_graph_v118" / "mind_nodes.jsonl",
++        case_dir / "mind_graph_v118" / "mind_edges.jsonl",
++    ]
++    body: Dict[str, str] = {}
++    for p in paths:
++        body[str(p.name)] = _sha256_file(p)
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_base = Path(str(args.out_base))
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    for od in [out1, out2]:
++        _ensure_absent(od)
++        od.parent.mkdir(parents=True, exist_ok=True)
++        od.mkdir(parents=True, exist_ok=False)
++
++        # Three deterministic cases.
++        c1 = _run_case_first_fails_second_passes(od / "case_first_fails_second_passes")
++        c2 = _run_case_exhausted(od / "case_exhausted_plans")
++        c3 = _run_case_budget_exhausted(od / "case_budget_exhausted")
++
++        eval_obj = {
++            "schema_version": 118,
++            "kind": "smoke_eval_v118_replan_law",
++            "seed": int(seed),
++            "cases": {"first_fails_second_passes": dict(c1), "exhausted_plans": dict(c2), "budget_exhausted": dict(c3)},
++            "cases_sha256": {
++                "first_fails_second_passes": _compute_case_sha256(od / "case_first_fails_second_passes"),
++                "exhausted_plans": _compute_case_sha256(od / "case_exhausted_plans"),
++                "budget_exhausted": _compute_case_sha256(od / "case_budget_exhausted"),
++            },
++        }
++        _write_once_json(od / "eval.json", eval_obj)
++        eval_sha = _sha256_file(od / "eval.json")
++        summary_obj = {
++            "schema_version": 118,
++            "kind": "smoke_summary_v118_replan_law",
++            "seed": int(seed),
++            "eval_sha256": str(eval_sha),
++        }
++        _write_once_json(od / "summary.json", summary_obj)
++        fail_catalog = {"schema_version": 118, "kind": "fail_catalog_v118_replan_law", "failures_total": 0, "failures": []}
++        _write_once_json(od / "fail_catalog_v118.json", fail_catalog)
++
++    # Determinism check.
++    ev1 = json.loads((out1 / "eval.json").read_text(encoding="utf-8"))
++    ev2 = json.loads((out2 / "eval.json").read_text(encoding="utf-8"))
++    if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++        _fail("determinism_failed:eval_json")
++
++    core = {
++        "schema_version": 118,
++        "seed": int(seed),
++        "eval_sha256": _sha256_file(out1 / "eval.json"),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(summary_sha256),
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++        "sha256_eval_json": _sha256_file(out1 / "eval.json"),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-15 17:51:52
++++ tests/test_replan_law_v118.py	2026-01-15 16:42:30
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++import unittest
++from typing import List, Optional
++
++from atos_core.replan_law_v118 import (
++    PlanCandidateV118,
++    REPLAN_REASON_EXHAUSTED_PLANS_V118,
++    REPLAN_REASON_OK_V118,
++    REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118,
++    replan_until_satisfies_v118,
++)
++
++
++class TestReplanLawV118(unittest.TestCase):
++    def test_first_fails_second_passes(self) -> None:
++        plans: List[PlanCandidateV118] = [
++            PlanCandidateV118(plan_id="planA_direct_answer", plan_cost=1.0, plan_sem_sig={"k": "A"}),
++            PlanCandidateV118(plan_id="planB_ask_clarify", plan_cost=1.0, plan_sem_sig={"k": "B"}),
++        ]
++
++        def next_plan() -> Optional[PlanCandidateV118]:
++            return plans.pop(0) if plans else None
++
++        def exec_plan(p: PlanCandidateV118):
++            if p.plan_id == "planA_direct_answer":
++                return False, True, "direct_answer_failed"
++            return True, True, ""
++
++        res = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=8)
++        self.assertTrue(res.ok)
++        self.assertEqual(res.reason, REPLAN_REASON_OK_V118)
++        self.assertEqual(res.attempts_total, 2)
++        self.assertEqual(res.attempts[-1].plan_id, "planB_ask_clarify")
++        self.assertTrue(res.attempts[-1].eval_satisfies)
++        self.assertTrue(res.attempts[-1].dialogue_survival_ok)
++
++    def test_exhausted_plans(self) -> None:
++        plans: List[PlanCandidateV118] = [
++            PlanCandidateV118(plan_id="planA", plan_cost=1.0, plan_sem_sig={"k": "A"}),
++        ]
++
++        def next_plan() -> Optional[PlanCandidateV118]:
++            return plans.pop(0) if plans else None
++
++        def exec_plan(_p: PlanCandidateV118):
++            return False, True, "failed"
++
++        res = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=8)
++        self.assertFalse(res.ok)
++        self.assertEqual(res.reason, REPLAN_REASON_EXHAUSTED_PLANS_V118)
++        self.assertEqual(res.attempts_total, 1)
++
++    def test_budget_exhausted(self) -> None:
++        plans: List[PlanCandidateV118] = [
++            PlanCandidateV118(plan_id="planA", plan_cost=1.0, plan_sem_sig={"k": "A"}),
++            PlanCandidateV118(plan_id="planB", plan_cost=1.0, plan_sem_sig={"k": "B"}),
++            PlanCandidateV118(plan_id="planC", plan_cost=1.0, plan_sem_sig={"k": "C"}),
++            PlanCandidateV118(plan_id="planD", plan_cost=1.0, plan_sem_sig={"k": "D"}),
++        ]
++
++        def next_plan() -> Optional[PlanCandidateV118]:
++            return plans.pop(0) if plans else None
++
++        def exec_plan(_p: PlanCandidateV118):
++            return False, True, "failed"
++
++        res = replan_until_satisfies_v118(next_plan=next_plan, exec_plan=exec_plan, max_attempts=3)
++        self.assertFalse(res.ok)
++        self.assertEqual(res.reason, REPLAN_REASON_PLAN_SEARCH_BUDGET_EXHAUSTED_V118)
++        self.assertEqual(res.attempts_total, 3)
++
++
++if __name__ == "__main__":
++    unittest.main()
++

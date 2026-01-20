@@ -1,0 +1,42 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         mode_policy: Optional[Act] = None
+         rewrite_rules: List[Act] = []
+         selector: Optional[Act] = None
+         unigram: Optional[Act] = None
++        macro_router: Optional[Act] = None
+ 
+         for act in acts:
+             if act.kind == "predictor":
+                 predictors.append(act)
+                 table_id = str(act.evidence.get("table_id", act.id))
+@@
+                 mode_selectors.append(act)
+             elif act.kind == "mode_policy" and mode_policy is None:
+                 mode_policy = act
+             elif act.kind == "selector" and selector is None:
+                 selector = act
++            elif act.kind == "compressor" and macro_router is None:
++                ev = act.evidence
++                if isinstance(ev, dict) and str(ev.get("name") or "") == "macro_router_v0":
++                    macro_router = act
+@@
+-        self._predictors = sorted(predictors, key=_act_order)
++        self._predictors = sorted(predictors, key=_act_order)
++        self._predictor_by_id = {str(a.id): a for a in self._predictors}
++        self._predictor_order = {str(a.id): i for i, a in enumerate(self._predictors)}
+         self._mode_selectors = sorted(
+             mode_selectors, key=lambda a: (str(a.evidence.get("mode", "")), a.id)
+         )
+         self._mode_policy = mode_policy
+         self._rewrite_rules = sorted(rewrite_rules, key=lambda a: a.id)
+         self._selector = selector
+         self._unigram = unigram
++        self._macro_router = macro_router
++        self._macro_router_table = None
++        if macro_router is not None:
++            ev = macro_router.evidence
++            if isinstance(ev, dict) and isinstance(ev.get("table"), dict):
++                self._macro_router_table = ev.get("table")
+*** End Patch

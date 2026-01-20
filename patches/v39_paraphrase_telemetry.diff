@@ -1,0 +1,337 @@
+--- patches/v39_base/engine.py	2026-01-10 22:04:32
++++ atos_core/engine.py	2026-01-10 22:08:50
+@@ -725,6 +725,11 @@
+                     exact_pats = [
+                         re.compile(r"(?is)^\s*responda\s+exatamente\s*:\s*(.+?)\s*$"),
+                         re.compile(r"(?is)^\s*retorne\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
++                        re.compile(r"(?is)^\s*devolva\s+exatamente\s*:\s*(.+?)\s*$"),
++                        re.compile(r"(?is)^\s*devolva\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
++                        re.compile(
++                            r"(?is)^\s*(?:responda|retorne|devolva|exiba|escreva)\s+(?:somente|apenas)\s*(?:com)?\s*:\s*(.+?)\s*$"
++                        ),
+                     ]
+                     for pat in exact_pats:
+                         m = pat.match(u)
+@@ -740,7 +745,15 @@
+                                 contract_meta["reason"] = contract_reason
+                             break
+ 
+-                    if not contract_tokens and re.search(r"(?i)\bjson\b", u) and re.search(r"(?i)\bapenas\b", u):
++                    if (
++                        not contract_tokens
++                        and re.search(r"(?i)\bjson\b", u)
++                        and (
++                            re.search(r"(?i)\bapenas\b", u)
++                            or re.search(r"(?i)\bsomente\b", u)
++                            or re.search(r"(?i)sem\s+texto\s+extra", u)
++                        )
++                    ):
+                         required_keys: List[str] = []
+                         m_keys = re.search(r'(?i)chaves\s+"([^"]+)"\s+e\s+"([^"]+)"', u)
+                         if m_keys:
+@@ -784,8 +797,13 @@
+ 
+                     if (
+                         not contract_tokens
+-                        and re.search(r"(?i)n[úu]mero\s+inteiro", u)
+-                        and re.search(r"(?i)\bapenas\b", u)
++                        and re.search(r"(?i)\bn[úu]mero\b", u)
++                        and (
++                            re.search(r"(?i)\bapenas\b", u)
++                            or re.search(r"(?i)\bsomente\b", u)
++                            or re.search(r"(?i)\bs[oó]\b", u)
++                            or re.search(r"(?i)\bso\b", u)
++                        )
+                     ):
+                         m = re.search(r"(-?\d+)\s*([+\-*/])\s*(-?\d+)", u)
+                         if not m:
+@@ -865,8 +883,11 @@
+                                 contract_meta["reason"] = contract_reason
+ 
+                     if not contract_tokens:
+-                        m = re.search(r"(?i)qual\s+é\s+a\s+senha\b", u) or re.search(
+-                            r"(?i)repita\s+a\s+senha\b", u
++                        m = (
++                            re.search(r"(?i)qual\s+é\s+a\s+senha\b", u)
++                            or re.search(r"(?i)qual\s+a\s+senha\b", u)
++                            or re.search(r"(?i)repita\s+a\s+senha\b", u)
++                            or re.search(r"(?i)diga\s+a\s+senha\b", u)
+                         )
+                         if m:
+                             key = _mem_key("senha")
+@@ -886,9 +907,12 @@
+                         m = re.search(
+                             r"(?i)em\s+que\s+ano\s+([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\s+nasceu\b",
+                             u,
++                        ) or re.search(
++                            r"(?i)ano\s+de\s+nascimento\s+(?:de|da|do)\s+([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\b",
++                            u,
+                         )
+                         if m:
+-                            ent = str(m.group(1))
++                            ent = _strip_edge_punct(str(m.group(1)))
+                             key = _mem_key("born_year", ent.lower())
+                             year = _mem_get(key)
+                             if year is not None:
+@@ -903,7 +927,9 @@
+                                 contract_meta["reason"] = "missing_birth_year"
+ 
+                     if not contract_tokens:
+-                        if re.search(r"(?i)repita\s+a\s+palavra[- ]c[óo]digo\b", u):
++                        if re.search(r"(?i)repita\s+a\s+palavra[- ]c[óo]digo\b", u) or re.search(
++                            r"(?i)repita\s+o\s+c[óo]digo\b", u
++                        ):
+                             key = _mem_key("code")
+                             code = _mem_get(key)
+                             if code is not None:
+@@ -918,19 +944,24 @@
+                                 contract_meta["reason"] = "missing_code"
+ 
+                     if not contract_tokens:
+-                        m = re.search(r"(?i)\binclua\s+([A-Za-z0-9_-]+)\b", u)
++                        m = re.search(r"(?i)\binclua\b", u)
+                         if m:
+-                            tok = _strip_edge_punct(m.group(1))
+-                            if tok and re.fullmatch(r"[A-Z0-9_-]{2,}", tok) is not None:
+-                                contract_tokens = tokenize_text(tok)
+-                                contract_kind = "contains_token"
+-                                contract_reason = "include_token"
+-                                contract_meta["used"] = True
+-                                contract_meta["kind"] = contract_kind
+-                                contract_meta["parsed_args"] = {"token": tok}
+-                                contract_meta["reason"] = contract_reason
+-                            elif tok:
+-                                contract_meta["reason"] = "include_token_rejected"
++                            after = u[m.end() :]
++                            m_tok = re.search(r"\b([A-Z0-9_-]{2,})\b", after)
++                            if m_tok:
++                                tok = _strip_edge_punct(m_tok.group(1))
++                                if tok and re.fullmatch(r"[A-Z0-9_-]{2,}", tok) is not None:
++                                    contract_tokens = tokenize_text(tok)
++                                    contract_kind = "contains_token"
++                                    contract_reason = "include_token"
++                                    contract_meta["used"] = True
++                                    contract_meta["kind"] = contract_kind
++                                    contract_meta["parsed_args"] = {"token": tok}
++                                    contract_meta["reason"] = contract_reason
++                                elif tok:
++                                    contract_meta["reason"] = "include_token_rejected"
++                            else:
++                                contract_meta["reason"] = "include_token_missing"
+ 
+         contract_active = bool(contract_tokens)
+ 
+--- patches/v39_base/suite.py	2026-01-10 22:04:32
++++ atos_core/suite.py	2026-01-10 22:07:37
+@@ -179,6 +179,136 @@
+     },
+ )
+ 
++SKILL_DIALOGUES_V1_PARAPHRASE: Tuple[Dict[str, Any], ...] = (
++    # Instruction following (paraphrases; exact output).
++    {
++        "task_id": "p_instr_ok",
++        "dialogue": ("Responda somente com: OK",),
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "OK", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["instruction"],
++    },
++    {
++        "task_id": "p_instr_exact_code_1",
++        "dialogue": ("Devolva exatamente: PATO-123",),
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "PATO-123", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["instruction"],
++    },
++    {
++        "task_id": "p_instr_exact_code_2",
++        "dialogue": ("Responda apenas com: X_Y-Z",),
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "X_Y-Z", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["instruction"],
++    },
++    # Format / JSON (paraphrases; strict, parseable, minimal schema).
++    {
++        "task_id": "p_json_ab_1",
++        "dialogue": (
++            'Devolva SOMENTE um JSON válido (sem texto extra) com chaves "a" e "b". '
++            '"a" deve ser a string "x" e "b" deve ser o número 7.',
++        ),
++        "validator_id": "json_parse_keys",
++        "expected_spec": {
++            "required_keys": ["a", "b"],
++            "types": {"a": "str", "b": "int"},
++            "expected_values": {"a": "x", "b": 7},
++        },
++        "tags": ["format", "json", "instruction"],
++    },
++    {
++        "task_id": "p_json_bool_1",
++        "dialogue": (
++            'Retorne SOMENTE um JSON válido (sem texto extra) com chaves "ok" e "n". '
++            '"ok" deve ser true e "n" deve ser 3.',
++        ),
++        "validator_id": "json_parse_keys",
++        "expected_spec": {
++            "required_keys": ["ok", "n"],
++            "types": {"ok": "bool", "n": "int"},
++            "expected_values": {"ok": True, "n": 3},
++        },
++        "tags": ["format", "json", "instruction"],
++    },
++    # Arithmetic (paraphrases; strict integer output only).
++    {
++        "task_id": "p_math_add_12_30",
++        "dialogue": ("Quanto é 12 + 30? Responda só o número.",),
++        "validator_id": "int_exact",
++        "expected_spec": {"value": 42, "strict": True},
++        "tags": ["math", "format", "instruction"],
++    },
++    {
++        "task_id": "p_math_mul_9_7",
++        "dialogue": ("Calcule 9*7. Responda somente o número.",),
++        "validator_id": "int_exact",
++        "expected_spec": {"value": 63, "strict": True},
++        "tags": ["math", "format", "instruction"],
++    },
++    {
++        "task_id": "p_math_sub_100_58",
++        "dialogue": ("Qual é o resultado de 100-58? Escreva apenas o número.",),
++        "validator_id": "int_exact",
++        "expected_spec": {"value": 42, "strict": True},
++        "tags": ["math", "format", "instruction"],
++    },
++    # Context factual (paraphrases; fact provided in-context; deterministic target).
++    {
++        "task_id": "p_ctx_password",
++        "dialogue": (
++            "Contexto: a senha é PINEAPPLE. Memorize.",
++            "Diga a senha. Responda somente com a senha.",
++        ),
++        "validate_turn": 1,
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "PINEAPPLE", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["factual", "state", "instruction"],
++    },
++    {
++        "task_id": "p_ctx_year",
++        "dialogue": (
++            "Contexto: Joana nasceu em 1980. Memorize.",
++            "Qual é o ano de nascimento de Joana? Responda só o número.",
++        ),
++        "validate_turn": 1,
++        "validator_id": "int_exact",
++        "expected_spec": {"value": 1980, "strict": True},
++        "tags": ["factual", "state", "math", "instruction"],
++    },
++    # State multi-turn (paraphrases; must carry state across turns).
++    {
++        "task_id": "p_state_code_alfa9",
++        "dialogue": (
++            "Guarde a palavra-código: ALFA9.",
++            "Agora repita a palavra-código exatamente.",
++        ),
++        "validate_turn": 1,
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "ALFA9", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["state", "instruction"],
++    },
++    {
++        "task_id": "p_state_code_beta7",
++        "dialogue": (
++            "Guarde a palavra-código: BETA7.",
++            "Repita o código exatamente.",
++        ),
++        "validate_turn": 1,
++        "validator_id": "exact_match",
++        "expected_spec": {"text": "BETA7", "collapse_ws": True, "case_sensitive": True},
++        "tags": ["state", "instruction"],
++    },
++    # Contains token (paraphrase; allows extra text but must include exact token).
++    {
++        "task_id": "p_contains_token_foobar",
++        "dialogue": ("Escreva uma frase curta e inclua a palavra FOOBAR.",),
++        "validator_id": "contains_exact_token",
++        "expected_spec": {"token": "FOOBAR", "case_sensitive": True},
++        "tags": ["state", "instruction"],
++    },
++)
++
+ 
+ def _normalize_output(text: str, *, collapse_ws: bool) -> str:
+     s = str(text or "").strip()
+@@ -746,6 +876,8 @@
+ 
+     plan_turns_total = 0
+     plan_turns_missing = 0
++    contract_used_turns = 0
++    contract_used_by_kind: Counter = Counter()
+ 
+     for i, task in enumerate(tasks):
+         if not isinstance(task, dict):
+@@ -791,6 +923,11 @@
+             contract_meta = tr.get("instruction_contract")
+             if isinstance(contract_meta, dict):
+                 plan_trace["contract"] = contract_meta
++                if bool(contract_meta.get("used")):
++                    contract_used_turns += 1
++                    k = str(contract_meta.get("kind") or "")
++                    if k:
++                        contract_used_by_kind[k] += 1
+             tr["plan_trace"] = plan_trace
+             history[-1]["trace"] = tr
+ 
+@@ -853,6 +990,12 @@
+         "failures": list(failures),
+         "plan_trace_turns_total": int(plan_turns_total),
+         "plan_trace_missing_turns": int(plan_turns_missing),
++        "contract_total_turns": int(plan_turns_total),
++        "contract_used_turns": int(contract_used_turns),
++        "contract_used_rate": _rate(contract_used_turns, plan_turns_total),
++        "contract_used_by_kind": dict(
++            sorted((str(k), int(v)) for k, v in contract_used_by_kind.items() if str(k))
++        ),
+     }
+     return transcripts, metrics
+ 
+--- patches/v39_base/eval_skill_suite.py	2026-01-10 22:04:32
++++ scripts/eval_skill_suite.py	2026-01-10 22:07:55
+@@ -12,7 +12,7 @@
+ 
+ from atos_core.engine import Engine, EngineConfig
+ from atos_core.store import ActStore
+-from atos_core.suite import SKILL_DIALOGUES_V0, run_skill_suite
++from atos_core.suite import SKILL_DIALOGUES_V0, SKILL_DIALOGUES_V1_PARAPHRASE, run_skill_suite
+ 
+ 
+ def sha256_text(s: str) -> str:
+@@ -46,20 +46,28 @@
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--max_new_tokens", type=int, default=200)
+     ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
++    ap.add_argument(
++        "--utility_suite_version",
++        choices=["v0", "v1"],
++        default="v0",
++        help="Which deterministic utility suite to run (v0=baseline, v1=paraphrase).",
++    )
+     args = ap.parse_args()
+ 
+     acts_path = os.path.join(args.run, "acts.jsonl")
+     store = ActStore.load_jsonl(acts_path)
+     engine = Engine(store, seed=args.seed, config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
+ 
++    tasks = SKILL_DIALOGUES_V0 if str(args.utility_suite_version) == "v0" else SKILL_DIALOGUES_V1_PARAPHRASE
+     transcripts, metrics = run_skill_suite(
+-        engine, tasks=SKILL_DIALOGUES_V0, max_new_tokens=args.max_new_tokens
++        engine, tasks=tasks, max_new_tokens=args.max_new_tokens
+     )
+     txt = transcripts_text(transcripts)
+     out: Dict[str, Any] = {
+         "run": str(args.run),
+         "seed": int(args.seed),
+         "max_new_tokens": int(args.max_new_tokens),
++        "utility_suite_version": str(args.utility_suite_version),
+         "sha256_transcript_text": sha256_text(txt),
+         "plan_trace_sample": first_plan_trace(transcripts),
+         **dict(metrics),

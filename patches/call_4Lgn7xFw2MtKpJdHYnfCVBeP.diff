@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+                 "selected_act_ids": trace_selected_act_ids,
+                 "candidates_pre_rewrite": trace_candidates_pre,
+                 "candidates_post_rewrite": trace_candidates_post,
++                "predictor_iterated": trace_predictor_iterated,
+                 "predictor_matched": trace_predictor_matched,
+                 "predictor_emitted": trace_predictor_emitted,
+                 "router_live_used": trace_router_live_used,
+                 "router_live_fallback": trace_router_live_fallback,
+                 "router_live_fallback_reason": trace_router_live_fallback_reason,
+*** End Patch

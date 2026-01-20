@@ -1,0 +1,268 @@
+--- patches/v40_base/engine.py	2026-01-10 23:18:42
++++ atos_core/engine.py	2026-01-10 23:55:26
+@@ -1055,7 +1055,103 @@
+                             nxt0 = c.token
+                             break
+             return nxt0
++
++        def _non_ws(seq: Sequence[str]) -> List[str]:
++            return [t for t in seq if t not in {"<BOS>"} and (not is_space(t))]
++
++        # Decoder-level anti-loop / fluency controls (deterministic; must not affect contracts).
++        NO_REPEAT_NGRAM = 3
++        REP_WINDOW = 64
++        REP_ALPHA = 0.45
++        BLOCK_PENALTY = 1e6
++        PROMPT_JITTER_ALPHA = 0.9
++        EARLY_WS_PENALTY = 4.0
++        MULTI_WS_PENALTY = 10.0
++        ROUTER_DECODER_FLUENCY_ID = "antiloop_v40"
++
++        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).digest()
++
++        def _prompt_jitter(tok: str) -> float:
++            try:
++                h = hashlib.sha256(prompt_hash + tok.encode("utf-8")).digest()
++                v = int.from_bytes(h[:8], "big")
++                return (v / float(2**64)) - 0.5
++            except Exception:
++                return 0.0
++
++        def _select_next_fluency(
++            cands: Dict[str, Candidate], *, context: Sequence[str], penalties: Dict[str, Any]
++        ) -> Optional[str]:
++            if not cands:
++                return None
++
++            # Source-lock: keep selection within the same source_act that would have won
++            # under the unmodified candidate set. This preserves gate invariants while we
++            # tune decoder-level fluency.
++            base_tok = _select_next(cands, context=context, penalties=penalties)
++            base_src = cands.get(base_tok).source_act if base_tok in cands else None
++
++            work = cands
++            if base_src is not None:
++                sub = {tok: cand for tok, cand in cands.items() if cand.source_act == base_src}
++                if sub:
++                    work = sub
++
++            if REP_WINDOW > 0 and REP_ALPHA > 0.0:
++                recent = turn_non_ws[-REP_WINDOW:]
++                if recent:
++                    counts: Dict[str, int] = {}
++                    for t in recent:
++                        counts[t] = int(counts.get(t, 0)) + 1
++                    for tok, cand in work.items():
++                        if tok in {"<EOS>"} or is_space(tok):
++                            continue
++                        cnt = int(counts.get(tok, 0))
++                        if cnt > 0:
++                            cand.score -= float(REP_ALPHA) * float(cnt)
++
++            if len(turn_non_ws) < 1 and EARLY_WS_PENALTY > 0.0:
++                for tok, cand in work.items():
++                    if tok == "<EOS>":
++                        continue
++                    if is_space(tok):
++                        cand.score -= float(EARLY_WS_PENALTY)
++
++            if MULTI_WS_PENALTY > 0.0:
++                for tok, cand in work.items():
++                    if tok == "<EOS>":
++                        continue
++                    if is_space(tok) and len(tok) > 1:
++                        cand.score -= float(MULTI_WS_PENALTY) * float(len(tok) - 1)
++
++            if PROMPT_JITTER_ALPHA > 0.0:
++                for tok, cand in work.items():
++                    if tok == "<EOS>":
++                        continue
++                    if is_space(tok):
++                        continue
++                    cand.score += float(PROMPT_JITTER_ALPHA) * float(_prompt_jitter(tok))
++
++            if NO_REPEAT_NGRAM >= 2 and len(turn_non_ws) >= (NO_REPEAT_NGRAM - 1) and seen_turn_ngrams:
++                prefix = tuple(turn_non_ws[-(NO_REPEAT_NGRAM - 1) :])
++                eligible = [
++                    tok
++                    for tok in work.keys()
++                    if tok not in {"<EOS>"} and (not is_space(tok))
++                ]
++                would_block = [
++                    tok for tok in eligible if tuple(list(prefix) + [tok]) in seen_turn_ngrams
++                ]
++                # Dead-end guard: if everything would be blocked, relax (do not block this step).
++                if eligible and len(would_block) < len(eligible):
++                    for tok in would_block:
++                        work[tok].score -= float(BLOCK_PENALTY)
+ 
++            return _select_next(work, context=context, penalties=penalties)
++
++        seen_turn_ngrams: set = set()
++        turn_non_ws: List[str] = []
++
+         for i in range(int(max_new_tokens)):
+             ck = ctx_key(context)
+             penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+@@ -1125,19 +1221,40 @@
+             gated_predictors: Optional[List[Act]] = None
+ 
+             if router_live_enabled:
+-                table = self._macro_router_table
+-                if table is None or not isinstance(table, dict):
+-                    router_fallback = True
+-                    router_fallback_reason = "router_missing"
++                compat = ""
++                try:
++                    if self._macro_router is not None and isinstance(self._macro_router.evidence, dict):
++                        compat = str(self._macro_router.evidence.get("decoder_fluency_id") or "")
++                except Exception:
++                    compat = ""
++
++                # If the router was built under a different decoder regime, do not rely on
++                # its top-k predictors: keep invariants by allowing all predictors (no savings).
++                if compat != ROUTER_DECODER_FLUENCY_ID:
++                    allowed_predictor_ids = [str(a.id) for a in self._predictors]
++                    gated_predictors = list(self._predictors)
+                 else:
+-                    ctx_sig = f"{mode_state}{SEP}{ck}"
+-                    entry = table.get(ctx_sig)
+-                    if isinstance(entry, dict):
+-                        preds = entry.get("predictors") or []
+-                        if isinstance(preds, list):
+-                            allowed_predictor_ids = [
+-                                str(x) for x in preds if isinstance(x, str) and x
+-                            ]
++                    table = self._macro_router_table
++                    if table is None or not isinstance(table, dict):
++                        router_fallback = True
++                        router_fallback_reason = "router_missing"
++                    else:
++                        ctx_sig = f"{mode_state}{SEP}{ck}"
++                        entry = table.get(ctx_sig)
++                        if isinstance(entry, dict):
++                            # Safety: if a ctx_sig exists but has tiny evidence, treat as uncovered.
++                            tot = int(entry.get("total", 0) or 0)
++                            if tot > 0 and tot < 5:
++                                router_fallback = True
++                                router_fallback_reason = "low_total"
++                            if router_fallback:
++                                entry = None
++                        if isinstance(entry, dict):
++                            preds = entry.get("predictors") or []
++                            if isinstance(preds, list):
++                                allowed_predictor_ids = [
++                                    str(x) for x in preds if isinstance(x, str) and x
++                                ]
+                     if allowed_predictor_ids:
+                         present = [
+                             pid for pid in allowed_predictor_ids if pid in self._predictor_by_id
+@@ -1146,11 +1263,13 @@
+                             present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
+                             gated_predictors = [self._predictor_by_id[pid] for pid in present]
+                         else:
+-                            router_fallback = True
+-                            router_fallback_reason = "allowed_missing"
++                            if not router_fallback:
++                                router_fallback = True
++                                router_fallback_reason = "allowed_missing"
+                     else:
+-                        router_fallback = True
+-                        router_fallback_reason = "missing_ctx"
++                        if not router_fallback:
++                            router_fallback = True
++                            router_fallback_reason = "missing_ctx"
+ 
+             emit_gate: Optional[Dict[str, Any]] = None
+             cand_gate: Optional[Dict[str, Candidate]] = None
+@@ -1186,8 +1305,14 @@
+                 gate_after, _ = _apply_rewrite_rules(
+                     cand_gate, context=context, penalties=penalties
+                 )
+-                b_nxt = _select_next(base_after, context=context, penalties=penalties)
+-                g_nxt = _select_next(gate_after, context=context, penalties=penalties)
++                if i < self.config.min_new_tokens_before_eos:
++                    if "<EOS>" in base_after:
++                        base_after["<EOS>"].score -= 1e6
++                    if "<EOS>" in gate_after:
++                        gate_after["<EOS>"].score -= 1e6
++
++                b_nxt = _select_next_fluency(base_after, context=context, penalties=penalties)
++                g_nxt = _select_next_fluency(gate_after, context=context, penalties=penalties)
+                 baseline_tok = str(b_nxt or "")
+                 gate_tok = str(g_nxt or "")
+                 mismatch = bool(b_nxt != g_nxt)
+@@ -1245,7 +1370,12 @@
+             if not candidates:
+                 break
+ 
+-            nxt = _select_next(candidates, context=context, penalties=penalties)
++            # Anti-loop (decoder-only): apply after rewrite rules + EOS guardrail, before selection.
++            # Must not run when a contract is active (contracts must be exact).
++            if not contract_active:
++                nxt = _select_next_fluency(candidates, context=context, penalties=penalties)
++            else:
++                nxt = _select_next(candidates, context=context, penalties=penalties)
+             if nxt is None or nxt == "<EOS>":
+                 break
+ 
+@@ -1285,6 +1415,10 @@
+             trace_selected_tokens.append(str(nxt))
+ 
+             gen_tokens.append(nxt)
++            if nxt not in {"<EOS>", "<BOS>"} and (not is_space(nxt)):
++                turn_non_ws.append(nxt)
++                if NO_REPEAT_NGRAM >= 2 and len(turn_non_ws) >= NO_REPEAT_NGRAM:
++                    seen_turn_ngrams.add(tuple(turn_non_ws[-NO_REPEAT_NGRAM:]))
+             # Update history sets for cycle penalties (filtered, space-free).
+             filtered = [x for x in (out_tokens + gen_tokens) if x not in {"<BOS>"}]
+             n = self.config.cycle_ngram
+--- patches/v40_base/eval.py	2026-01-10 23:18:42
++++ scripts/eval.py	2026-01-10 23:20:22
+@@ -36,6 +36,11 @@
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--max_new_tokens", type=int, default=200)
+     ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
++    ap.add_argument(
++        "--no_write_transcripts",
++        action="store_true",
++        help="Do not write transcripts.jsonl into --run (WORM/read-only eval).",
++    )
+     args = ap.parse_args()
+ 
+     acts_path = os.path.join(args.run, "acts.jsonl")
+@@ -66,9 +71,10 @@
+         template_ngram_n=6,
+         template_prefix_window=32,
+     )
+-    with open(transcripts_path, "w", encoding="utf-8") as f:
+-        for rec in transcripts:
+-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++    if not bool(args.no_write_transcripts):
++        with open(transcripts_path, "w", encoding="utf-8") as f:
++            for rec in transcripts:
++                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+ 
+     eval_out = {
+         "nll_bits_mean_eval": nll_bits_mean,
+--- patches/v40_base/learn.py	2026-01-10 23:55:49
++++ atos_core/learn.py	2026-01-10 23:56:03
+@@ -465,6 +465,8 @@
+             "name": "macro_router_v0",
+             "enabled": True,
+             "shadow_mode": True,
++            # Decoder compatibility tag (used by gate-live to preserve invariants across decoder changes).
++            "decoder_fluency_id": "antiloop_v40",
+             # Budget / governance.
+             "max_contexts": 8192,
+             "top_k": 2,
+@@ -2132,6 +2134,9 @@
+         if not isinstance(ev, dict) or not bool(ev.get("enabled", False)):
+             return {"enabled": False}
+ 
++        # Mark the router as compatible with the current decoder fluency regime.
++        ev["decoder_fluency_id"] = "antiloop_v40"
++
+         table = ev.setdefault("table", {})
+         if not isinstance(table, dict):
+             table = {}

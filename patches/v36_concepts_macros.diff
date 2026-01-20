@@ -1,0 +1,855 @@
+--- patches/v36_base/learn.py	2026-01-10 19:48:05
++++ atos_core/learn.py	2026-01-10 19:57:00
+@@ -6,6 +6,7 @@
+ import time
+ import copy
+ import re
++import itertools
+ from collections import Counter
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+@@ -970,6 +971,21 @@
+         set_min_count = int(ev.get("set_min_count", 4) or 4)
+         transition_top_k = int(ev.get("transition_top_k", 32) or 32)
+ 
++        # Turn-level "concepts as subgraphs" (shadow-only: affects logging/metrics, not generation).
++        concepts = ev.setdefault("concepts", {})
++        if not isinstance(concepts, dict):
++            concepts = {}
++            ev["concepts"] = concepts
++
++        concept_budget = int(ev.get("concept_budget", 128) or 128)
++        concept_max_new = int(ev.get("concept_max_new_per_window", 8) or 8)
++        concept_n_min = int(ev.get("concept_n_min", 2) or 2)
++        concept_n_max = int(ev.get("concept_n_max", 6) or 6)
++        concept_min_count = int(ev.get("concept_min_count", 3) or 3)
++        concept_set_min_size = int(ev.get("concept_set_min_size", 2) or 2)
++        concept_set_max_size = int(ev.get("concept_set_max_size", 6) or 6)
++        concept_set_min_count = int(ev.get("concept_set_min_count", 3) or 3)
++
+         if (
+             budget <= 0
+             or max_new <= 0
+@@ -979,6 +995,14 @@
+             or set_min_size <= 0
+             or set_min_count <= 1
+             or transition_top_k < 0
++            or concept_budget < 0
++            or concept_max_new < 0
++            or concept_n_min <= 0
++            or concept_n_max < concept_n_min
++            or concept_min_count <= 1
++            or concept_set_min_size <= 0
++            or concept_set_max_size < concept_set_min_size
++            or concept_set_min_count <= 1
+         ):
+             return {"enabled": True, "updated": False, "reason": "invalid_params"}
+ 
+@@ -997,6 +1021,17 @@
+         set_contexts: Dict[Tuple[str, ...], set] = {}
+         transition_counts: Counter = Counter()
+         rewrite_hit_counts: Counter = Counter()
++        # Turn-level subgraph motifs (per turn) mined from trace["subgraph"].
++        turn_exec_seqs_all: List[List[str]] = []
++        turn_rr_seqs_all: List[List[str]] = []
++        turn_exec_seq_counts: Counter = Counter()
++        turn_exec_seq_contexts: Dict[Tuple[str, ...], set] = {}
++        turn_exec_set_counts: Counter = Counter()
++        turn_exec_set_contexts: Dict[Tuple[str, ...], set] = {}
++        turn_rr_seq_counts: Counter = Counter()
++        turn_rr_seq_contexts: Dict[Tuple[str, ...], set] = {}
++        turn_rr_set_counts: Counter = Counter()
++        turn_rr_set_contexts: Dict[Tuple[str, ...], set] = {}
+ 
+         for rec in transcripts:
+             turns = rec.get("turns", [])
+@@ -1008,6 +1043,88 @@
+                 ctx_keys0 = tr.get("context_keys") or []
+                 if not isinstance(ctx_keys0, list):
+                     ctx_keys0 = []
++
++                # Deterministic "turn context" signature: first non-empty ctx_key (mode␟ctx_key).
++                turn_ctx_key = ""
++                for _ck in ctx_keys0:
++                    if isinstance(_ck, str) and _ck:
++                        turn_ctx_key = _ck
++                        break
++                turn_ctx_sig = f"{mode}\u241f{turn_ctx_key}" if turn_ctx_key else ""
++
++                # Turn-level subgraph motifs: executed predictors + rewrite hits (ordered unique).
++                sub = tr.get("subgraph") or {}
++                if not isinstance(sub, dict):
++                    sub = {}
++                exec_turn0 = sub.get("executed_predictor_act_ids") or []
++                rr_turn0 = sub.get("rewrite_rule_hit_ids") or []
++
++                exec_turn: List[str] = []
++                if isinstance(exec_turn0, list):
++                    for x in exec_turn0:
++                        if isinstance(x, str) and x and (not x.startswith("__")):
++                            exec_turn.append(str(x))
++                rr_turn: List[str] = []
++                if isinstance(rr_turn0, list):
++                    for x in rr_turn0:
++                        if isinstance(x, str) and x and (not x.startswith("__")):
++                            rr_turn.append(str(x))
++
++                if exec_turn:
++                    turn_exec_seqs_all.append(list(exec_turn))
++                    # Motif SEQ: n-grams over the ordered unique list.
++                    if len(exec_turn) >= int(concept_n_min):
++                        nmax2 = min(int(concept_n_max), int(len(exec_turn)))
++                        for n in range(int(concept_n_min), int(nmax2) + 1):
++                            for i0 in range(int(len(exec_turn) - n + 1)):
++                                pat = tuple(exec_turn[i0 : i0 + n])
++                                turn_exec_seq_counts[pat] += 1
++                                if turn_ctx_sig:
++                                    s = turn_exec_seq_contexts.get(pat)
++                                    if s is None:
++                                        s = set()
++                                        turn_exec_seq_contexts[pat] = s
++                                    s.add(turn_ctx_sig)
++                    # Motif SET: co-occurrence itemsets (subset combinations).
++                    sorted_exec = sorted(set(exec_turn))
++                    smax2 = min(int(concept_set_max_size), int(len(sorted_exec)))
++                    for k in range(int(concept_set_min_size), int(smax2) + 1):
++                        for comb in itertools.combinations(sorted_exec, k):
++                            pat2 = tuple(comb)
++                            turn_exec_set_counts[pat2] += 1
++                            if turn_ctx_sig:
++                                s = turn_exec_set_contexts.get(pat2)
++                                if s is None:
++                                    s = set()
++                                    turn_exec_set_contexts[pat2] = s
++                                s.add(turn_ctx_sig)
++
++                if rr_turn:
++                    turn_rr_seqs_all.append(list(rr_turn))
++                    if len(rr_turn) >= int(concept_n_min):
++                        nmax2 = min(int(concept_n_max), int(len(rr_turn)))
++                        for n in range(int(concept_n_min), int(nmax2) + 1):
++                            for i0 in range(int(len(rr_turn) - n + 1)):
++                                pat = tuple(rr_turn[i0 : i0 + n])
++                                turn_rr_seq_counts[pat] += 1
++                                if turn_ctx_sig:
++                                    s = turn_rr_seq_contexts.get(pat)
++                                    if s is None:
++                                        s = set()
++                                        turn_rr_seq_contexts[pat] = s
++                                    s.add(turn_ctx_sig)
++                    sorted_rr = sorted(set(rr_turn))
++                    smax2 = min(int(concept_set_max_size), int(len(sorted_rr)))
++                    for k in range(int(concept_set_min_size), int(smax2) + 1):
++                        for comb in itertools.combinations(sorted_rr, k):
++                            pat2 = tuple(comb)
++                            turn_rr_set_counts[pat2] += 1
++                            if turn_ctx_sig:
++                                s = turn_rr_set_contexts.get(pat2)
++                                if s is None:
++                                    s = set()
++                                    turn_rr_set_contexts[pat2] = s
++                                s.add(turn_ctx_sig)
+ 
+                 sel_ids = tr.get("selected_source_act_ids")
+                 if not isinstance(sel_ids, list):
+@@ -1366,22 +1483,23 @@
+                 added_set += 1
+             added += 1
+ 
+-        # Evict to budget deterministically by utility (gain_real_bits_est, count, id).
++        # Evict to budget deterministically by utility (gain_real_bits_est, contexts_distinct, count, id).
+         evicted = 0
+         if budget > 0 and len(macros) > budget:
+-            ranked: List[Tuple[int, int, str]] = []
++            ranked: List[Tuple[int, int, int, str]] = []
+             for mid, ent in macros.items():
+                 if not isinstance(ent, dict):
+                     continue
+                 ranked.append(
+                     (
+                         int(ent.get("gain_real_bits_est", 0) or 0),
++                        int(ent.get("contexts_distinct", 0) or 0),
+                         int(ent.get("count", 0) or 0),
+                         str(mid),
+                     )
+                 )
+-            ranked.sort(key=lambda x: (-x[0], -x[1], x[2]))
+-            keep = {mid for _g, _c, mid in ranked[:budget]}
++            ranked.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]))
++            keep = {mid for _g, _ctx, _c, mid in ranked[:budget]}
+             for mid in list(macros.keys()):
+                 if mid not in keep:
+                     macros.pop(mid, None)
+@@ -1438,8 +1556,414 @@
+             trace_mdl_gain_bits_est = int(trace_mdl_before_bits_est - trace_mdl_after_bits_est)
+             trace_mdl_gain_real_bits_est = int(
+                 trace_mdl_before_bits_est - (trace_mdl_after_bits_est + macro_cost_bits_total)
++            )
++
++        # ---- Concepts as turn-level subgraphs (shadow-only): mine, budget, and MDL-real gate ----
++        concept_added = 0
++        concept_added_seq = 0
++        concept_added_set = 0
++        concept_updated_existing = 0
++        concept_evicted = 0
++        concept_cleared = False
++
++        concept_trace_mdl_before_bits_est = 0
++        concept_trace_mdl_after_bits_est = 0
++        concept_trace_mdl_gain_bits_est = 0
++        concept_library_cost_bits_est = 0
++        concept_trace_mdl_gain_real_bits_est = 0
++
++        avg_trace_len_turn_before = 0.0
++        avg_trace_len_turn_after = 0.0
++        concept_turn_hit_rate = 0.0
++        concept_symbol_coverage_rate = 0.0
++        concept_hits_per_turn_mean = 0.0
++
++        # concepts (dict) is defined near the top of this function.
++        def _concept_seq_patterns(src: str) -> List[Tuple[int, Tuple[str, ...], str]]:
++            pats: List[Tuple[int, Tuple[str, ...], str]] = []
++            for cid, ent in concepts.items():
++                if not isinstance(ent, dict):
++                    continue
++                if str(ent.get("kind", "")) != "concept":
++                    continue
++                if str(ent.get("source", "")) != src:
++                    continue
++                if str(ent.get("type", "")) != "seq":
++                    continue
++                pat = ent.get("pattern")
++                if not isinstance(pat, list) or not pat:
++                    continue
++                toks = tuple(str(x) for x in pat if x is not None)
++                if len(toks) < 2:
++                    continue
++                pats.append((len(toks), toks, str(cid)))
++            pats.sort(key=lambda x: (-x[0], x[2], x[1]))
++            return pats
++
++        def _concept_set_patterns(src: str) -> List[Tuple[int, Tuple[str, ...], str]]:
++            pats: List[Tuple[int, Tuple[str, ...], str]] = []
++            for cid, ent in concepts.items():
++                if not isinstance(ent, dict):
++                    continue
++                if str(ent.get("kind", "")) != "concept":
++                    continue
++                if str(ent.get("source", "")) != src:
++                    continue
++                if str(ent.get("type", "")) != "set":
++                    continue
++                pat = ent.get("pattern")
++                if not isinstance(pat, list) or not pat:
++                    continue
++                toks = tuple(sorted(str(x) for x in pat if x is not None))
++                if len(toks) < 2:
++                    continue
++                pats.append((len(toks), toks, str(cid)))
++            pats.sort(key=lambda x: (-x[0], x[2], x[1]))
++            return pats
++
++        def _compress_turn_concepts(
++            seqs: Sequence[Sequence[str]],
++            seq_pats: Sequence[Tuple[int, Tuple[str, ...], str]],
++            set_pats: Sequence[Tuple[int, Tuple[str, ...], str]],
++        ) -> Tuple[int, int, int, int, int, int, int]:
++            bits = 0
++            symbols_before = 0
++            symbols_after = 0
++            covered = 0
++            seq_hits = 0
++            set_hits = 0
++            turns_hit = 0
++            set_pats2 = [(k, set(pat), mid) for k, pat, mid in set_pats if pat]
++            for seq in seqs:
++                seq0 = [str(x) for x in seq if isinstance(x, str) and x and (not x.startswith("__"))]
++                if not seq0:
++                    continue
++                symbols_before += int(len(seq0))
++                i = 0
++                remaining: List[str] = []
++                out_seq_syms: List[str] = []
++                local_seq_hits = 0
++                local_set_hits = 0
++                while i < len(seq0):
++                    matched = False
++                    for plen, pat, mid in seq_pats:
++                        if i + plen <= len(seq0) and tuple(seq0[i : i + plen]) == pat:
++                            out_seq_syms.append(str(mid))
++                            covered += int(plen)
++                            seq_hits += 1
++                            local_seq_hits += 1
++                            i += int(plen)
++                            matched = True
++                            break
++                    if not matched:
++                        remaining.append(str(seq0[i]))
++                        i += 1
++
++                rem_set = set(remaining)
++                out_set_syms: List[str] = []
++                for _k, pat_set, mid in set_pats2:
++                    if pat_set and pat_set.issubset(rem_set):
++                        out_set_syms.append(str(mid))
++                        rem_set -= pat_set
++                        covered += int(len(pat_set))
++                        set_hits += 1
++                        local_set_hits += 1
++
++                out_syms = list(out_seq_syms) + sorted(out_set_syms) + sorted(rem_set)
++                symbols_after += int(len(out_syms))
++                for sym in out_syms:
++                    bits += sym_cost_bits(str(sym))
++                if (local_seq_hits + local_set_hits) > 0:
++                    turns_hit += 1
++            return (
++                int(bits),
++                int(symbols_before),
++                int(symbols_after),
++                int(covered),
++                int(seq_hits),
++                int(set_hits),
++                int(turns_hit),
++            )
++
++        # Update existing concept counts/contexts from this window's mined motifs.
++        for cid, ent in concepts.items():
++            if not isinstance(ent, dict):
++                continue
++            if str(ent.get("kind", "")) != "concept":
++                continue
++            typ = str(ent.get("type", ""))
++            src = str(ent.get("source", ""))
++            pat0 = ent.get("pattern")
++            if not isinstance(pat0, list):
++                continue
++            if typ == "seq":
++                key = tuple(str(x) for x in pat0 if x is not None)
++                if src == "executed_predictor_act_ids":
++                    c = int(turn_exec_seq_counts.get(key, 0) or 0)
++                    ctx_n = int(len(turn_exec_seq_contexts.get(key, set())))
++                elif src == "rewrite_rule_hit_ids":
++                    c = int(turn_rr_seq_counts.get(key, 0) or 0)
++                    ctx_n = int(len(turn_rr_seq_contexts.get(key, set())))
++                else:
++                    continue
++            elif typ == "set":
++                key2 = tuple(sorted(str(x) for x in pat0 if x is not None))
++                if src == "executed_predictor_act_ids":
++                    c = int(turn_exec_set_counts.get(key2, 0) or 0)
++                    ctx_n = int(len(turn_exec_set_contexts.get(key2, set())))
++                elif src == "rewrite_rule_hit_ids":
++                    c = int(turn_rr_set_counts.get(key2, 0) or 0)
++                    ctx_n = int(len(turn_rr_set_contexts.get(key2, set())))
++                else:
++                    continue
++            else:
++                continue
++            if c > 0:
++                ent["count"] = int(ent.get("count", 0) or 0) + int(c)
++                ent["last_seen_step"] = int(step)
++                if ctx_n > 0:
++                    ent["contexts_distinct"] = max(int(ent.get("contexts_distinct", 0) or 0), int(ctx_n))
++                concept_updated_existing += 1
++
++        def _concept_id(*, typ: str, src: str, pat: Tuple[str, ...]) -> str:
++            raw = (f"{src}|{typ}|" + "|".join(pat)).encode("utf-8")
++            return f"c{typ}_{sha256_hex(raw)[:12]}"
++
++        def _new_concept_entry(
++            cid: str, *, typ: str, src: str, pat: Tuple[str, ...], c: int, ctx_n: int, gain_bits: int
++        ) -> Dict[str, Any]:
++            return {
++                "id": str(cid),
++                "kind": "concept",
++                "type": str(typ),
++                "source": str(src),
++                "pattern": list(pat),
++                "deps": sorted(set(str(x) for x in pat if x is not None)),
++                "n": int(len(pat)) if typ == "seq" else None,
++                "k": int(len(pat)) if typ == "set" else None,
++                "count": int(c),
++                "contexts_distinct": int(max(0, int(ctx_n))),
++                "last_seen_step": int(step),
++                "gain_real_bits_est": int(gain_bits),
++            }
++
++        # Greedy selection: pick up to concept_max_new concepts with positive MDL-real gain.
++        if concept_budget > 0 and concept_max_new > 0 and (turn_exec_seqs_all or turn_rr_seqs_all):
++            cur_exec_seq_pats = _concept_seq_patterns("executed_predictor_act_ids")
++            cur_exec_set_pats = _concept_set_patterns("executed_predictor_act_ids")
++            cur_rr_seq_pats = _concept_seq_patterns("rewrite_rule_hit_ids")
++            cur_rr_set_pats = _concept_set_patterns("rewrite_rule_hit_ids")
++
++            raw_exec_bits = sum(sym_cost_bits(sym) for seq in turn_exec_seqs_all for sym in seq)
++            raw_rr_bits = sum(sym_cost_bits(sym) for seq in turn_rr_seqs_all for sym in seq)
++            concept_trace_mdl_before_bits_est = int(raw_exec_bits + raw_rr_bits)
++
++            cur_exec_bits, exec_sym_before, exec_sym_after, exec_cov, exec_seq_hits, exec_set_hits, exec_turn_hit = (
++                _compress_turn_concepts(turn_exec_seqs_all, cur_exec_seq_pats, cur_exec_set_pats)
+             )
++            cur_rr_bits, rr_sym_before, rr_sym_after, rr_cov, rr_seq_hits, rr_set_hits, rr_turn_hit = (
++                _compress_turn_concepts(turn_rr_seqs_all, cur_rr_seq_pats, cur_rr_set_pats)
++            )
++            cur_total_bits = int(cur_exec_bits + cur_rr_bits)
+ 
++            # Candidate pools (deterministic ordering from tuples).
++            candidates: List[Tuple[str, str, Tuple[str, ...], int, int]] = []
++            for pat, c in turn_exec_seq_counts.items():
++                if int(c) < int(concept_min_count):
++                    continue
++                if len(pat) < int(concept_n_min) or len(pat) > int(concept_n_max):
++                    continue
++                ctx_n = int(len(turn_exec_seq_contexts.get(pat, set())))
++                candidates.append(("seq", "executed_predictor_act_ids", tuple(pat), int(c), int(ctx_n)))
++            for pat, c in turn_exec_set_counts.items():
++                if int(c) < int(concept_set_min_count):
++                    continue
++                if len(pat) < int(concept_set_min_size) or len(pat) > int(concept_set_max_size):
++                    continue
++                ctx_n = int(len(turn_exec_set_contexts.get(pat, set())))
++                candidates.append(("set", "executed_predictor_act_ids", tuple(pat), int(c), int(ctx_n)))
++            for pat, c in turn_rr_seq_counts.items():
++                if int(c) < int(concept_min_count):
++                    continue
++                if len(pat) < int(concept_n_min) or len(pat) > int(concept_n_max):
++                    continue
++                ctx_n = int(len(turn_rr_seq_contexts.get(pat, set())))
++                candidates.append(("seq", "rewrite_rule_hit_ids", tuple(pat), int(c), int(ctx_n)))
++            for pat, c in turn_rr_set_counts.items():
++                if int(c) < int(concept_set_min_count):
++                    continue
++                if len(pat) < int(concept_set_min_size) or len(pat) > int(concept_set_max_size):
++                    continue
++                ctx_n = int(len(turn_rr_set_contexts.get(pat, set())))
++                candidates.append(("set", "rewrite_rule_hit_ids", tuple(pat), int(c), int(ctx_n)))
++
++            for _ in range(int(concept_max_new)):
++                best: Optional[Tuple[int, int, int, str, str, Tuple[str, ...], Dict[str, Any], Any]] = None
++                # (gain, ctx_n, count, typ, src, pat, entry, new_state)
++
++                for typ, src, pat, c, ctx_n in candidates:
++                    cid = _concept_id(typ=typ, src=src, pat=pat)
++                    if cid in concepts:
++                        continue
++                    if ctx_n <= 0:
++                        continue
++
++                    if src == "executed_predictor_act_ids":
++                        if typ == "seq":
++                            pats2 = list(cur_exec_seq_pats)
++                            pats2.append((len(pat), tuple(pat), cid))
++                            pats2.sort(key=lambda x: (-x[0], x[2], x[1]))
++                            new_exec_bits = _compress_turn_concepts(turn_exec_seqs_all, pats2, cur_exec_set_pats)[0]
++                            new_total_bits = int(new_exec_bits + cur_rr_bits)
++                            new_state = ("exec_seq", pats2, None, int(new_exec_bits))
++                        else:
++                            sp2 = list(cur_exec_set_pats)
++                            sp2.append((len(pat), tuple(sorted(pat)), cid))
++                            sp2.sort(key=lambda x: (-x[0], x[2], x[1]))
++                            new_exec_bits = _compress_turn_concepts(turn_exec_seqs_all, cur_exec_seq_pats, sp2)[0]
++                            new_total_bits = int(new_exec_bits + cur_rr_bits)
++                            new_state = ("exec_set", None, sp2, int(new_exec_bits))
++                    else:
++                        if typ == "seq":
++                            pats2 = list(cur_rr_seq_pats)
++                            pats2.append((len(pat), tuple(pat), cid))
++                            pats2.sort(key=lambda x: (-x[0], x[2], x[1]))
++                            new_rr_bits = _compress_turn_concepts(turn_rr_seqs_all, pats2, cur_rr_set_pats)[0]
++                            new_total_bits = int(cur_exec_bits + new_rr_bits)
++                            new_state = ("rr_seq", pats2, None, int(new_rr_bits))
++                        else:
++                            sp2 = list(cur_rr_set_pats)
++                            sp2.append((len(pat), tuple(sorted(pat)), cid))
++                            sp2.sort(key=lambda x: (-x[0], x[2], x[1]))
++                            new_rr_bits = _compress_turn_concepts(turn_rr_seqs_all, cur_rr_seq_pats, sp2)[0]
++                            new_total_bits = int(cur_exec_bits + new_rr_bits)
++                            new_state = ("rr_set", None, sp2, int(new_rr_bits))
++
++                    delta_bits = int(cur_total_bits - new_total_bits)
++                    if delta_bits <= 0:
++                        continue
++                    entry0 = _new_concept_entry(
++                        cid,
++                        typ=typ,
++                        src=src,
++                        pat=tuple(pat),
++                        c=int(c),
++                        ctx_n=int(ctx_n),
++                        gain_bits=int(delta_bits),
++                    )
++                    cost = int(macro_entry_cost_bits(entry0))
++                    gain = int(delta_bits - cost)
++                    if gain <= 0:
++                        continue
++                    entry0["gain_real_bits_est"] = int(gain)
++                    cand_key = (gain, int(ctx_n), int(c), str(typ), str(cid))
++                    if best is None or cand_key > (best[0], best[1], best[2], best[3], best[5]):
++                        best = (gain, int(ctx_n), int(c), str(typ), str(src), tuple(pat), entry0, new_state)
++
++                if best is None:
++                    break
++                gain, ctx_n, c, typ, src, pat, entry0, new_state = best
++                cid = str(entry0.get("id") or _concept_id(typ=typ, src=src, pat=pat))
++                concepts[cid] = dict(entry0)
++                concept_added += 1
++                if typ == "seq":
++                    concept_added_seq += 1
++                else:
++                    concept_added_set += 1
++
++                tag = new_state[0]
++                if tag == "exec_seq":
++                    cur_exec_seq_pats = list(new_state[1])
++                    cur_exec_bits = int(new_state[3])
++                elif tag == "exec_set":
++                    cur_exec_set_pats = list(new_state[2])
++                    cur_exec_bits = int(new_state[3])
++                elif tag == "rr_seq":
++                    cur_rr_seq_pats = list(new_state[1])
++                    cur_rr_bits = int(new_state[3])
++                elif tag == "rr_set":
++                    cur_rr_set_pats = list(new_state[2])
++                    cur_rr_bits = int(new_state[3])
++                cur_total_bits = int(cur_exec_bits + cur_rr_bits)
++
++            # Budget eviction (deterministic): keep strongest concepts by (gain, contexts_distinct, count, id).
++            if concept_budget > 0 and len(concepts) > concept_budget:
++                ranked: List[Tuple[int, int, int, str]] = []
++                for cid, ent in concepts.items():
++                    if not isinstance(ent, dict):
++                        continue
++                    if str(ent.get("kind", "")) != "concept":
++                        continue
++                    ranked.append(
++                        (
++                            int(ent.get("gain_real_bits_est", 0) or 0),
++                            int(ent.get("contexts_distinct", 0) or 0),
++                            int(ent.get("count", 0) or 0),
++                            str(cid),
++                        )
++                    )
++                ranked.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]))
++                keep = {cid for _g, _ctx, _c, cid in ranked[: int(concept_budget)]}
++                for cid in list(concepts.keys()):
++                    if cid not in keep:
++                        concepts.pop(cid, None)
++                        concept_evicted += 1
++
++            # Final recompute with kept concepts.
++            final_exec_seq_pats = _concept_seq_patterns("executed_predictor_act_ids")
++            final_exec_set_pats = _concept_set_patterns("executed_predictor_act_ids")
++            final_rr_seq_pats = _concept_seq_patterns("rewrite_rule_hit_ids")
++            final_rr_set_pats = _concept_set_patterns("rewrite_rule_hit_ids")
++            exec_bits2, exec_sym_before, exec_sym_after, exec_cov, exec_seq_hits, exec_set_hits, exec_turn_hit = (
++                _compress_turn_concepts(turn_exec_seqs_all, final_exec_seq_pats, final_exec_set_pats)
++            )
++            rr_bits2, rr_sym_before, rr_sym_after, rr_cov, rr_seq_hits, rr_set_hits, rr_turn_hit = (
++                _compress_turn_concepts(turn_rr_seqs_all, final_rr_seq_pats, final_rr_set_pats)
++            )
++            concept_trace_mdl_after_bits_est = int(exec_bits2 + rr_bits2)
++            concept_trace_mdl_gain_bits_est = int(
++                concept_trace_mdl_before_bits_est - concept_trace_mdl_after_bits_est
++            )
++
++            concept_library_cost_bits_est = int(
++                sum(macro_entry_cost_bits(ent) for ent in concepts.values() if isinstance(ent, dict))
++            )
++            concept_trace_mdl_gain_real_bits_est = int(
++                concept_trace_mdl_before_bits_est
++                - (concept_trace_mdl_after_bits_est + concept_library_cost_bits_est)
++            )
++            if concept_trace_mdl_gain_real_bits_est <= 0 and concepts:
++                concepts.clear()
++                concept_cleared = True
++                concept_library_cost_bits_est = 0
++                exec_bits2, exec_sym_before, exec_sym_after, exec_cov, exec_seq_hits, exec_set_hits, exec_turn_hit = (
++                    _compress_turn_concepts(turn_exec_seqs_all, [], [])
++                )
++                rr_bits2, rr_sym_before, rr_sym_after, rr_cov, rr_seq_hits, rr_set_hits, rr_turn_hit = (
++                    _compress_turn_concepts(turn_rr_seqs_all, [], [])
++                )
++                concept_trace_mdl_after_bits_est = int(exec_bits2 + rr_bits2)
++                concept_trace_mdl_gain_bits_est = int(
++                    concept_trace_mdl_before_bits_est - concept_trace_mdl_after_bits_est
++                )
++                concept_trace_mdl_gain_real_bits_est = int(
++                    concept_trace_mdl_before_bits_est
++                    - (concept_trace_mdl_after_bits_est + concept_library_cost_bits_est)
++                )
++
++            turns_total = int(len(turn_exec_seqs_all))
++            if turns_total > 0:
++                avg_trace_len_turn_before = float(exec_sym_before / turns_total)
++                avg_trace_len_turn_after = float(exec_sym_after / turns_total)
++                concept_turn_hit_rate = float(exec_turn_hit / turns_total)
++                concept_hits_total = int(exec_seq_hits + exec_set_hits)
++                concept_hits_per_turn_mean = float(concept_hits_total / turns_total)
++                concept_symbol_coverage_rate = float(
++                    (exec_cov / max(1, exec_sym_before)) if exec_sym_before > 0 else 0.0
++                )
++
++            ev["concepts_last_update_step"] = int(step)
++
+         # Dependency depth (for future macro-in-macro).
+         memo: Dict[str, int] = {}
+ 
+@@ -1503,6 +2027,37 @@
+             rr_items.sort(key=lambda x: (-x[1], x[0]))
+             rr_top = [{"id": rid, "count": int(c)} for rid, c in rr_items[:10]]
+ 
++        top_concepts: List[Dict[str, Any]] = []
++        if isinstance(concepts, dict) and concepts:
++            ranked_c: List[Tuple[int, int, int, str, Dict[str, Any]]] = []
++            for cid, ent in concepts.items():
++                if not isinstance(ent, dict):
++                    continue
++                if str(ent.get("kind", "")) != "concept":
++                    continue
++                ranked_c.append(
++                    (
++                        int(ent.get("gain_real_bits_est", 0) or 0),
++                        int(ent.get("contexts_distinct", 0) or 0),
++                        int(ent.get("count", 0) or 0),
++                        str(cid),
++                        ent,
++                    )
++                )
++            ranked_c.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]))
++            for g, ctx_n, c, cid, ent in ranked_c[:10]:
++                top_concepts.append(
++                    {
++                        "id": str(cid),
++                        "type": str(ent.get("type", "")),
++                        "source": str(ent.get("source", "")),
++                        "count": int(c),
++                        "contexts_distinct": int(ctx_n),
++                        "gain_real_bits_est": int(g),
++                        "pattern": list(ent.get("pattern") or []),
++                    }
++                )
++
+         total_symbols_before = int(raw_seq_symbols + raw_set_symbols)
+         total_symbols_after = int(seq_symbols_after + set_symbols_after)
+         num_turns = int(len(seqs_all))
+@@ -1542,9 +2097,27 @@
+             "macro_hits_set": int(set_hits),
+             "avg_trace_len_before": float(avg_before),
+             "avg_trace_len_after": float(avg_after),
++            "avg_trace_len_turn_before": float(avg_trace_len_turn_before),
++            "avg_trace_len_turn_after": float(avg_trace_len_turn_after),
+             "depth_compositional_max": int(depth_max),
+             "depth_compositional_median": int(depth_med),
++            "concept_cleared_for_net_mdl": bool(concept_cleared),
++            "concept_added": int(concept_added),
++            "concept_added_seq": int(concept_added_seq),
++            "concept_added_set": int(concept_added_set),
++            "concept_updated_existing": int(concept_updated_existing),
++            "concept_evicted": int(concept_evicted),
++            "concept_total": int(len(concepts)) if isinstance(concepts, dict) else 0,
++            "concept_trace_mdl_before_bits_est": int(concept_trace_mdl_before_bits_est),
++            "concept_trace_mdl_after_bits_est": int(concept_trace_mdl_after_bits_est),
++            "concept_trace_mdl_gain_bits_est": int(concept_trace_mdl_gain_bits_est),
++            "concept_library_cost_bits_est": int(concept_library_cost_bits_est),
++            "concept_trace_mdl_gain_real_bits_est": int(concept_trace_mdl_gain_real_bits_est),
++            "concept_turn_hit_rate": float(concept_turn_hit_rate),
++            "concept_symbol_coverage_rate": float(concept_symbol_coverage_rate),
++            "concept_hits_per_turn_mean": float(concept_hits_per_turn_mean),
+             "top_macros": top_macros,
++            "top_concepts": top_concepts,
+             "top_rewrite_rule_hits": rr_top,
+             "top_set_transitions": top_transitions[:10],
+         }
+@@ -3028,12 +3601,32 @@
+                     ),
+                     "acts_considered_per_token_mean": gen.get("acts_considered_per_token_mean"),
+                     "search_steps_per_turn_mean": gen.get("search_steps_per_turn_mean"),
++                    "predictor_iterated_per_token_mean": gen.get("predictor_iterated_per_token_mean"),
++                    "scan_acts_considered_per_token_mean": gen.get(
++                        "scan_acts_considered_per_token_mean"
++                    ),
++                    "scan_steps_per_turn_mean": gen.get("scan_steps_per_turn_mean"),
+                     "avg_trace_len_before": macro_meta.get("avg_trace_len_before")
+                     if macro_meta
+                     else None,
+                     "avg_trace_len_after": macro_meta.get("avg_trace_len_after")
+                     if macro_meta
+                     else None,
++                    "avg_trace_len_turn_before": macro_meta.get("avg_trace_len_turn_before")
++                    if macro_meta
++                    else None,
++                    "avg_trace_len_turn_after": macro_meta.get("avg_trace_len_turn_after")
++                    if macro_meta
++                    else None,
++                    "concept_turn_hit_rate": macro_meta.get("concept_turn_hit_rate")
++                    if macro_meta
++                    else None,
++                    "concept_symbol_coverage_rate": macro_meta.get("concept_symbol_coverage_rate")
++                    if macro_meta
++                    else None,
++                    "concept_hits_per_turn_mean": macro_meta.get("concept_hits_per_turn_mean")
++                    if macro_meta
++                    else None,
+                     "macro_hit_rate_seq": macro_meta.get("macro_hit_rate_seq") if macro_meta else None,
+                     "macro_hit_rate_set": macro_meta.get("macro_hit_rate_set") if macro_meta else None,
+                     "macro_hits_seq": macro_meta.get("macro_hits_seq") if macro_meta else None,
+@@ -3050,6 +3643,22 @@
+                     "trace_mdl_gain_real_bits_est": macro_meta.get("trace_mdl_gain_real_bits_est")
+                     if macro_meta
+                     else None,
++                    "concept_trace_mdl_before_bits_est": macro_meta.get(
++                        "concept_trace_mdl_before_bits_est"
++                    )
++                    if macro_meta
++                    else None,
++                    "concept_trace_mdl_after_bits_est": macro_meta.get("concept_trace_mdl_after_bits_est")
++                    if macro_meta
++                    else None,
++                    "concept_trace_mdl_gain_bits_est": macro_meta.get("concept_trace_mdl_gain_bits_est")
++                    if macro_meta
++                    else None,
++                    "concept_trace_mdl_gain_real_bits_est": macro_meta.get(
++                        "concept_trace_mdl_gain_real_bits_est"
++                    )
++                    if macro_meta
++                    else None,
+                     "total_macros": macro_meta.get("total_macros") if macro_meta else None,
+                     "macro_added": macro_meta.get("added") if macro_meta else None,
+                     "macro_updated": macro_meta.get("updated_existing") if macro_meta else None,
+@@ -3057,6 +3666,13 @@
+                     "macro_library_cost_bits_est": macro_meta.get("macro_library_cost_bits_est")
+                     if macro_meta
+                     else None,
++                    "concept_total": macro_meta.get("concept_total") if macro_meta else None,
++                    "concept_added": macro_meta.get("concept_added") if macro_meta else None,
++                    "concept_updated": macro_meta.get("concept_updated_existing") if macro_meta else None,
++                    "concept_evicted": macro_meta.get("concept_evicted") if macro_meta else None,
++                    "concept_library_cost_bits_est": macro_meta.get("concept_library_cost_bits_est")
++                    if macro_meta
++                    else None,
+                     "depth_compositional_max": macro_meta.get("depth_compositional_max")
+                     if macro_meta
+                     else None,
+--- patches/v36_base/suite.py	2026-01-10 19:48:05
++++ atos_core/suite.py	2026-01-10 19:50:10
+@@ -589,7 +589,9 @@
+     trace_candidates_sum = 0
+     trace_pred_matched_sum = 0
+     trace_pred_emitted_sum = 0
++    trace_pred_iterated_sum = 0
+     trace_act_evals_sum = 0
++    trace_scan_evals_sum = 0
+     trace_active_set_size: int = 0
+     trace_rewrite_rules_total: int = 0
+     trace_selector_present: int = 0
+@@ -642,6 +644,7 @@
+             cand_post = tr.get("candidates_post_rewrite") or []
+             pred_matched = tr.get("predictor_matched") or []
+             pred_emitted = tr.get("predictor_emitted") or []
++            pred_iterated = tr.get("predictor_iterated") or []
+             if isinstance(cand_post, list) and isinstance(pred_matched, list) and isinstance(pred_emitted, list):
+                 n_tok = min(len(cand_post), len(pred_matched), len(pred_emitted))
+                 if n_tok > 0:
+@@ -649,12 +652,22 @@
+                     trace_candidates_sum += int(sum(int(x) for x in cand_post[:n_tok]))
+                     trace_pred_matched_sum += int(sum(int(x) for x in pred_matched[:n_tok]))
+                     trace_pred_emitted_sum += int(sum(int(x) for x in pred_emitted[:n_tok]))
++                    if isinstance(pred_iterated, list):
++                        n2 = min(int(n_tok), int(len(pred_iterated)))
++                        if n2 > 0:
++                            trace_pred_iterated_sum += int(
++                                sum(int(x) for x in pred_iterated[:n2])
++                            )
+ 
+                     rr_total = int(tr.get("rewrite_rules_total", 0) or 0)
+                     sel_present = 1 if tr.get("selector_id") else 0
+                     trace_act_evals_sum += int(sum(int(x) for x in pred_matched[:n_tok]))
+                     trace_act_evals_sum += int(n_tok * rr_total)
+                     trace_act_evals_sum += int(n_tok * sel_present)
++                    if isinstance(pred_iterated, list) and n2 > 0:
++                        trace_scan_evals_sum += int(sum(int(x) for x in pred_iterated[:n2]))
++                        trace_scan_evals_sum += int(n2 * rr_total)
++                        trace_scan_evals_sum += int(n2 * sel_present)
+ 
+                     if trace_active_set_size <= 0:
+                         trace_active_set_size = int(tr.get("active_set_size", 0) or 0)
+@@ -699,6 +712,17 @@
+         metrics["search_steps_per_turn_mean"] = float(
+             trace_act_evals_sum / max(1, len(reply_sigs))
+         )
++        if trace_pred_iterated_sum > 0:
++            metrics["predictor_iterated_per_token_mean"] = float(
++                trace_pred_iterated_sum / trace_tokens_total
++            )
++        if trace_scan_evals_sum > 0:
++            metrics["scan_acts_considered_per_token_mean"] = float(
++                trace_scan_evals_sum / trace_tokens_total
++            )
++            metrics["scan_steps_per_turn_mean"] = float(
++                trace_scan_evals_sum / max(1, len(reply_sigs))
++            )
+         metrics["trace_active_set_size"] = int(trace_active_set_size)
+         metrics["trace_rewrite_rules_total"] = int(trace_rewrite_rules_total)
+         metrics["trace_selector_present"] = int(trace_selector_present)
+@@ -866,7 +890,9 @@
+     trace_candidates_sum = 0
+     trace_pred_matched_sum = 0
+     trace_pred_emitted_sum = 0
++    trace_pred_iterated_sum = 0
+     trace_act_evals_sum = 0
++    trace_scan_evals_sum = 0
+     trace_active_set_size: int = 0
+     trace_rewrite_rules_total: int = 0
+     trace_selector_present: int = 0
+@@ -899,6 +925,7 @@
+                 cand_post = tr.get("candidates_post_rewrite") or []
+                 pred_matched = tr.get("predictor_matched") or []
+                 pred_emitted = tr.get("predictor_emitted") or []
++                pred_iterated = tr.get("predictor_iterated") or []
+                 if (
+                     isinstance(cand_post, list)
+                     and isinstance(pred_matched, list)
+@@ -914,12 +941,24 @@
+                         trace_pred_emitted_sum += int(
+                             sum(int(x) for x in pred_emitted[:n_tok])
+                         )
++                        if isinstance(pred_iterated, list):
++                            n2 = min(int(n_tok), int(len(pred_iterated)))
++                            if n2 > 0:
++                                trace_pred_iterated_sum += int(
++                                    sum(int(x) for x in pred_iterated[:n2])
++                                )
+ 
+                         rr_total = int(tr.get("rewrite_rules_total", 0) or 0)
+                         sel_present = 1 if tr.get("selector_id") else 0
+                         trace_act_evals_sum += int(sum(int(x) for x in pred_matched[:n_tok]))
+                         trace_act_evals_sum += int(n_tok * rr_total)
+                         trace_act_evals_sum += int(n_tok * sel_present)
++                        if isinstance(pred_iterated, list) and n2 > 0:
++                            trace_scan_evals_sum += int(
++                                sum(int(x) for x in pred_iterated[:n2])
++                            )
++                            trace_scan_evals_sum += int(n2 * rr_total)
++                            trace_scan_evals_sum += int(n2 * sel_present)
+ 
+                         if trace_active_set_size <= 0:
+                             trace_active_set_size = int(tr.get("active_set_size", 0) or 0)
+@@ -961,6 +1000,17 @@
+         metrics["search_steps_per_turn_mean"] = float(
+             trace_act_evals_sum / max(1, len(reply_sigs))
+         )
++        if trace_pred_iterated_sum > 0:
++            metrics["predictor_iterated_per_token_mean"] = float(
++                trace_pred_iterated_sum / trace_tokens_total
++            )
++        if trace_scan_evals_sum > 0:
++            metrics["scan_acts_considered_per_token_mean"] = float(
++                trace_scan_evals_sum / trace_tokens_total
++            )
++            metrics["scan_steps_per_turn_mean"] = float(
++                trace_scan_evals_sum / max(1, len(reply_sigs))
++            )
+         metrics["trace_active_set_size"] = int(trace_active_set_size)
+         metrics["trace_rewrite_rules_total"] = int(trace_rewrite_rules_total)
+         metrics["trace_selector_present"] = int(trace_selector_present)

@@ -1,0 +1,1886 @@
+--- /dev/null	2026-01-18 22:01:36
++++ atos_core/arc_loader_v138.py	2026-01-18 20:56:19
+@@ -0,0 +1,200 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .grid_v124 import GridV124, grid_from_list_v124, grid_shape_v124, unique_colors_v124
++
++ARC_LOADER_SCHEMA_VERSION_V138 = 138
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _resolve_arc_tasks_root_v138(*, arc_root: str, split: Optional[str]) -> Path:
++    # Same split-aware rules as v137: honor root/{training,evaluation} and root/data/{training,evaluation}.
++    root = Path(str(arc_root)).resolve()
++    if not root.exists():
++        raise FileNotFoundError(f"arc_root_missing:{root}")
++
++    requested = str(split or "").strip()
++    candidates: List[Tuple[Path, List[str]]] = []
++    for base in (root, root / "data"):
++        if not base.exists():
++            continue
++        found: List[str] = []
++        for name in ("training", "evaluation"):
++            if (base / name).is_dir():
++                found.append(name)
++        if found:
++            candidates.append((base, sorted(found)))
++
++    if candidates:
++        avail = sorted(set(x for _, fs in candidates for x in fs))
++        if requested not in avail:
++            raise ValueError(
++                f"arc_split_required:requested={requested or '<missing>'} available={','.join(avail)} root={root}"
++            )
++        for base, fs in candidates:
++            if requested in fs:
++                return (base / requested).resolve()
++        raise ValueError("arc_split_resolution_failed")
++
++    if requested and requested not in ("sample", "synth"):
++        raise ValueError(f"arc_split_not_found:requested={requested} root={root}")
++    return root
++
++
++@dataclass(frozen=True)
++class ArcTaskV138:
++    task_id: str
++    train_pairs: Tuple[Tuple[GridV124, GridV124], ...]
++    # In ARC-AGI datasets, test outputs exist (used for scoring-only). In internal samples,
++    # test outputs may be omitted; keep them as Optional and let the runner fall back to
++    # solver-status-only accounting for those cases.
++    test_pairs: Tuple[Tuple[GridV124, Optional[GridV124]], ...]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "schema_version": int(ARC_LOADER_SCHEMA_VERSION_V138),
++            "kind": "arc_task_v138",
++            "task_id": str(self.task_id),
++            "train_pairs": [
++                {"in_grid": [list(r) for r in inp], "out_grid": [list(r) for r in out]}
++                for inp, out in self.train_pairs
++            ],
++            "test_pairs": [
++                {
++                    "in_grid": [list(r) for r in inp],
++                    "out_grid": ([list(r) for r in out] if out is not None else None),
++                }
++                for inp, out in self.test_pairs
++            ],
++        }
++
++
++def _parse_grid_v138(x: Any) -> GridV124:
++    if not isinstance(x, list):
++        raise ValueError("grid_not_list")
++    rows: List[List[int]] = []
++    for row in x:
++        if not isinstance(row, list):
++            raise ValueError("grid_row_not_list")
++        rows.append([int(v) for v in row])
++    return grid_from_list_v124(rows)
++
++
++def _validate_grid_v138(g: GridV124) -> None:
++    h, w = grid_shape_v124(g)
++    if h < 0 or w < 0:
++        raise ValueError("invalid_grid_shape")
++    for c in unique_colors_v124(g):
++        cc = int(c)
++        if cc < 0 or cc > 9:
++            raise ValueError("grid_color_out_of_range")
++
++
++def _parse_task_json_v138(*, path: Path, task_id: str) -> ArcTaskV138:
++    obj = json.loads(path.read_text(encoding="utf-8"))
++    train_pairs: List[Tuple[GridV124, GridV124]] = []
++    for pair in obj.get("train", []):
++        inp = _parse_grid_v138(pair.get("input"))
++        out = _parse_grid_v138(pair.get("output"))
++        train_pairs.append((inp, out))
++
++    tests = obj.get("test", [])
++    if not tests:
++        raise ValueError("missing_test")
++    test_pairs: List[Tuple[GridV124, Optional[GridV124]]] = []
++    for pair in tests:
++        inp = _parse_grid_v138(pair.get("input"))
++        out_obj = pair.get("output")
++        out = _parse_grid_v138(out_obj) if out_obj is not None else None
++        test_pairs.append((inp, out))
++
++    grids_to_validate: List[GridV124] = []
++    grids_to_validate.extend([p[0] for p in train_pairs])
++    grids_to_validate.extend([p[1] for p in train_pairs])
++    grids_to_validate.extend([p[0] for p in test_pairs])
++    grids_to_validate.extend([p[1] for p in test_pairs if p[1] is not None])  # type: ignore[misc]
++    for g in grids_to_validate:
++        _validate_grid_v138(g)
++
++    return ArcTaskV138(task_id=str(task_id), train_pairs=tuple(train_pairs), test_pairs=tuple(test_pairs))
++
++
++def write_arc_canonical_jsonl_v138(
++    *, arc_root: str, split: Optional[str], limit: int, out_jsonl: Path, out_manifest: Path
++) -> Dict[str, Any]:
++    tasks_root = _resolve_arc_tasks_root_v138(arc_root=str(arc_root), split=split)
++    if out_jsonl.exists():
++        raise FileExistsError(f"worm_exists:{out_jsonl}")
++    if out_manifest.exists():
++        raise FileExistsError(f"worm_exists:{out_manifest}")
++    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
++    out_manifest.parent.mkdir(parents=True, exist_ok=True)
++
++    task_paths = sorted(tasks_root.rglob("*.json"), key=lambda p: str(p.relative_to(tasks_root)))
++    if int(limit) > 0:
++        task_paths = task_paths[: int(limit)]
++
++    inputs: List[Dict[str, Any]] = []
++    rows: List[str] = []
++    for p in task_paths:
++        task_id = str(p.relative_to(tasks_root)).replace("\\", "/")
++        sha = _sha256_file(p)
++        inputs.append({"task_id": str(task_id), "path": str(p), "sha256": str(sha)})
++        task = _parse_task_json_v138(path=p, task_id=task_id)
++        rows.append(canonical_json_dumps(task.to_dict()))
++
++    with open(out_jsonl, "x", encoding="utf-8") as f:
++        for line in rows:
++            f.write(line + "\n")
++
++    manifest_obj: Dict[str, Any] = {
++        "schema_version": int(ARC_LOADER_SCHEMA_VERSION_V138),
++        "kind": "arc_manifest_v138",
++        "arc_root_input": str(Path(str(arc_root)).resolve()),
++        "tasks_root": str(tasks_root),
++        "split": str(split or ""),
++        "limit": int(limit),
++        "inputs": inputs,
++        "canonical_jsonl_sha256": _sha256_file(out_jsonl),
++    }
++    manifest_obj["manifest_sig"] = sha256_hex(canonical_json_dumps(manifest_obj).encode("utf-8"))
++    with open(out_manifest, "x", encoding="utf-8") as f:
++        json.dump(manifest_obj, f, ensure_ascii=False, sort_keys=True, indent=2)
++        f.write("\n")
++    return manifest_obj
++
++
++def iter_canonical_tasks_v138(jsonl_path: str) -> Iterator[ArcTaskV138]:
++    with open(str(jsonl_path), "r", encoding="utf-8") as f:
++        for line in f:
++            if not line.strip():
++                continue
++            obj = json.loads(line)
++            train_pairs: List[Tuple[GridV124, GridV124]] = []
++            for pair in obj.get("train_pairs", []):
++                inp = _parse_grid_v138(pair.get("in_grid"))
++                out = _parse_grid_v138(pair.get("out_grid"))
++                train_pairs.append((inp, out))
++            test_pairs: List[Tuple[GridV124, Optional[GridV124]]] = []
++            for pair in obj.get("test_pairs", []):
++                inp = _parse_grid_v138(pair.get("in_grid"))
++                out_obj = pair.get("out_grid")
++                out = _parse_grid_v138(out_obj) if out_obj is not None else None
++                test_pairs.append((inp, out))
++            yield ArcTaskV138(task_id=str(obj.get("task_id")), train_pairs=tuple(train_pairs), test_pairs=tuple(test_pairs))
+--- /dev/null	2026-01-18 22:01:36
++++ atos_core/arc_solver_v138.py	2026-01-18 20:51:31
+@@ -0,0 +1,712 @@
++from __future__ import annotations
++
++import heapq
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .arc_objects_v132 import BBoxV132, ObjectV132, ObjectSetV132, connected_components4_v132
++from .arc_ops_v137 import StateV132, apply_op_v137, step_cost_bits_v137
++from .grid_v124 import (
++    GridV124,
++    bbox_nonzero_v124,
++    crop_to_bbox_nonzero_v124,
++    grid_equal_v124,
++    grid_from_list_v124,
++    grid_hash_v124,
++    grid_shape_v124,
++    pad_to_v124,
++    unique_colors_v124,
++)
++
++ARC_SOLVER_SCHEMA_VERSION_V138 = 138
++
++
++def _validate_grid_values_v138(g: GridV124) -> None:
++    for row in g:
++        for v in row:
++            x = int(v)
++            if x < 0 or x > 9:
++                raise ValueError("grid_color_out_of_range")
++
++
++def _summarize_mismatch_v138(*, got: GridV124, want: GridV124) -> Dict[str, Any]:
++    hg, wg = grid_shape_v124(got)
++    hw, ww = grid_shape_v124(want)
++    if (hg, wg) != (hw, ww):
++        return {"kind": "shape_mismatch", "got": {"h": int(hg), "w": int(wg)}, "want": {"h": int(hw), "w": int(ww)}}
++    diff = 0
++    for r in range(hg):
++        for c in range(wg):
++            if int(got[r][c]) != int(want[r][c]):
++                diff += 1
++    return {"kind": "cell_mismatch", "diff_cells": int(diff)}
++
++
++def _stage_from_avail_v138(avail: Set[str]) -> str:
++    # A small abstract stage for reachability pruning.
++    if "grid" not in avail:
++        return "none"
++    # These stages are intentionally coarse; must remain sound.
++    if "patch" in avail:
++        return "patch"
++    if "bbox" in avail:
++        return "bbox"
++    if "obj" in avail:
++        return "obj"
++    if "objset" in avail:
++        return "objset"
++    return "grid"
++
++
++def _abstract_slots_after_steps_v138(steps: Sequence["ProgramStepV138"]) -> Set[str]:
++    avail: Set[str] = {"grid"}
++    for s in steps:
++        op = str(s.op_id)
++        if op == "cc4":
++            avail.add("objset")
++        elif op == "select_obj":
++            if "objset" in avail:
++                avail.add("obj")
++        elif op == "obj_bbox":
++            if "obj" in avail:
++                avail.add("bbox")
++        elif op in {"bbox_by_color"}:
++            avail.add("bbox")
++        elif op in {"crop_bbox"}:
++            pass
++        elif op in {"new_canvas"}:
++            pass
++        elif op in {"paint_rect", "draw_rect_border"}:
++            pass
++        elif op in {"pad_to"}:
++            pass
++        elif op in {"crop_bbox_nonzero"}:
++            pass
++        elif op in {"translate", "map_colors", "repeat_grid", "overlay_self_translate", "propagate_color_translate"}:
++            pass
++        elif op in {"paste"}:
++            avail.add("patch")
++        # If unknown op_id, do not add slots (fail-open for pruning).
++    return avail
++
++
++def _min_steps_to_grid_modify_v138(stage: str) -> int:
++    # Minimal number of steps needed to modify grid from a given stage.
++    st = str(stage)
++    if st == "none":
++        return 10**9
++    # Any stage that has grid can apply a grid-writing op in 1 step.
++    return 1
++
++
++def _can_reach_shape_v138(*, stage: str, got_shape: Tuple[int, int], want_shape: Tuple[int, int], steps_left: int) -> bool:
++    # Sound over-approx shape reachability for current operator inventory.
++    if steps_left < 0:
++        return False
++    (hg, wg) = (int(got_shape[0]), int(got_shape[1]))
++    (hw, ww) = (int(want_shape[0]), int(want_shape[1]))
++    if (hg, wg) == (hw, ww):
++        return True
++    # With remaining steps, we can reach arbitrary (hw,ww) iff we can apply pad_to/new_canvas/crop.
++    # In this solver family, pad_to and new_canvas are available at any stage with grid; crop_bbox needs bbox.
++    if steps_left <= 0:
++        return False
++    st = str(stage)
++    if st in {"grid", "objset", "obj", "bbox", "patch"}:
++        # pad_to/new_canvas allow reaching any target shape.
++        return True
++    return False
++
++
++@dataclass(frozen=True)
++class ProgramStepV138:
++    op_id: str
++    args: Dict[str, Any]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {"op_id": str(self.op_id), "args": dict(self.args)}
++
++
++@dataclass(frozen=True)
++class ProgramV138:
++    steps: Tuple[ProgramStepV138, ...]
++
++    def program_sig(self) -> str:
++        return sha256_hex(canonical_json_dumps({"steps": [s.to_dict() for s in self.steps]}).encode("utf-8"))
++
++
++@dataclass(frozen=True)
++class _EvalInfoV138:
++    ok_train: bool
++    loss: Tuple[int, int]
++    mismatch_ex: Optional[Dict[str, Any]]
++
++
++def _apply_step_v138(state: StateV132, step: ProgramStepV138) -> StateV132:
++    return apply_op_v137(state=state, op_id=str(step.op_id), args=dict(step.args))
++
++
++def apply_program_v138(prog: ProgramV138, grid: GridV124) -> GridV124:
++    state = StateV132(grid=grid)
++    for step in prog.steps:
++        state = _apply_step_v138(state, step)
++    return state.grid
++
++
++def _program_cost_bits_v138(steps: Sequence[ProgramStepV138]) -> int:
++    total = 0
++    for st in steps:
++        total += int(step_cost_bits_v137(op_id=str(st.op_id), args=dict(st.args)))
++    return int(total)
++
++
++def _state_sig_v138(*, stage: str, state: StateV132, cc4_bg: Optional[int]) -> str:
++    h = {"grid_hash": grid_hash_v124(state.grid)}
++    st = str(stage)
++    if st in {"objset", "obj", "bbox", "patch"} and cc4_bg is not None:
++        h["cc4_bg"] = int(cc4_bg)
++    if state.bbox is not None:
++        h["bbox"] = state.bbox.to_dict()
++    if state.patch is not None:
++        h["patch_hash"] = grid_hash_v124(state.patch)
++    if state.obj is not None:
++        h["obj_sig"] = str(state.obj.object_sig())
++    if state.objset is not None:
++        h["objset_sig"] = str(state.objset.set_sig())
++    return sha256_hex(canonical_json_dumps(h).encode("utf-8"))
++
++
++def _eval_on_train_v138(*, prog: ProgramV138, train_pairs: Sequence[Tuple[GridV124, GridV124]]) -> _EvalInfoV138:
++    diff_sum = 0
++    shape_pen = 0
++    mismatch_ex: Optional[Dict[str, Any]] = None
++    for inp, out in train_pairs:
++        try:
++            got = apply_program_v138(prog, inp)
++        except Exception as e:
++            return _EvalInfoV138(ok_train=False, loss=(10**9, 10**9), mismatch_ex={"kind": "exception", "error": str(e)})
++        mm = _summarize_mismatch_v138(got=got, want=out)
++        if mm["kind"] == "shape_mismatch":
++            shape_pen += 100000
++        else:
++            diff_sum += int(mm.get("diff_cells") or 0)
++        if mismatch_ex is None and (mm["kind"] != "cell_mismatch" or int(mm.get("diff_cells") or 0) != 0):
++            mismatch_ex = mm
++    ok = diff_sum == 0 and shape_pen == 0
++    return _EvalInfoV138(ok_train=ok, loss=(int(shape_pen), int(diff_sum)), mismatch_ex=mismatch_ex)
++
++
++def _bg_candidates_v138(grids: Sequence[GridV124]) -> Tuple[int, ...]:
++    from .arc_solver_v134 import _bg_candidates_v134
++
++    return _bg_candidates_v134(grids)
++
++
++def _infer_color_mapping_v138(inp: GridV124, out: GridV124) -> Optional[Dict[str, int]]:
++    from .arc_solver_v134 import _infer_color_mapping_v134
++
++    return _infer_color_mapping_v134(inp, out)
++
++
++def _infer_repeat_grid_steps_v138(train_pairs: Sequence[Tuple[GridV124, GridV124]]) -> List[ProgramStepV138]:
++    from .arc_solver_v134 import _infer_repeat_grid_steps_v134
++
++    steps_v134 = _infer_repeat_grid_steps_v134(train_pairs)
++    out: List[ProgramStepV138] = []
++    for s in steps_v134:
++        out.append(ProgramStepV138(op_id=str(s.op_id), args=dict(s.args)))
++    return out
++
++
++def _infer_overlay_self_translate_steps_v138(
++    *, train_pairs: Sequence[Tuple[GridV124, GridV124]], bg_candidates: Sequence[int]
++) -> List[ProgramStepV138]:
++    from .arc_solver_v135 import _infer_overlay_self_translate_steps_v135
++
++    steps_v135 = _infer_overlay_self_translate_steps_v135(train_pairs=train_pairs, bg_candidates=tuple(int(x) for x in bg_candidates))
++    out: List[ProgramStepV138] = []
++    for s in steps_v135:
++        out.append(ProgramStepV138(op_id=str(s.op_id), args=dict(s.args)))
++    return out
++
++
++def _infer_propagate_color_translate_steps_v138(
++    *, train_pairs: Sequence[Tuple[GridV124, GridV124]], bg_candidates: Sequence[int]
++) -> List[ProgramStepV138]:
++    from .arc_solver_v137 import _infer_propagate_color_translate_steps_v137
++
++    steps_v137 = _infer_propagate_color_translate_steps_v137(train_pairs=train_pairs, bg_candidates=tuple(int(x) for x in bg_candidates))
++    out: List[ProgramStepV138] = []
++    for s in steps_v137:
++        out.append(ProgramStepV138(op_id=str(s.op_id), args=dict(s.args)))
++    return out
++
++
++def _infer_direct_steps_v138(*, train_pairs: Sequence[Tuple[GridV124, GridV124]], test_in: GridV124) -> List[ProgramStepV138]:
++    direct: List[ProgramStepV138] = []
++
++    for op_id in ["rotate90", "rotate180", "rotate270", "reflect_h", "reflect_v"]:
++        ok = True
++        step = ProgramStepV138(op_id=str(op_id), args={})
++        for inp, out in train_pairs:
++            got = apply_program_v138(ProgramV138(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    mapping: Dict[str, int] = {}
++    mapping_ok = True
++    for inp, out in train_pairs:
++        m = _infer_color_mapping_v138(inp, out)
++        if m is None:
++            mapping_ok = False
++            break
++        for k in m.keys():
++            if k in mapping and int(mapping[k]) != int(m[k]):
++                mapping_ok = False
++                break
++            mapping[k] = int(m[k])
++        if not mapping_ok:
++            break
++    if mapping_ok and mapping:
++        ok = True
++        step = ProgramStepV138(op_id="map_colors", args={"mapping": {str(k): int(mapping[k]) for k in sorted(mapping.keys())}})
++        for inp, out in train_pairs:
++            got = apply_program_v138(ProgramV138(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    bgs = _bg_candidates_v138([p[0] for p in train_pairs] + [test_in])
++    for bg in bgs:
++        shift: Optional[Tuple[int, int]] = None
++        consistent = True
++        for inp, out in train_pairs:
++            hi, wi = grid_shape_v124(inp)
++            ho, wo = grid_shape_v124(out)
++            if (hi, wi) != (ho, wo):
++                consistent = False
++                break
++            ir0, ic0, _, _ = bbox_nonzero_v124(inp, bg=int(bg))
++            or0, oc0, _, _ = bbox_nonzero_v124(out, bg=int(bg))
++            dy = int(or0 - ir0)
++            dx = int(oc0 - ic0)
++            if shift is None:
++                shift = (dy, dx)
++            elif shift != (dy, dx):
++                consistent = False
++                break
++        if not consistent or shift is None:
++            continue
++        dy, dx = shift
++        if dy == 0 and dx == 0:
++            continue
++        step = ProgramStepV138(op_id="translate", args={"dx": int(dx), "dy": int(dy), "pad": int(bg)})
++        ok = True
++        for inp, out in train_pairs:
++            got = apply_program_v138(ProgramV138(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    for bg in bgs:
++        ok = True
++        for inp, out in train_pairs:
++            got = crop_to_bbox_nonzero_v124(inp, bg=int(bg))
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(ProgramStepV138(op_id="crop_bbox_nonzero", args={"bg": int(bg)}))
++
++    shapes_out = sorted({grid_shape_v124(out) for _, out in train_pairs})
++    for h, w in shapes_out:
++        for bg in bgs:
++            ok = True
++            for inp, out in train_pairs:
++                got = pad_to_v124(inp, height=int(h), width=int(w), pad=int(bg))
++                if not grid_equal_v124(got, out):
++                    ok = False
++                    break
++            if ok:
++                direct.append(ProgramStepV138(op_id="pad_to", args={"height": int(h), "width": int(w), "pad": int(bg)}))
++
++    direct.extend(_infer_repeat_grid_steps_v138(train_pairs))
++    direct.extend(_infer_overlay_self_translate_steps_v138(train_pairs=train_pairs, bg_candidates=bgs))
++    direct.extend(_infer_propagate_color_translate_steps_v138(train_pairs=train_pairs, bg_candidates=bgs))
++
++    direct.sort(key=lambda s: canonical_json_dumps(s.to_dict()))
++    seen: Set[str] = set()
++    out_steps: List[ProgramStepV138] = []
++    for s in direct:
++        sig = sha256_hex(canonical_json_dumps(s.to_dict()).encode("utf-8"))
++        if sig in seen:
++            continue
++        seen.add(sig)
++        out_steps.append(s)
++    return out_steps
++
++
++def _propose_bbox_by_color_steps_v138(*, train_pairs: Sequence[Tuple[GridV124, GridV124]]) -> List[ProgramStepV138]:
++    if not train_pairs:
++        return []
++    colors_all: Optional[Set[int]] = None
++    for inp, _ in train_pairs:
++        cs = set(int(c) for c in unique_colors_v124(inp))
++        colors_all = cs if colors_all is None else (colors_all & cs)
++        if not colors_all:
++            return []
++    assert colors_all is not None
++    return [ProgramStepV138(op_id="bbox_by_color", args={"color": int(c)}) for c in sorted(colors_all)]
++
++
++def _cc4_nonempty_for_all_v138(*, grids: Sequence[GridV124], bg: int) -> bool:
++    for g in grids:
++        try:
++            oset = connected_components4_v132(g, bg=int(bg))
++        except Exception:
++            return False
++        if not getattr(oset, "objects", None):
++            return False
++        if len(oset.objects) <= 0:
++            return False
++    return True
++
++
++def _crop_bbox_nonzero_is_noop_v138(*, train_in: Sequence[GridV124], bg: int) -> bool:
++    for g in train_in:
++        h, w = grid_shape_v124(g)
++        r0, c0, r1, c1 = bbox_nonzero_v124(g, bg=int(bg))
++        if int(r0) != 0 or int(c0) != 0 or int(r1) != int(h) or int(c1) != int(w):
++            return False
++    return True
++
++
++def _pad_to_is_noop_v138(*, train_in_shapes: Sequence[Tuple[int, int]], height: int, width: int) -> bool:
++    for h, w in train_in_shapes:
++        if int(h) > int(height) or int(w) > int(width):
++            return False
++    return True
++
++
++def _propose_next_steps_v138(
++    *,
++    steps_so_far: Sequence[ProgramStepV138],
++    train_pairs: Sequence[Tuple[GridV124, GridV124]],
++    test_in: GridV124,
++    bg_candidates: Sequence[int],
++    shapes_out: Sequence[Tuple[int, int]],
++    palette_out: Sequence[int],
++    direct_steps: Sequence[ProgramStepV138],
++) -> List[ProgramStepV138]:
++    avail = _abstract_slots_after_steps_v138(steps_so_far)
++    stage = _stage_from_avail_v138(avail)
++
++    train_in = [p[0] for p in train_pairs]
++    train_in_shapes = [grid_shape_v124(g) for g in train_in]
++    out_steps: List[ProgramStepV138] = []
++
++    # direct steps first (strong constraints).
++    for s in direct_steps:
++        out_steps.append(s)
++
++    # bbox_by_color can create bbox.
++    if "bbox" not in avail:
++        out_steps.extend(_propose_bbox_by_color_steps_v138(train_pairs=train_pairs))
++
++    # object pipeline is only possible after cc4.
++    if "objset" not in avail:
++        for bg in bg_candidates:
++            if not _cc4_nonempty_for_all_v138(grids=train_in + [test_in], bg=int(bg)):
++                continue
++            out_steps.append(ProgramStepV138(op_id="cc4", args={"bg": int(bg)}))
++
++    if "objset" in avail and "obj" not in avail:
++        # Conservative, small selector arg set (delegated).
++        from .arc_solver_v134 import _infer_select_obj_args_v134
++
++        args_list = _infer_select_obj_args_v134(train_pairs=train_pairs, bg=int(bg_candidates[0] if bg_candidates else 0), max_rank=1)
++        for a in args_list:
++            out_steps.append(ProgramStepV138(op_id="select_obj", args=dict(a)))
++
++    if "obj" in avail and "bbox" not in avail:
++        out_steps.append(ProgramStepV138(op_id="obj_bbox", args={}))
++
++    # bbox-driven crops.
++    if "bbox" in avail:
++        out_steps.append(ProgramStepV138(op_id="crop_bbox", args={}))
++
++    # grid-only ops always possible.
++    for bg in bg_candidates:
++        if not _crop_bbox_nonzero_is_noop_v138(train_in=train_in + [test_in], bg=int(bg)):
++            out_steps.append(ProgramStepV138(op_id="crop_bbox_nonzero", args={"bg": int(bg)}))
++
++    for (h, w) in shapes_out:
++        for bg in bg_candidates:
++            if _pad_to_is_noop_v138(train_in_shapes=train_in_shapes + [grid_shape_v124(test_in)], height=int(h), width=int(w)):
++                continue
++            out_steps.append(ProgramStepV138(op_id="pad_to", args={"height": int(h), "width": int(w), "pad": int(bg)}))
++
++    # new_canvas: propose output shapes and bg candidates.
++    for (h, w) in shapes_out:
++        for bg in bg_candidates:
++            out_steps.append(ProgramStepV138(op_id="new_canvas", args={"height": int(h), "width": int(w), "bg": int(bg)}))
++
++    # paint/draw require bbox; if present, propose colors from palette_out.
++    if "bbox" in avail:
++        for c in palette_out:
++            out_steps.append(ProgramStepV138(op_id="paint_rect", args={"color": int(c)}))
++            out_steps.append(ProgramStepV138(op_id="draw_rect_border", args={"color": int(c), "thickness": 1}))
++
++    # Dedup deterministically.
++    out_steps.sort(key=lambda s: canonical_json_dumps(s.to_dict()))
++    seen: Set[str] = set()
++    uniq: List[ProgramStepV138] = []
++    for s in out_steps:
++        sig = sha256_hex(canonical_json_dumps(s.to_dict()).encode("utf-8"))
++        if sig in seen:
++            continue
++        seen.add(sig)
++        uniq.append(s)
++    return uniq
++
++
++@dataclass(frozen=True)
++class SolveConfigV138:
++    max_depth: int = 4
++    max_programs: int = 4000
++    trace_program_limit: int = 80
++    max_ambiguous_outputs: int = 8
++
++
++def solve_arc_task_v138(*, train_pairs: Sequence[Tuple[GridV124, GridV124]], test_in: GridV124, config: SolveConfigV138) -> Dict[str, Any]:
++    for inp, out in train_pairs:
++        _validate_grid_values_v138(inp)
++        _validate_grid_values_v138(out)
++    _validate_grid_values_v138(test_in)
++
++    bgs = _bg_candidates_v138([p[0] for p in train_pairs] + [test_in])
++    shapes_out = tuple(sorted({grid_shape_v124(out) for _, out in train_pairs}))
++    palette_out_set: Set[int] = set()
++    for _, out in train_pairs:
++        palette_out_set |= set(int(c) for c in unique_colors_v124(out))
++    palette_out = tuple(sorted(palette_out_set))
++
++    direct_steps = _infer_direct_steps_v138(train_pairs=train_pairs, test_in=test_in)
++
++    max_depth = int(config.max_depth)
++    max_programs = int(config.max_programs)
++    trace_program_limit = int(config.trace_program_limit)
++
++    heap: List[Tuple[Tuple[int, int, int, str], Tuple[ProgramStepV138, ...]]] = []
++    start: Tuple[ProgramStepV138, ...] = tuple()
++    start_prog = ProgramV138(steps=start)
++    start_cost = _program_cost_bits_v138(start)
++    start_eval = _eval_on_train_v138(prog=start_prog, train_pairs=train_pairs)
++    heapq.heappush(heap, ((int(start_cost), int(start_eval.loss[0]), int(start_eval.loss[1]), start_prog.program_sig()), start))
++
++    best_by_state: Dict[str, Tuple[int, int]] = {}
++    trace_programs: List[Dict[str, Any]] = []
++    tried = 0
++    min_cost_solutions: List[ProgramV138] = []
++    min_cost_bits: Optional[int] = None
++
++    pruned_by_shape_reachability = 0
++    pruned_by_palette_reachability = 0
++    pruned_by_dominated_state = 0
++    pruned_by_no_grid_modify_in_time = 0
++
++    def record_trace(*, steps: Tuple[ProgramStepV138, ...], cost_bits: int, depth: int, ok_train: bool, mismatch: Optional[Dict[str, Any]]) -> None:
++        if len(trace_programs) >= trace_program_limit:
++            return
++        trace_programs.append(
++            {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++                "kind": "arc_trace_program_v138",
++                "program_sig": ProgramV138(steps=steps).program_sig(),
++                "cost_bits": int(cost_bits),
++                "depth": int(depth),
++                "ok_train": bool(ok_train),
++                "mismatch": mismatch,
++                "steps": [s.to_dict() for s in steps],
++            }
++        )
++
++    while heap and tried < max_programs:
++        (_pri, steps) = heapq.heappop(heap)
++        tried += 1
++        depth = int(len(steps))
++        prog = ProgramV138(steps=steps)
++        cost_bits = _program_cost_bits_v138(steps)
++
++        stage = _stage_from_avail_v138(_abstract_slots_after_steps_v138(steps))
++        steps_left = int(max_depth - depth)
++
++        shapes_ok = True
++        for (inp, out) in train_pairs:
++            if not _can_reach_shape_v138(stage=stage, got_shape=grid_shape_v124(inp), want_shape=grid_shape_v124(out), steps_left=steps_left):
++                shapes_ok = False
++                break
++        if not shapes_ok:
++            pruned_by_shape_reachability += 1
++            continue
++
++        if int(steps_left) > 0:
++            if int(_min_steps_to_grid_modify_v138(stage)) > int(steps_left):
++                pruned_by_no_grid_modify_in_time += 1
++                continue
++
++        try:
++            st = StateV132(grid=test_in)
++            cc4_bg = None
++            for s in steps:
++                if str(s.op_id) == "cc4":
++                    cc4_bg = int((s.args or {}).get("bg") or 0)
++                st = _apply_step_v138(st, s)
++            sig = _state_sig_v138(stage=stage, state=st, cc4_bg=cc4_bg)
++            dom = best_by_state.get(sig)
++            if dom is not None:
++                dom_depth, dom_cost = dom
++                if int(dom_depth) <= int(depth) and int(dom_cost) <= int(cost_bits):
++                    pruned_by_dominated_state += 1
++                    continue
++            best_by_state[sig] = (int(min(dom[0], depth) if dom else depth), int(min(dom[1], cost_bits) if dom else cost_bits))
++        except Exception:
++            pass
++
++        ev = _eval_on_train_v138(prog=prog, train_pairs=train_pairs)
++        record_trace(steps=steps, cost_bits=cost_bits, depth=depth, ok_train=ev.ok_train, mismatch=ev.mismatch_ex)
++
++        if ev.ok_train:
++            if min_cost_bits is None or int(cost_bits) < int(min_cost_bits):
++                min_cost_bits = int(cost_bits)
++                min_cost_solutions = [prog]
++            elif int(cost_bits) == int(min_cost_bits):
++                min_cost_solutions.append(prog)
++            continue
++
++        if depth >= max_depth:
++            continue
++
++        next_steps = _propose_next_steps_v138(
++            steps_so_far=list(steps),
++            train_pairs=train_pairs,
++            test_in=test_in,
++            bg_candidates=tuple(int(x) for x in bgs),
++            shapes_out=tuple(shapes_out),
++            palette_out=tuple(int(c) for c in palette_out),
++            direct_steps=list(direct_steps),
++        )
++
++        for ns in next_steps:
++            new_steps = steps + (ns,)
++            new_prog = ProgramV138(steps=new_steps)
++            new_cost = _program_cost_bits_v138(new_steps)
++            new_ev = _eval_on_train_v138(prog=new_prog, train_pairs=train_pairs)
++            pri = (int(new_cost), int(new_ev.loss[0]), int(new_ev.loss[1]), new_prog.program_sig())
++            heapq.heappush(heap, (pri, new_steps))
++
++    if min_cost_bits is not None and min_cost_solutions:
++        outputs: Dict[str, GridV124] = {}
++        for prog in min_cost_solutions:
++            got = apply_program_v138(prog, test_in)
++            outputs[grid_hash_v124(got)] = got
++        if len(outputs) == 1:
++            out_grid = list(outputs.values())[0]
++            return {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++                "kind": "arc_solve_result_v138",
++                "status": "SOLVED",
++                "program_sig": str(min_cost_solutions[0].program_sig()),
++                "program_cost_bits": int(min_cost_bits),
++                "predicted_grid": [list(r) for r in out_grid],
++                "predicted_grid_hash": grid_hash_v124(out_grid),
++                "trace": {
++                    "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++                    "kind": "arc_trace_v138",
++                    "max_depth": int(max_depth),
++                    "max_programs": int(max_programs),
++                    "tried": int(tried),
++                    "min_cost_solutions": int(len(min_cost_solutions)),
++                    "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++                    "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++                    "pruned_by_dominated_state": int(pruned_by_dominated_state),
++                    "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++                    "trace_programs": trace_programs,
++                },
++            }
++        # Ambiguous: include a deterministic small set of predicted grids for ARC-protocol multi-attempt scoring.
++        hashes_sorted = sorted(outputs.keys())
++        max_keep = int(max(1, int(config.max_ambiguous_outputs)))
++        kept_hashes = hashes_sorted[:max_keep]
++        predicted_grids = [{"grid_hash": str(h), "grid": [list(r) for r in outputs[h]]} for h in kept_hashes]
++        return {
++            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++            "kind": "arc_solve_result_v138",
++            "status": "UNKNOWN",
++            "program_sig": "",
++            "program_cost_bits": int(min_cost_bits or 0),
++            "predicted_grid_hash": "",
++            "predicted_grids": predicted_grids,
++            "failure_reason": {
++                "kind": "AMBIGUOUS_RULE",
++                "details": {
++                    "min_cost_solutions": int(len(min_cost_solutions)),
++                    "predicted_grid_hashes": hashes_sorted,
++                    "predicted_grids_truncated": bool(len(hashes_sorted) > len(kept_hashes)),
++                    "predicted_grids_kept": int(len(kept_hashes)),
++                },
++            },
++            "trace": {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++                "kind": "arc_trace_v138",
++                "max_depth": int(max_depth),
++                "max_programs": int(max_programs),
++                "tried": int(tried),
++                "min_cost_solutions": int(len(min_cost_solutions)),
++                "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++                "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++                "pruned_by_dominated_state": int(pruned_by_dominated_state),
++                "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++                "trace_programs": trace_programs,
++            },
++        }
++
++    failure_kind = "SEARCH_BUDGET_EXCEEDED" if tried >= max_programs else "MISSING_OPERATOR"
++    return {
++        "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++        "kind": "arc_solve_result_v138",
++        "status": "FAIL",
++        "program_sig": "",
++        "program_cost_bits": 0,
++        "predicted_grid_hash": "",
++        "failure_reason": {
++            "kind": str(failure_kind),
++            "details": {
++                "candidates_tested": int(tried),
++                "max_depth": int(max_depth),
++                "search_exhausted": bool(not heap),
++            },
++        },
++        "trace": {
++            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V138),
++            "kind": "arc_trace_v138",
++            "max_depth": int(max_depth),
++            "max_programs": int(max_programs),
++            "tried": int(tried),
++            "min_cost_solutions": 0,
++            "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++            "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++            "pruned_by_dominated_state": int(pruned_by_dominated_state),
++            "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++            "trace_programs": trace_programs,
++        },
++    }
++
+--- /dev/null	2026-01-18 22:01:36
++++ scripts/arc_diag_v138_pre.py	2026-01-18 20:46:48
+@@ -0,0 +1,393 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
++
++
++def _stable_json(obj: Any) -> str:
++    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++
++
++def _grid_shape(grid: Sequence[Sequence[int]]) -> Tuple[int, int]:
++    h = int(len(grid))
++    w = int(len(grid[0])) if h else 0
++    return (h, w)
++
++
++def _grid_palette(grid: Sequence[Sequence[int]]) -> Set[int]:
++    out: Set[int] = set()
++    for row in grid:
++        for x in row:
++            out.add(int(x))
++    return out
++
++
++def _grid_diff_cells_same_shape(inp: Sequence[Sequence[int]], out: Sequence[Sequence[int]]) -> Optional[int]:
++    hi, wi = _grid_shape(inp)
++    ho, wo = _grid_shape(out)
++    if (hi, wi) != (ho, wo):
++        return None
++    diff = 0
++    for r in range(hi):
++        for c in range(wi):
++            if int(inp[r][c]) != int(out[r][c]):
++                diff += 1
++    return int(diff)
++
++
++def _is_tile_repeat(inp: Sequence[Sequence[int]], out: Sequence[Sequence[int]]) -> Optional[Tuple[int, int]]:
++    hi, wi = _grid_shape(inp)
++    ho, wo = _grid_shape(out)
++    if hi <= 0 or wi <= 0:
++        return None
++    if ho % hi != 0 or wo % wi != 0:
++        return None
++    ry = int(ho // hi)
++    rx = int(wo // wi)
++    if ry <= 0 or rx <= 0:
++        return None
++    for r in range(ho):
++        for c in range(wo):
++            if int(out[r][c]) != int(inp[r % hi][c % wi]):
++                return None
++    return (int(ry), int(rx))
++
++
++def _is_scale_cell(inp: Sequence[Sequence[int]], out: Sequence[Sequence[int]]) -> Optional[Tuple[int, int]]:
++    hi, wi = _grid_shape(inp)
++    ho, wo = _grid_shape(out)
++    if hi <= 0 or wi <= 0:
++        return None
++    if ho % hi != 0 or wo % wi != 0:
++        return None
++    sy = int(ho // hi)
++    sx = int(wo // wi)
++    if sy <= 0 or sx <= 0:
++        return None
++    for r in range(ho):
++        for c in range(wo):
++            if int(out[r][c]) != int(inp[r // sy][c // sx]):
++                return None
++    return (int(sy), int(sx))
++
++
++def _shape_rel_for_pairs(pairs: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]]) -> str:
++    if not pairs:
++        return "unknown"
++    if all(a == b for a, b in pairs):
++        return "same"
++    if all(b == (a[1], a[0]) for a, b in pairs):
++        return "swap_hw"
++    ratios: Set[Tuple[int, int]] = set()
++    ok = True
++    for (hi, wi), (ho, wo) in pairs:
++        if hi <= 0 or wi <= 0 or ho <= 0 or wo <= 0:
++            ok = False
++            break
++        if ho % hi != 0 or wo % wi != 0:
++            ok = False
++            break
++        ratios.add((int(ho // hi), int(wo // wi)))
++    if ok and len(ratios) == 1:
++        ry, rx = list(ratios)[0]
++        return f"scale_integer:{int(ry)}x{int(rx)}"
++    return "shape_change_mixed"
++
++
++def _palette_rel(p_in: Set[int], p_out: Set[int]) -> str:
++    if p_out.issubset(p_in):
++        if p_in == p_out:
++            return "equal"
++        return "subset"
++    if p_in.issubset(p_out):
++        return "superset"
++    return "other"
++
++
++def _delta_density_bin(pairs: Sequence[Tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]]) -> str:
++    diffs: List[float] = []
++    for inp, out in pairs:
++        d = _grid_diff_cells_same_shape(inp, out)
++        if d is None:
++            continue
++        h, w = _grid_shape(inp)
++        diffs.append(float(d) / float(max(1, h * w)))
++    if not diffs:
++        return "n/a"
++    avg = sum(diffs) / float(len(diffs))
++    if avg <= 0.10:
++        return "sparse<=0.10"
++    if avg <= 0.30:
++        return "local<=0.30"
++    return "dense>0.30"
++
++
++@dataclass(frozen=True)
++class TaskSigV138:
++    failure_kind: str
++    shape_rel: str
++    palette_rel: str
++    delta_density: str
++    evidence: Tuple[str, ...]
++
++    def as_key(self) -> str:
++        return _stable_json(
++            {
++                "failure_kind": self.failure_kind,
++                "shape_rel": self.shape_rel,
++                "palette_rel": self.palette_rel,
++                "delta_density": self.delta_density,
++                "evidence": list(self.evidence),
++            }
++        )
++
++
++def _load_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _iter_per_task_paths(run_dir: str) -> List[str]:
++    per_task_dir = os.path.join(run_dir, "per_task")
++    names = []
++    for fn in os.listdir(per_task_dir):
++        if fn.endswith(".json") or fn.endswith(".json.json"):
++            names.append(fn)
++    names.sort()
++    return [os.path.join(per_task_dir, n) for n in names]
++
++
++def _summarize_run_manifest(run_dir: str) -> Dict[str, Any]:
++    # Derive counts from per_task_manifest.jsonl for determinism (summary.json may omit counts in older runs).
++    manifest_path = os.path.join(run_dir, "per_task_manifest.jsonl")
++    if not os.path.exists(manifest_path):
++        raise SystemExit(f"missing_per_task_manifest:{manifest_path}")
++    total = solved = unknown = failed = 0
++    failure_counts: Dict[str, int] = {}
++    with open(manifest_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            row = json.loads(line)
++            status = str(row.get("status") or "")
++            total += 1
++            if status == "SOLVED":
++                solved += 1
++            elif status == "UNKNOWN":
++                unknown += 1
++            else:
++                failed += 1
++                fk = str(row.get("failure_kind") or "")
++                if fk:
++                    failure_counts[fk] = int(failure_counts.get(fk, 0)) + 1
++    solve_rate = float(solved) / float(total) if total else 0.0
++    return {
++        "tasks_total": int(total),
++        "solved": int(solved),
++        "unknown": int(unknown),
++        "failed": int(failed),
++        "solve_rate": float(solve_rate),
++        "failure_counts": {k: int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++    }
++
++
++def _cluster_failures(run_dir: str, *, want_kinds: Set[str]) -> Dict[str, Any]:
++    per_task_paths = _iter_per_task_paths(run_dir)
++    clusters: Dict[str, int] = {}
++
++    pruned_totals: Dict[str, int] = {}
++    tried_counts: List[int] = []
++    depth_counts: Dict[int, int] = {}
++    op1_counts: Dict[str, int] = {}
++
++    for p in per_task_paths:
++        d = _load_json(p)
++        res = d.get("result") or {}
++        status = str(res.get("status") or "")
++        fr = res.get("failure_reason") or {}
++        failure_kind = str(fr.get("kind") or ("SOLVED" if status == "SOLVED" else "UNKNOWN" if status == "UNKNOWN" else "FAIL"))
++        if failure_kind not in want_kinds:
++            continue
++
++        if failure_kind == "SEARCH_BUDGET_EXCEEDED":
++            tried_counts.append(int((fr.get("details") or {}).get("candidates_tested") or 0))
++
++        trace = res.get("trace") if isinstance(res.get("trace"), dict) else {}
++        for k in [
++            "pruned_by_shape_reachability",
++            "pruned_by_palette_reachability",
++            "pruned_by_dominated_state",
++            "pruned_by_no_grid_modify_in_time",
++        ]:
++            if k in trace:
++                pruned_totals[k] = int(pruned_totals.get(k, 0)) + int(trace.get(k) or 0)
++
++        # small early-trace aggregates
++        for tp in trace.get("trace_programs", []) if isinstance(trace.get("trace_programs"), list) else []:
++            if not isinstance(tp, dict):
++                continue
++            depth = int(tp.get("depth") or 0)
++            depth_counts[depth] = int(depth_counts.get(depth, 0)) + 1
++            if depth == 1:
++                steps = tp.get("steps") or []
++                if isinstance(steps, list) and steps:
++                    op_id = str((steps[0] or {}).get("op_id") or "")
++                    if op_id:
++                        op1_counts[op_id] = int(op1_counts.get(op_id, 0)) + 1
++
++        task = d.get("task") or {}
++        train_pairs = task.get("train_pairs") or []
++        pair_shapes: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
++        pairs_grids: List[Tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]] = []
++        pin: Set[int] = set()
++        pout: Set[int] = set()
++        for pair in train_pairs:
++            inp = pair.get("in_grid")
++            out = pair.get("out_grid")
++            if inp is None or out is None:
++                continue
++            pair_shapes.append((_grid_shape(inp), _grid_shape(out)))
++            pairs_grids.append((inp, out))
++            pin |= _grid_palette(inp)
++            pout |= _grid_palette(out)
++
++        shape_rel = _shape_rel_for_pairs(pair_shapes)
++        palette_rel = _palette_rel(pin, pout)
++        delta_density = _delta_density_bin(pairs_grids)
++
++        evidence: List[str] = []
++        if shape_rel.startswith("scale_integer:"):
++            tile_ok = True
++            tile_ratio: Optional[Tuple[int, int]] = None
++            cell_ok = True
++            cell_ratio: Optional[Tuple[int, int]] = None
++            for inp, out in pairs_grids:
++                tr = _is_tile_repeat(inp, out)
++                cr = _is_scale_cell(inp, out)
++                if tr is None:
++                    tile_ok = False
++                else:
++                    tile_ratio = tr if tile_ratio is None else tile_ratio
++                    if tile_ratio != tr:
++                        tile_ok = False
++                if cr is None:
++                    cell_ok = False
++                else:
++                    cell_ratio = cr if cell_ratio is None else cell_ratio
++                    if cell_ratio != cr:
++                        cell_ok = False
++            if tile_ok and tile_ratio is not None:
++                evidence.append(f"tile_repeat:{tile_ratio[0]}x{tile_ratio[1]}")
++            if cell_ok and cell_ratio is not None:
++                evidence.append(f"scale_cell:{cell_ratio[0]}x{cell_ratio[1]}")
++
++        sig = TaskSigV138(
++            failure_kind=str(failure_kind),
++            shape_rel=str(shape_rel),
++            palette_rel=str(palette_rel),
++            delta_density=str(delta_density),
++            evidence=tuple(sorted(evidence)),
++        )
++        key = sig.as_key()
++        clusters[key] = int(clusters.get(key, 0)) + 1
++
++    clusters_sorted = sorted(((k, int(v)) for k, v in clusters.items()), key=lambda kv: (-int(kv[1]), str(kv[0])))
++    return {
++        "clusters_sorted": clusters_sorted,
++        "pruned_totals": {k: int(pruned_totals[k]) for k in sorted(pruned_totals.keys())},
++        "budget_tried_stats": {
++            "n": int(len(tried_counts)),
++            "min": int(min(tried_counts)) if tried_counts else 0,
++            "max": int(max(tried_counts)) if tried_counts else 0,
++            "avg": float(sum(tried_counts) / float(len(tried_counts))) if tried_counts else 0.0,
++        },
++        "depth_counts": {str(k): int(depth_counts[k]) for k in sorted(depth_counts.keys())},
++        "op1_counts_top": sorted(op1_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:10],
++    }
++
++
++def _parse_run_arg(s: str) -> Tuple[str, str]:
++    if "=" not in s:
++        raise SystemExit(f"bad_run_arg:{s}")
++    k, v = s.split("=", 1)
++    if not k or not v:
++        raise SystemExit(f"bad_run_arg:{s}")
++    return (str(k), str(v))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run", action="append", default=[], help="label=run_dir (repeatable)")
++    ap.add_argument("--out_path", required=True)
++    args = ap.parse_args()
++
++    out_path = str(args.out_path)
++    if os.path.exists(out_path):
++        raise SystemExit(f"worm_violation_out_path_exists:{out_path}")
++
++    runs: List[Tuple[str, str]] = []
++    for x in args.run:
++        runs.append(_parse_run_arg(str(x)))
++    if not runs:
++        raise SystemExit("no_runs_provided")
++
++    run_summaries: Dict[str, Any] = {}
++    clusters_missing: Dict[str, Any] = {}
++    clusters_budget: Dict[str, Any] = {}
++
++    for label, run_dir in runs:
++        if not os.path.isdir(run_dir):
++            raise SystemExit(f"run_dir_not_found:{run_dir}")
++        run_summaries[label] = _summarize_run_manifest(run_dir)
++        clusters_missing[label] = _cluster_failures(run_dir, want_kinds={"MISSING_OPERATOR"})
++        clusters_budget[label] = _cluster_failures(run_dir, want_kinds={"SEARCH_BUDGET_EXCEEDED"})
++
++    lines: List[str] = []
++    lines.append("# ARC_DIAG_REPORT_v138_PRE")
++    lines.append("")
++    lines.append("## Run summaries (derived from per_task_manifest.jsonl)")
++    for label in sorted(run_summaries.keys()):
++        s = run_summaries[label]
++        lines.append(f"### {label}")
++        lines.append(f"- tasks_total={s['tasks_total']} solved={s['solved']} unknown={s['unknown']} failed={s['failed']} solve_rate={s['solve_rate']:.4f}")
++        lines.append(f"- failure_counts={_stable_json(s['failure_counts'])}")
++        lines.append("")
++
++    def emit_clusters(*, title: str, data: Dict[str, Any], top_n: int = 15) -> None:
++        lines.append(f"## {title}")
++        for label in sorted(data.keys()):
++            cl = data[label]
++            lines.append(f"### {label}")
++            lines.append(f"- budget_tried_stats={_stable_json(cl['budget_tried_stats'])}")
++            lines.append(f"- pruned_totals={_stable_json(cl['pruned_totals'])}")
++            lines.append(f"- depth_counts={_stable_json(cl['depth_counts'])}")
++            lines.append(f"- op1_counts_top={_stable_json(cl['op1_counts_top'])}")
++            lines.append("")
++            lines.append("| count | signature |")
++            lines.append("|---:|---|")
++            for key, n in cl["clusters_sorted"][: int(top_n)]:
++                lines.append(f"| {int(n)} | `{key}` |")
++            lines.append("")
++
++    emit_clusters(title="MISSING_OPERATOR clusters (top)", data=clusters_missing)
++    emit_clusters(title="SEARCH_BUDGET_EXCEEDED clusters (top)", data=clusters_budget)
++
++    # Decision section: intended for V138 selection; keep non-task-specific.
++    lines.append("## Decision (V138 delta)")
++    lines.append("- delta_kind: harness_protocol_fix")
++    lines.append("- rationale: V137 canonical tasks omit test outputs, so solve_rate is not ARC-protocol scoring; V138 will add test_out for scoring-only and support 2-attempt evaluation without exposing test_out to solver.")
++    lines.append("")
++
++    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
++    with open(out_path, "x", encoding="utf-8") as f:
++        f.write("\n".join(lines) + "\n")
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-18 22:01:36
++++ scripts/run_arc_scalpel_v138.py	2026-01-18 21:43:09
+@@ -0,0 +1,525 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _write_text_x(path: Path, text: str) -> None:
++    _ensure_absent(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "x", encoding="utf-8") as f:
++        f.write(text)
++
++
++def _excluded_dir_parts_v138() -> set:
++    return {
++        ".git",
++        "__pycache__",
++        ".pycache",
++        "results",
++        "external_world",
++        "external_world_v122",
++        "external_world_v122_try2",
++        "external_world_v122_try3",
++        "external_world_v122_try4",
++        "external_world_v122_try5",
++        "external_world_v122_try6",
++    }
++
++
++def _repo_snapshot_sha256_v138(*, root: Path, exclude_paths: Sequence[Path]) -> str:
++    excluded = _excluded_dir_parts_v138()
++    excludes = [p.resolve() for p in exclude_paths]
++    rows: List[Dict[str, Any]] = []
++    for p in root.rglob("*"):
++        if not p.is_file():
++            continue
++        if any(part in excluded for part in p.parts):
++            continue
++        rp = p.resolve()
++        if any(str(rp).startswith(str(ex)) for ex in excludes):
++            continue
++        rel = p.relative_to(root).as_posix()
++        rows.append({"path": str(rel), "sha256": _sha256_file(p)})
++    rows.sort(key=lambda r: str(r["path"]))
++    body = {"schema_version": 138, "kind": "repo_snapshot_v138", "files": rows}
++    from atos_core.act import canonical_json_dumps, sha256_hex
++
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def _sanitize_task_id(task_id: str) -> str:
++    s = "".join([c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(task_id)])
++    return s or "task"
++
++
++def _grid_equal(a: Sequence[Sequence[int]], b: Sequence[Sequence[int]]) -> bool:
++    if len(a) != len(b):
++        return False
++    for ra, rb in zip(a, b):
++        if list(ra) != list(rb):
++            return False
++    return True
++
++
++def _build_report_markdown_v138(*, eval_obj: Dict[str, Any], backlog: Sequence[Dict[str, Any]]) -> str:
++    total = int(eval_obj.get("tasks_total") or 0)
++    solved = int(eval_obj.get("tasks_solved") or 0)
++    unknown = int(eval_obj.get("tasks_unknown") or 0)
++    failed = int(eval_obj.get("tasks_failed") or 0)
++    failures = eval_obj.get("failure_counts")
++    failures = failures if isinstance(failures, dict) else {}
++    top = sorted(((str(k), int(failures[k])) for k in failures.keys()), key=lambda kv: (-int(kv[1]), str(kv[0])))[:15]
++
++    lines: List[str] = []
++    lines.append("# ARC_DIAG_REPORT_v138")
++    lines.append("")
++    lines.append("## Solve rate (scored vs test outputs; max_guesses=2)")
++    lines.append(f"- tasks_total={total} solved={solved} unknown={unknown} failed={failed}")
++    if total:
++        lines.append(f"- solve_rate={solved/total:.3f}")
++    lines.append("")
++    lines.append("## Top failures (scoring failure_kind)")
++    if not top:
++        lines.append("- (none)")
++    else:
++        for k, n in top:
++            lines.append(f"- {k}: {n}")
++    lines.append("")
++    lines.append("## Backlog (operator gaps) — propostas gerais")
++    if not backlog:
++        lines.append("- (none)")
++    else:
++        for item in backlog:
++            lines.append(f"### {item['name']}")
++            lines.append(f"- signature: `{item['signature']}`")
++            lines.append(f"- invariants: {item['invariants']}")
++            lines.append(f"- examples: {item['examples']}")
++            lines.append(f"- covers: {item['covers']}")
++            lines.append("")
++    return "\n".join(lines)
++
++
++def _derive_backlog_v138(*, failure_counts: Dict[str, int]) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if "MISSING_OPERATOR" in failure_counts:
++        out.append(
++            {
++                "name": "general shape-changing operators (gap)",
++                "signature": "(GRID)->GRID (scale/tile/resize or crop/paste families) with inverse propose",
++                "invariants": "Determinístico; tipado; parâmetros inferidos de demonstrações.",
++                "examples": "scale_cell, tile_repeat, reflect/rotate, crop/pad/paste combos.",
++                "covers": "MISSING_OPERATOR clusters with shape_change_mixed / scale_integer.",
++            }
++        )
++    if "TEST_OUTPUT_MISMATCH" in failure_counts:
++        out.append(
++            {
++                "name": "reduce overfit / ambiguity (gap)",
++                "signature": "scoring-only: prefer smaller hypothesis set; or add more invariants to prune",
++                "invariants": "No test leakage; only train evidence; fail-closed ambiguity.",
++                "examples": "stronger palette/shape reachability; object role induction from train pairs.",
++                "covers": "cases where train-consistent program is not correct on test.",
++            }
++        )
++    return out[:10]
++
++
++def _build_outputs_manifest_v138(*, out_dir: Path) -> Dict[str, Any]:
++    per_task_dir = out_dir / "per_task"
++    per_task_files = [p for p in per_task_dir.glob("*.json") if p.is_file()]
++    per_task_files.sort(key=lambda p: p.name)
++
++    def rel(p: Path) -> str:
++        return p.relative_to(out_dir).as_posix()
++
++    files: List[Dict[str, Any]] = []
++    fixed = [
++        out_dir / "summary.json",
++        out_dir / "smoke_summary.json",
++        out_dir / "eval.json",
++        out_dir / "per_task_manifest.jsonl",
++        out_dir / "trace_candidates.jsonl",
++        out_dir / "ARC_DIAG_REPORT_v138.md",
++        out_dir / "isolation_check_v138.json",
++        out_dir / "input" / "arc_manifest_v138.json",
++        out_dir / "input" / "arc_tasks_canonical_v138.jsonl",
++    ]
++    for p in fixed:
++        files.append({"path": rel(p), "sha256": _sha256_file(p)})
++    for p in per_task_files:
++        files.append({"path": rel(p), "sha256": _sha256_file(p)})
++
++    body = {"schema_version": 138, "kind": "arc_outputs_manifest_v138", "files": files}
++    from atos_core.act import canonical_json_dumps, sha256_hex
++
++    body["manifest_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
++
++def _score_one_test_case_v138(
++    *, solver_res: Dict[str, Any], want_grid: Optional[Sequence[Sequence[int]]], max_guesses: int
++) -> Dict[str, Any]:
++    status = str(solver_res.get("status") or "")
++    if want_grid is None:
++        # Unscored: fall back to solver status only (used for internal sample/synth where test outputs are omitted).
++        fk = ""
++        fr = solver_res.get("failure_reason")
++        if isinstance(fr, dict):
++            fk = str(fr.get("kind") or "")
++        return {
++            "status": status if status in {"SOLVED", "UNKNOWN"} else "FAIL",
++            "failure_kind": fk,
++            "attempts_used": 1,
++            "solver_status": status,
++            "scored": False,
++        }
++    if status == "SOLVED":
++        pred = solver_res.get("predicted_grid")
++        ok = isinstance(pred, list) and _grid_equal(pred, want_grid)
++        return {
++            "status": "SOLVED" if ok else "FAIL",
++            "failure_kind": "" if ok else "TEST_OUTPUT_MISMATCH",
++            "attempts_used": 1,
++            "solver_status": "SOLVED",
++            "scored": True,
++        }
++    if status == "UNKNOWN":
++        preds: List[Sequence[Sequence[int]]] = []
++        for item in solver_res.get("predicted_grids", []) if isinstance(solver_res.get("predicted_grids"), list) else []:
++            if isinstance(item, dict) and isinstance(item.get("grid"), list):
++                preds.append(item.get("grid"))  # type: ignore[arg-type]
++        ok = False
++        used = 0
++        for g in preds[: int(max_guesses)]:
++            used += 1
++            if _grid_equal(g, want_grid):
++                ok = True
++                break
++        return {
++            "status": "SOLVED" if ok else "UNKNOWN",
++            "failure_kind": "" if ok else "AMBIGUOUS_RULE",
++            "attempts_used": int(used) if used else int(max_guesses),
++            "solver_status": "UNKNOWN",
++            "scored": True,
++        }
++    fk = ""
++    fr = solver_res.get("failure_reason")
++    if isinstance(fr, dict):
++        fk = str(fr.get("kind") or "")
++    return {"status": "FAIL", "failure_kind": fk or "FAIL", "attempts_used": 1, "solver_status": "FAIL", "scored": True}
++
++
++def _run_one(
++    *,
++    arc_root: str,
++    split: str,
++    limit: int,
++    seed: int,
++    out_dir: Path,
++    max_guesses: int,
++    max_depth: int,
++    max_programs: int,
++) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++    os.environ["PYTHONPYCACHEPREFIX"] = str(out_dir / ".pycache")
++
++    from atos_core.act import canonical_json_dumps, sha256_hex
++    from atos_core.arc_loader_v138 import iter_canonical_tasks_v138, write_arc_canonical_jsonl_v138
++    from atos_core.arc_solver_v138 import SolveConfigV138, solve_arc_task_v138
++
++    repo_root = Path(__file__).resolve().parent.parent
++    snap_before = _repo_snapshot_sha256_v138(root=repo_root, exclude_paths=[out_dir])
++
++    input_dir = out_dir / "input"
++    input_dir.mkdir(parents=True, exist_ok=False)
++    canon_jsonl = input_dir / "arc_tasks_canonical_v138.jsonl"
++    manifest_path = input_dir / "arc_manifest_v138.json"
++    write_arc_canonical_jsonl_v138(
++        arc_root=str(arc_root),
++        split=str(split),
++        limit=int(limit),
++        out_jsonl=canon_jsonl,
++        out_manifest=manifest_path,
++    )
++
++    per_task_dir = out_dir / "per_task"
++    per_task_dir.mkdir(parents=True, exist_ok=False)
++
++    per_task_manifest_path = out_dir / "per_task_manifest.jsonl"
++    trace_candidates_path = out_dir / "trace_candidates.jsonl"
++    _ensure_absent(per_task_manifest_path)
++    _ensure_absent(trace_candidates_path)
++
++    tasks_total = 0
++    tasks_solved = 0
++    tasks_unknown = 0
++    tasks_failed = 0
++    failure_counts: Dict[str, int] = {}
++
++    per_task_rows: List[Dict[str, Any]] = []
++    trace_rows: List[Dict[str, Any]] = []
++
++    cfg = SolveConfigV138(
++        max_depth=int(max_depth),
++        max_programs=int(max_programs),
++        trace_program_limit=80,
++        max_ambiguous_outputs=max(8, int(max_guesses)),
++    )
++
++    for task in iter_canonical_tasks_v138(str(canon_jsonl)):
++        tasks_total += 1
++        # Solve each test input independently; scoring uses test outputs only after solve.
++        test_case_results: List[Dict[str, Any]] = []
++        solver_results: List[Dict[str, Any]] = []
++        for test_in, test_out in task.test_pairs:
++            res = solve_arc_task_v138(train_pairs=list(task.train_pairs), test_in=test_in, config=cfg)
++            solver_results.append(res)
++            want_grid = [list(r) for r in test_out] if test_out is not None else None
++            test_case_results.append(_score_one_test_case_v138(solver_res=res, want_grid=want_grid, max_guesses=int(max_guesses)))
++
++        # Aggregate task status.
++        if all(r["status"] == "SOLVED" for r in test_case_results):
++            status = "SOLVED"
++        elif any(r["status"] == "FAIL" for r in test_case_results):
++            status = "FAIL"
++        else:
++            status = "UNKNOWN"
++
++        if status == "SOLVED":
++            tasks_solved += 1
++        elif status == "UNKNOWN":
++            tasks_unknown += 1
++        else:
++            tasks_failed += 1
++
++        failure_kind = ""
++        if status != "SOLVED":
++            # deterministic priority among failure kinds
++            kinds: List[str] = []
++            for r in test_case_results:
++                k = str(r.get("failure_kind") or "")
++                if k:
++                    kinds.append(k)
++            pri = ["TEST_OUTPUT_MISMATCH", "SEARCH_BUDGET_EXCEEDED", "MISSING_OPERATOR", "AMBIGUOUS_RULE", "FAIL"]
++            for k in pri:
++                if k in kinds:
++                    failure_kind = k
++                    break
++            if not failure_kind and kinds:
++                failure_kind = sorted(kinds)[0]
++        if status == "FAIL" and failure_kind:
++            failure_counts[failure_kind] = int(failure_counts.get(failure_kind, 0)) + 1
++
++        per_task_obj = {
++            "kind": "arc_per_task_v138",
++            "schema_version": 138,
++            "task": task.to_dict(),
++            "solver_results": solver_results,
++            "scoring": {
++                "schema_version": 138,
++                "max_guesses": int(max_guesses),
++                "status": str(status),
++                "failure_kind": str(failure_kind),
++                "test_case_results": test_case_results,
++            },
++        }
++        task_path = per_task_dir / f"{_sanitize_task_id(task.task_id)}.json"
++        _write_once_json(task_path, per_task_obj)
++
++        row = {
++            "schema_version": 138,
++            "kind": "arc_per_task_manifest_row_v138",
++            "task_id": str(task.task_id),
++            "status": str(status),
++            "failure_kind": str(failure_kind),
++            "solver_statuses": [str(r.get("status") or "") for r in solver_results],
++            "max_guesses": int(max_guesses),
++        }
++        per_task_rows.append(row)
++
++        # Trace candidates (sample) for audit: include solver trace_programs only.
++        for idx, res in enumerate(solver_results):
++            trace = res.get("trace") if isinstance(res.get("trace"), dict) else {}
++            for tp in trace.get("trace_programs", []) if isinstance(trace.get("trace_programs"), list) else []:
++                if isinstance(tp, dict):
++                    trace_rows.append(
++                        {
++                            "schema_version": 138,
++                            "kind": "arc_trace_candidate_v138",
++                            "task_id": str(task.task_id),
++                            "test_index": int(idx),
++                            "program_sig": str(tp.get("program_sig") or ""),
++                            "cost_bits": int(tp.get("cost_bits") or 0),
++                            "depth": int(tp.get("depth") or 0),
++                            "ok_train": bool(tp.get("ok_train") or False),
++                            "mismatch_kind": str(((tp.get("mismatch") or {}) if isinstance(tp.get("mismatch"), dict) else {}).get("kind") or ""),
++                            "steps": tp.get("steps") if isinstance(tp.get("steps"), list) else [],
++                        }
++                    )
++
++    # Write manifests
++    with open(per_task_manifest_path, "x", encoding="utf-8") as f:
++        for row in per_task_rows:
++            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
++    with open(trace_candidates_path, "x", encoding="utf-8") as f:
++        for row in trace_rows:
++            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
++
++    eval_obj: Dict[str, Any] = {
++        "schema_version": 138,
++        "kind": "arc_eval_v138",
++        "tasks_total": int(tasks_total),
++        "tasks_solved": int(tasks_solved),
++        "tasks_unknown": int(tasks_unknown),
++        "tasks_failed": int(tasks_failed),
++        "solve_rate": float(float(tasks_solved) / float(tasks_total) if tasks_total else 0.0),
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "max_guesses": int(max_guesses),
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    summary_obj: Dict[str, Any] = {
++        "schema_version": 138,
++        "kind": "arc_summary_v138",
++        "arc_root": str(arc_root),
++        "split": str(split),
++        "limit": int(limit),
++        "seed": int(seed),
++        "max_guesses": int(max_guesses),
++        "max_depth": int(max_depth),
++        "max_programs": int(max_programs),
++        "tasks_total": int(tasks_total),
++        "tasks_solved": int(tasks_solved),
++        "tasks_unknown": int(tasks_unknown),
++        "tasks_failed": int(tasks_failed),
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "eval_sig": str(eval_obj["eval_sig"]),
++    }
++    summary_obj["summary_sig"] = sha256_hex(canonical_json_dumps(summary_obj).encode("utf-8"))
++    _write_once_json(out_dir / "summary.json", summary_obj)
++    _write_once_json(out_dir / "smoke_summary.json", {"schema_version": 138, "kind": "arc_smoke_summary_v138", "summary_sha256": summary_obj["summary_sig"]})
++
++    backlog = _derive_backlog_v138(failure_counts=failure_counts)
++    report_md = _build_report_markdown_v138(eval_obj=eval_obj, backlog=backlog)
++    _write_text_x(out_dir / "ARC_DIAG_REPORT_v138.md", report_md)
++
++    snap_after = _repo_snapshot_sha256_v138(root=repo_root, exclude_paths=[out_dir])
++    isolation = {
++        "schema_version": 138,
++        "kind": "isolation_check_v138",
++        "repo_root": str(repo_root),
++        "snapshot_before": str(snap_before),
++        "snapshot_after": str(snap_after),
++        "ok": bool(snap_before == snap_after),
++    }
++    _write_once_json(out_dir / "isolation_check_v138.json", isolation)
++    if not bool(isolation["ok"]):
++        raise SystemExit("isolation_failed")
++
++    outputs_manifest = _build_outputs_manifest_v138(out_dir=out_dir)
++    _write_once_json(out_dir / "outputs_manifest.json", outputs_manifest)
++
++    return {
++        "schema_version": 138,
++        "kind": "arc_run_result_v138",
++        "out_dir": str(out_dir),
++        "summary_sha256": str(summary_obj["summary_sig"]),
++        "outputs_manifest_sig": str(outputs_manifest["manifest_sig"]),
++        "tasks_total": int(tasks_total),
++        "tasks_solved": int(tasks_solved),
++        "tasks_unknown": int(tasks_unknown),
++        "tasks_failed": int(tasks_failed),
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "isolation_ok": True,
++    }
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--arc_root", required=True)
++    ap.add_argument("--split", required=True)
++    ap.add_argument("--limit", type=int, default=20)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--max_guesses", type=int, default=2)
++    ap.add_argument("--max_depth", type=int, default=4)
++    ap.add_argument("--max_programs", type=int, default=4000)
++    args = ap.parse_args(argv)
++
++    out_base = Path(str(args.out_base))
++    out_try1 = Path(str(out_base) + "_try1")
++    out_try2 = Path(str(out_base) + "_try2")
++
++    r1 = _run_one(
++        arc_root=str(args.arc_root),
++        split=str(args.split),
++        limit=int(args.limit),
++        seed=int(args.seed),
++        out_dir=out_try1,
++        max_guesses=int(args.max_guesses),
++        max_depth=int(args.max_depth),
++        max_programs=int(args.max_programs),
++    )
++    r2 = _run_one(
++        arc_root=str(args.arc_root),
++        split=str(args.split),
++        limit=int(args.limit),
++        seed=int(args.seed),
++        out_dir=out_try2,
++        max_guesses=int(args.max_guesses),
++        max_depth=int(args.max_depth),
++        max_programs=int(args.max_programs),
++    )
++
++    determinism_ok = str(r1.get("summary_sha256")) == str(r2.get("summary_sha256")) and str(r1.get("outputs_manifest_sig")) == str(
++        r2.get("outputs_manifest_sig")
++    )
++    if not determinism_ok:
++        raise SystemExit("determinism_failed")
++
++    out = {"ok": True, "determinism_ok": True, "try1": r1, "try2": r2}
++    print(json.dumps(out, ensure_ascii=False, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- /dev/null	2026-01-18 22:01:36
++++ tests/test_arc_solver_v138.py	2026-01-18 20:55:01
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++import re
++import unittest
++
++from atos_core.arc_solver_v138 import SolveConfigV138, solve_arc_task_v138
++from atos_core.grid_v124 import grid_from_list_v124
++
++
++class TestArcSolverV138(unittest.TestCase):
++    def test_unknown_includes_predicted_grids(self) -> None:
++        # Construct a case where rotate90 and rotate270 are both minimal and consistent on train,
++        # but diverge on test_in -> UNKNOWN with predicted_grids present.
++        train_in = grid_from_list_v124([[1, 0, 0], [0, 2, 0], [0, 0, 1]])
++        train_out = grid_from_list_v124([[0, 0, 1], [0, 2, 0], [1, 0, 0]])
++        test_in = grid_from_list_v124([[1, 0, 0], [0, 2, 0], [0, 0, 0]])
++
++        res = solve_arc_task_v138(train_pairs=[(train_in, train_out)], test_in=test_in, config=SolveConfigV138(max_depth=1, max_programs=200))
++        self.assertEqual(res["status"], "UNKNOWN")
++        self.assertIn("predicted_grids", res)
++        preds = res["predicted_grids"]
++        self.assertIsInstance(preds, list)
++        self.assertGreaterEqual(len(preds), 2)
++        self.assertTrue(all(isinstance(x, dict) and "grid" in x and "grid_hash" in x for x in preds))
++
++    def test_anti_hack_scan_solver_source(self) -> None:
++        # Hard rule: core solver should not branch on task_id/paths/dataset strings.
++        import inspect
++        import atos_core.arc_solver_v138 as m
++
++        src = inspect.getsource(m)
++        banned_substrings = ["task_id", "Path(", "glob(", "rglob(", "/ARC-AGI"]
++        for s in banned_substrings:
++            self.assertNotIn(s, src, msg=f"banned_substring_found:{s}")
++        banned_regex = [r"\bevaluation\b", r"\btraining\b"]
++        for pat in banned_regex:
++            self.assertIsNone(re.search(pat, src), msg=f"banned_pattern_found:{pat}")
++
++
++if __name__ == "__main__":
++    unittest.main()

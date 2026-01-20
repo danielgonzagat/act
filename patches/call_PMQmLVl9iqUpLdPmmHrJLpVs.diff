@@ -1,0 +1,264 @@
+*** Begin Patch
+*** Add File: act/scripts/eval_gate_compare.py
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()
++
++
++def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def _safe_int(x: Any) -> int:
++    try:
++        return int(x)
++    except Exception:
++        return 0
++
++
++def sum_metric_over_selected_tokens(
++    transcripts: Sequence[Dict[str, Any]], *, metric_key: str
++) -> Tuple[int, int]:
++    total = 0
++    tokens = 0
++    for rec in transcripts:
++        turns = rec.get("turns", [])
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            tr = (t.get("trace") or {}) if isinstance(t, dict) else {}
++            if not isinstance(tr, dict):
++                continue
++            winners = tr.get("selected_source_act_ids") or []
++            if not isinstance(winners, list):
++                continue
++            L = int(len(winners))
++            vals = tr.get(metric_key) or []
++            if not isinstance(vals, list):
++                vals = []
++            for i in range(min(L, len(vals))):
++                total += _safe_int(vals[i])
++            tokens += L
++    return total, tokens
++
++
++def collect_gate_live_metrics(
++    transcripts: Sequence[Dict[str, Any]]
++) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
++    total_tokens = 0
++    covered = 0
++    winner_ok = 0
++    fastpath = 0
++    fallbacks = 0
++    mismatches = 0
++
++    live_eval_sum = 0
++    baseline_eval_sum_dbg = 0
++
++    examples: List[Dict[str, Any]] = []
++
++    for rec in transcripts:
++        pid = rec.get("prompt_id")
++        turns = rec.get("turns", [])
++        if not isinstance(turns, list):
++            continue
++        for turn_idx, t in enumerate(turns):
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++
++            winners = tr.get("selected_source_act_ids") or []
++            if not isinstance(winners, list):
++                continue
++            L = int(len(winners))
++            if L <= 0:
++                continue
++
++            allowed = tr.get("router_live_allowed_predictor_ids") or []
++            used = tr.get("router_live_used") or []
++            fallback = tr.get("router_live_fallback") or []
++            mismatch = tr.get("router_live_mismatch") or []
++            live_eval = tr.get("router_live_predictors_evaluated") or tr.get("predictor_matched") or []
++            base_eval_dbg = tr.get("baseline_predictors_evaluated") or []
++            ctx_keys = tr.get("context_keys") or []
++            dbg_base_tok = tr.get("router_live_debug_baseline_token") or []
++            dbg_gate_tok = tr.get("router_live_debug_gate_token") or []
++
++            if not isinstance(allowed, list):
++                allowed = []
++            if not isinstance(used, list):
++                used = []
++            if not isinstance(fallback, list):
++                fallback = []
++            if not isinstance(mismatch, list):
++                mismatch = []
++            if not isinstance(live_eval, list):
++                live_eval = []
++            if not isinstance(base_eval_dbg, list):
++                base_eval_dbg = []
++            if not isinstance(ctx_keys, list):
++                ctx_keys = []
++            if not isinstance(dbg_base_tok, list):
++                dbg_base_tok = []
++            if not isinstance(dbg_gate_tok, list):
++                dbg_gate_tok = []
++
++            for i in range(L):
++                total_tokens += 1
++
++                # Coverage/winner-in-allowed (ctx_sig exists => allowed list non-empty)
++                a: List[str] = []
++                if i < len(allowed) and isinstance(allowed[i], list):
++                    a = [str(x) for x in allowed[i] if isinstance(x, str) and x]
++                if a:
++                    covered += 1
++                    if isinstance(winners[i], str) and winners[i] in set(a):
++                        winner_ok += 1
++
++                if i < len(used) and _safe_int(used[i]) == 1:
++                    fastpath += 1
++                if i < len(fallback) and _safe_int(fallback[i]) == 1:
++                    fallbacks += 1
++                if i < len(live_eval):
++                    live_eval_sum += _safe_int(live_eval[i])
++                if i < len(base_eval_dbg):
++                    baseline_eval_sum_dbg += _safe_int(base_eval_dbg[i])
++
++                is_mm = i < len(mismatch) and _safe_int(mismatch[i]) == 1
++                if is_mm:
++                    mismatches += 1
++                    if len(examples) < 3:
++                        examples.append(
++                            {
++                                "prompt_id": pid,
++                                "turn": int(turn_idx),
++                                "token_index": int(i),
++                                "mode": str(t.get("mode") or "default"),
++                                "ctx_key": str(ctx_keys[i]) if i < len(ctx_keys) else "",
++                                "baseline_token": str(dbg_base_tok[i]) if i < len(dbg_base_tok) else "",
++                                "gate_token": str(dbg_gate_tok[i]) if i < len(dbg_gate_tok) else "",
++                                "fallback_reason": str(
++                                    (tr.get("router_live_fallback_reason") or [""])[i]
++                                    if isinstance(tr.get("router_live_fallback_reason"), list)
++                                    and i < len(tr.get("router_live_fallback_reason") or [])
++                                    else ""
++                                ),
++                            }
++                        )
++
++    metrics: Dict[str, Any] = {
++        "tokens": int(total_tokens),
++        "coverage_rate": float(covered / max(1, total_tokens)),
++        "winner_in_allowed_rate": float(winner_ok / max(1, total_tokens)),
++        "live_fastpath_rate": float(fastpath / max(1, total_tokens)),
++        "live_fallback_rate": float(fallbacks / max(1, total_tokens)),
++        "live_mismatch_rate": float(mismatches / max(1, total_tokens)),
++        "live_predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, total_tokens)),
++        "debug_baseline_predictors_evaluated_per_token_mean": float(
++            baseline_eval_sum_dbg / max(1, total_tokens)
++        ),
++    }
++    return metrics, examples
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run", required=True, help="Run dir containing acts.jsonl (read-only)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=200)
++    args = ap.parse_args()
++
++    acts_path = os.path.join(args.run, "acts.jsonl")
++    store = ActStore.load_jsonl(acts_path)
++
++    base_engine = Engine(store, seed=args.seed, config=EngineConfig())
++    gate_engine = Engine(
++        store,
++        seed=args.seed,
++        config=EngineConfig(router_live_enabled=True, router_live_debug_compare=True),
++    )
++
++    base_transcripts, _ = run_chat_suite(
++        base_engine,
++        dialogues=CHAT_DIALOGUES_20X3,
++        max_new_tokens=args.max_new_tokens,
++        prefix_k=8,
++        template_ngram_n=6,
++        template_prefix_window=32,
++    )
++    gate_transcripts, _ = run_chat_suite(
++        gate_engine,
++        dialogues=CHAT_DIALOGUES_20X3,
++        max_new_tokens=args.max_new_tokens,
++        prefix_k=8,
++        template_ngram_n=6,
++        template_prefix_window=32,
++    )
++
++    base_txt = transcripts_text(base_transcripts)
++    gate_txt = transcripts_text(gate_transcripts)
++
++    base_sha = sha256_text(base_txt)
++    gate_sha = sha256_text(gate_txt)
++
++    base_eval_sum, base_tokens = sum_metric_over_selected_tokens(
++        base_transcripts, metric_key="predictor_matched"
++    )
++    live_eval_sum, live_tokens = sum_metric_over_selected_tokens(
++        gate_transcripts, metric_key="router_live_predictors_evaluated"
++    )
++
++    gate_metrics, examples = collect_gate_live_metrics(gate_transcripts)
++
++    # Compute skip rate from counts (simulated live cost).
++    would_skip_rate = 0.0
++    if base_eval_sum > 0:
++        would_skip_rate = float((base_eval_sum - live_eval_sum) / base_eval_sum)
++
++    out: Dict[str, Any] = {
++        "run": str(args.run),
++        "seed": int(args.seed),
++        "max_new_tokens": int(args.max_new_tokens),
++        "sha256_transcript_text_baseline": str(base_sha),
++        "sha256_transcript_text_gate": str(gate_sha),
++        "mismatch_count": int(
++            round(float(gate_metrics.get("live_mismatch_rate", 0.0)) * gate_metrics.get("tokens", 0))
++        ),
++        "mismatch_examples": examples,
++        "baseline": {
++            "tokens": int(base_tokens),
++            "predictors_evaluated_sum": int(base_eval_sum),
++            "predictors_evaluated_per_token_mean": float(base_eval_sum / max(1, base_tokens)),
++        },
++        "gate_live": {
++            **gate_metrics,
++            "predictors_evaluated_sum": int(live_eval_sum),
++            "predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, live_tokens)),
++            "live_would_skip_rate": float(would_skip_rate),
++        },
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
++
+*** End Patch

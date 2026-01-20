@@ -1,0 +1,323 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+-        for i in range(int(max_new_tokens)):
+-            ck = ctx_key(context)
+-            trace_context_keys.append(ck)
+-            penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+-
+-            router_live_enabled = bool(self.config.router_live_enabled)
+-            router_debug = bool(self.config.router_live_debug_compare)
+-
+-            router_used = False
+-            router_fallback = False
+-            router_fallback_reason = ""
+-            allowed_predictor_ids: List[str] = []
+-            gated_predictors: Optional[List[Act]] = None
+-
+-            if router_live_enabled:
+-                table = self._macro_router_table
+-                if table is None or not isinstance(table, dict):
+-                    router_fallback = True
+-                    router_fallback_reason = "router_missing"
+-                else:
+-                    ctx_sig = f"{mode_state}{SEP}{ck}"
+-                    entry = table.get(ctx_sig)
+-                    if isinstance(entry, dict):
+-                        preds = entry.get("predictors") or []
+-                        if isinstance(preds, list):
+-                            allowed_predictor_ids = [
+-                                str(x) for x in preds if isinstance(x, str) and x
+-                            ]
+-                    if allowed_predictor_ids:
+-                        present = [
+-                            pid for pid in allowed_predictor_ids if pid in self._predictor_by_id
+-                        ]
+-                        if present:
+-                            present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
+-                            gated_predictors = [self._predictor_by_id[pid] for pid in present]
+-                        else:
+-                            router_fallback = True
+-                            router_fallback_reason = "allowed_missing"
+-                    else:
+-                        router_fallback = True
+-                        router_fallback_reason = "missing_ctx"
+-
+-            emit_gate: Optional[Dict[str, Any]] = None
+-            cand_gate: Optional[Dict[str, Candidate]] = None
+-            if gated_predictors is not None:
+-                emit_gate = {}
+-                cand_gate = self._emit_candidates(
+-                    context=context, penalties=penalties, predictors=gated_predictors, trace=emit_gate
+-                )
+-                if int(emit_gate.get("predictor_emitted", 0) or 0) <= 0:
+-                    router_fallback = True
+-                    router_fallback_reason = "gate_empty_emit"
+-                    emit_gate = None
+-                    cand_gate = None
+-
+-            emit_base: Optional[Dict[str, Any]] = None
+-            cand_base: Optional[Dict[str, Candidate]] = None
+-            if router_debug or (router_live_enabled and cand_gate is None):
+-                emit_base = {}
+-                cand_base = self._emit_candidates(context=context, penalties=penalties, trace=emit_base)
+-
+-            mismatch = False
+-            baseline_tok = ""
+-            gate_tok = ""
+-            if router_debug and cand_gate is not None and cand_base is not None:
+-                base_after = _apply_rewrite_rules(
+-                    cand_base, record_trace=False, context=context, penalties=penalties
+-                )
+-                gate_after = _apply_rewrite_rules(
+-                    cand_gate, record_trace=False, context=context, penalties=penalties
+-                )
+-                b_nxt = _select_next(base_after, context=context, penalties=penalties)
+-                g_nxt = _select_next(gate_after, context=context, penalties=penalties)
+-                baseline_tok = str(b_nxt or "")
+-                gate_tok = str(g_nxt or "")
+-                mismatch = bool(b_nxt != g_nxt)
+-                if mismatch:
+-                    router_fallback = True
+-                    router_fallback_reason = "mismatch"
+-                    emit_gate = None
+-                    cand_gate = None
+-
+-            emit_trace: Dict[str, Any] = {}
+-            candidates: Dict[str, Candidate] = {}
+-            if cand_gate is not None and emit_gate is not None and not router_fallback:
+-                router_used = True
+-                emit_trace = emit_gate
+-                candidates = cand_gate
+-            else:
+-                router_used = False
+-                if router_live_enabled and not router_fallback:
+-                    router_fallback = True
+-                    router_fallback_reason = "no_gate"
+-                if cand_base is None or emit_base is None:
+-                    emit_base = {}
+-                    cand_base = self._emit_candidates(
+-                        context=context, penalties=penalties, trace=emit_base
+-                    )
+-                emit_trace = emit_base
+-                candidates = cand_base
+-
+-            exec_pred = emit_trace.get("executed_predictor_ids") or []
+-            if isinstance(exec_pred, list):
+-                trace_executed_predictor_ids.append([str(x) for x in exec_pred if isinstance(x, str)])
+-            else:
+-                trace_executed_predictor_ids.append([])
+-
+-            candidates = _apply_rewrite_rules(
+-                candidates, record_trace=True, context=context, penalties=penalties
+-            )
+-
+-            # EOS guardrail
+-            if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
+-                candidates["<EOS>"].score -= 1e6
+-
+-            if not candidates:
+-                break
+-
+-            trace_predictor_matched.append(int(emit_trace.get("predictor_matched", 0) or 0))
+-            trace_predictor_emitted.append(int(emit_trace.get("predictor_emitted", 0) or 0))
+-            trace_candidates_pre.append(int(emit_trace.get("candidates_pre_rewrite", len(candidates)) or 0))
+-            trace_candidates_post.append(int(len(candidates)))
+-
+-            trace_router_live_used.append(1 if router_used else 0)
+-            trace_router_live_fallback.append(1 if router_fallback else 0)
+-            trace_router_live_fallback_reason.append(str(router_fallback_reason))
+-            trace_router_live_allowed_predictor_ids.append(list(allowed_predictor_ids))
+-            trace_router_live_predictors_evaluated.append(int(emit_trace.get("predictor_matched", 0) or 0))
+-            trace_baseline_predictors_evaluated.append(
+-                int((emit_base or {}).get("predictor_matched", 0) or 0) if router_debug else 0
+-            )
+-            trace_router_live_mismatch.append(1 if mismatch else 0)
+-            trace_router_live_debug_baseline_token.append(baseline_tok)
+-            trace_router_live_debug_gate_token.append(gate_tok)
+-
+-            nxt = _select_next(candidates, context=context, penalties=penalties)
+-
+-            if nxt == "<EOS>":
+-                break
+-
+-            src_act = candidates.get(nxt).source_act if nxt in candidates else "__unknown__"
+-            trace_selected_act_ids.append(str(src_act))
+-            trace_selected_tokens.append(str(nxt))
+-
+-            gen_tokens.append(nxt)
++        for i in range(int(max_new_tokens)):
++            ck = ctx_key(context)
++            penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
++
++            router_live_enabled = bool(self.config.router_live_enabled)
++            router_debug = bool(self.config.router_live_debug_compare)
++
++            router_used = False
++            router_fallback = False
++            router_fallback_reason = ""
++            allowed_predictor_ids: List[str] = []
++            gated_predictors: Optional[List[Act]] = None
++
++            if router_live_enabled:
++                table = self._macro_router_table
++                if table is None or not isinstance(table, dict):
++                    router_fallback = True
++                    router_fallback_reason = "router_missing"
++                else:
++                    ctx_sig = f"{mode_state}{SEP}{ck}"
++                    entry = table.get(ctx_sig)
++                    if isinstance(entry, dict):
++                        preds = entry.get("predictors") or []
++                        if isinstance(preds, list):
++                            allowed_predictor_ids = [
++                                str(x) for x in preds if isinstance(x, str) and x
++                            ]
++                    if allowed_predictor_ids:
++                        present = [
++                            pid for pid in allowed_predictor_ids if pid in self._predictor_by_id
++                        ]
++                        if present:
++                            present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
++                            gated_predictors = [self._predictor_by_id[pid] for pid in present]
++                        else:
++                            router_fallback = True
++                            router_fallback_reason = "allowed_missing"
++                    else:
++                        router_fallback = True
++                        router_fallback_reason = "missing_ctx"
++
++            emit_gate: Optional[Dict[str, Any]] = None
++            cand_gate: Optional[Dict[str, Candidate]] = None
++            if gated_predictors is not None:
++                emit_gate = {}
++                cand_gate = self._emit_candidates(
++                    context=context,
++                    penalties=penalties,
++                    predictors=gated_predictors,
++                    trace=emit_gate,
++                )
++                if int(emit_gate.get("predictor_emitted", 0) or 0) <= 0:
++                    router_fallback = True
++                    router_fallback_reason = "gate_empty_emit"
++                    emit_gate = None
++                    cand_gate = None
++
++            emit_base: Optional[Dict[str, Any]] = None
++            cand_base: Optional[Dict[str, Candidate]] = None
++            if router_debug or (router_live_enabled and cand_gate is None):
++                emit_base = {}
++                cand_base = self._emit_candidates(
++                    context=context, penalties=penalties, trace=emit_base
++                )
++
++            mismatch = False
++            baseline_tok = ""
++            gate_tok = ""
++            if router_debug and cand_gate is not None and cand_base is not None:
++                base_after, _ = _apply_rewrite_rules(
++                    cand_base, context=context, penalties=penalties
++                )
++                gate_after, _ = _apply_rewrite_rules(
++                    cand_gate, context=context, penalties=penalties
++                )
++                b_nxt = _select_next(base_after, context=context, penalties=penalties)
++                g_nxt = _select_next(gate_after, context=context, penalties=penalties)
++                baseline_tok = str(b_nxt or "")
++                gate_tok = str(g_nxt or "")
++                mismatch = bool(b_nxt != g_nxt)
++                if mismatch:
++                    router_fallback = True
++                    router_fallback_reason = "mismatch"
++                    emit_gate = None
++                    cand_gate = None
++
++            emit_trace: Dict[str, Any] = {}
++            candidates: Dict[str, Candidate] = {}
++            if cand_gate is not None and emit_gate is not None and not router_fallback:
++                router_used = True
++                emit_trace = emit_gate
++                candidates = cand_gate
++            else:
++                router_used = False
++                if router_live_enabled and not router_fallback:
++                    router_fallback = True
++                    router_fallback_reason = "no_gate"
++                if cand_base is None or emit_base is None:
++                    emit_base = {}
++                    cand_base = self._emit_candidates(
++                        context=context, penalties=penalties, trace=emit_base
++                    )
++                emit_trace = emit_base
++                candidates = cand_base
++
++            exec_pred = emit_trace.get("executed_predictor_ids") or []
++            exec_pred_ids: List[str] = []
++            if isinstance(exec_pred, list):
++                exec_pred_ids = [str(x) for x in exec_pred if isinstance(x, str)]
++
++            pred_iter = int(emit_trace.get("predictor_iterated", 0) or 0)
++            pred_mat = int(emit_trace.get("predictor_matched", 0) or 0)
++            pred_emit = int(emit_trace.get("predictor_emitted", 0) or 0)
++            cand_pre = int(emit_trace.get("candidates_pre_rewrite", len(candidates)) or 0)
++
++            base_iter = 0
++            base_mat = 0
++            base_emit = 0
++            if isinstance(emit_base, dict):
++                base_iter = int(emit_base.get("predictor_iterated", 0) or 0)
++                base_mat = int(emit_base.get("predictor_matched", 0) or 0)
++                base_emit = int(emit_base.get("predictor_emitted", 0) or 0)
++
++            candidates, rr_hits = _apply_rewrite_rules(
++                candidates, context=context, penalties=penalties
++            )
++
++            # EOS guardrail
++            if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
++                candidates["<EOS>"].score -= 1e6
++
++            if not candidates:
++                break
++
++            nxt = _select_next(candidates, context=context, penalties=penalties)
++            if nxt is None or nxt == "<EOS>":
++                break
++
++            src_act = candidates.get(nxt).source_act if nxt in candidates else "__unknown__"
++
++            # Align trace arrays exactly to emitted tokens (no EOS attempt row).
++            trace_context_keys.append(ck)
++            trace_executed_predictor_ids.append(exec_pred_ids)
++            trace_rewrite_rule_hit_ids.append(rr_hits)
++            trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
++
++            trace_predictor_iterated.append(pred_iter)
++            trace_predictor_matched.append(pred_mat)
++            trace_predictor_emitted.append(pred_emit)
++            trace_candidates_pre.append(cand_pre)
++            trace_candidates_post.append(int(len(candidates)))
++
++            trace_router_live_used.append(1 if router_used else 0)
++            trace_router_live_fallback.append(1 if router_fallback else 0)
++            trace_router_live_fallback_reason.append(str(router_fallback_reason))
++            trace_router_live_allowed_predictor_ids.append(list(allowed_predictor_ids))
++            trace_router_live_predictors_iterated.append(pred_iter)
++            trace_router_live_predictors_matched.append(pred_mat)
++            trace_router_live_predictors_emitted.append(pred_emit)
++            trace_baseline_predictors_iterated.append(base_iter if router_debug else 0)
++            trace_baseline_predictors_matched.append(base_mat if router_debug else 0)
++            trace_baseline_predictors_emitted.append(base_emit if router_debug else 0)
++            trace_router_live_mismatch.append(1 if mismatch else 0)
++            trace_router_live_debug_baseline_token.append(baseline_tok)
++            trace_router_live_debug_gate_token.append(gate_tok)
++
++            trace_selected_act_ids.append(str(src_act))
++            trace_selected_tokens.append(str(nxt))
++
++            gen_tokens.append(nxt)
+             # Update history sets for cycle penalties (filtered, space-free).
+             filtered = [x for x in (out_tokens + gen_tokens) if x not in {"<BOS>"}]
+             n = self.config.cycle_ngram
+             if len(filtered) >= n:
+*** End Patch

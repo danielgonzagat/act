@@ -1,0 +1,1785 @@
+--- /dev/null	2026-01-19 02:10:10
++++ atos_core/arc_loader_v139.py	2026-01-18 23:12:32
+@@ -0,0 +1,203 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .grid_v124 import GridV124, grid_from_list_v124, grid_shape_v124, unique_colors_v124
++
++ARC_LOADER_SCHEMA_VERSION_V139 = 139
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _resolve_arc_tasks_root_v139(*, arc_root: str, split: Optional[str]) -> Path:
++    # Split-aware rules:
++    # - Honor root/{training,evaluation} and root/data/{training,evaluation}
++    # - If such dirs exist, split is required and must match.
++    root = Path(str(arc_root)).resolve()
++    if not root.exists():
++        raise FileNotFoundError(f"arc_root_missing:{root}")
++
++    requested = str(split or "").strip()
++    candidates: List[Tuple[Path, List[str]]] = []
++    for base in (root, root / "data"):
++        if not base.exists():
++            continue
++        found: List[str] = []
++        for name in ("training", "evaluation"):
++            if (base / name).is_dir():
++                found.append(name)
++        if found:
++            candidates.append((base, sorted(found)))
++
++    if candidates:
++        avail = sorted(set(x for _, fs in candidates for x in fs))
++        if requested not in avail:
++            raise ValueError(
++                f"arc_split_required:requested={requested or '<missing>'} available={','.join(avail)} root={root}"
++            )
++        for base, fs in candidates:
++            if requested in fs:
++                return (base / requested).resolve()
++        raise ValueError("arc_split_resolution_failed")
++
++    if requested and requested not in ("sample", "synth"):
++        raise ValueError(f"arc_split_not_found:requested={requested} root={root}")
++    return root
++
++
++@dataclass(frozen=True)
++class ArcTaskV139:
++    task_id: str
++    train_pairs: Tuple[Tuple[GridV124, GridV124], ...]
++    # In ARC-AGI datasets, test outputs exist (used for scoring-only). In internal samples,
++    # test outputs may be omitted; keep them as Optional and let the runner fall back to
++    # solver-status-only accounting for those cases.
++    test_pairs: Tuple[Tuple[GridV124, Optional[GridV124]], ...]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "schema_version": int(ARC_LOADER_SCHEMA_VERSION_V139),
++            "kind": "arc_task_v139",
++            "task_id": str(self.task_id),
++            "train_pairs": [
++                {"in_grid": [list(r) for r in inp], "out_grid": [list(r) for r in out]}
++                for inp, out in self.train_pairs
++            ],
++            "test_pairs": [
++                {
++                    "in_grid": [list(r) for r in inp],
++                    "out_grid": ([list(r) for r in out] if out is not None else None),
++                }
++                for inp, out in self.test_pairs
++            ],
++        }
++
++
++def _parse_grid_v139(x: Any) -> GridV124:
++    if not isinstance(x, list):
++        raise ValueError("grid_not_list")
++    rows: List[List[int]] = []
++    for row in x:
++        if not isinstance(row, list):
++            raise ValueError("grid_row_not_list")
++        rows.append([int(v) for v in row])
++    return grid_from_list_v124(rows)
++
++
++def _validate_grid_v139(g: GridV124) -> None:
++    h, w = grid_shape_v124(g)
++    if h < 0 or w < 0:
++        raise ValueError("invalid_grid_shape")
++    for c in unique_colors_v124(g):
++        cc = int(c)
++        if cc < 0 or cc > 9:
++            raise ValueError("grid_color_out_of_range")
++
++
++def _parse_task_json_v139(*, path: Path, task_id: str) -> ArcTaskV139:
++    obj = json.loads(path.read_text(encoding="utf-8"))
++    train_pairs: List[Tuple[GridV124, GridV124]] = []
++    for pair in obj.get("train", []):
++        inp = _parse_grid_v139(pair.get("input"))
++        out = _parse_grid_v139(pair.get("output"))
++        train_pairs.append((inp, out))
++
++    tests = obj.get("test", [])
++    if not tests:
++        raise ValueError("missing_test")
++    test_pairs: List[Tuple[GridV124, Optional[GridV124]]] = []
++    for pair in tests:
++        inp = _parse_grid_v139(pair.get("input"))
++        out_obj = pair.get("output")
++        out = _parse_grid_v139(out_obj) if out_obj is not None else None
++        test_pairs.append((inp, out))
++
++    grids_to_validate: List[GridV124] = []
++    grids_to_validate.extend([p[0] for p in train_pairs])
++    grids_to_validate.extend([p[1] for p in train_pairs])
++    grids_to_validate.extend([p[0] for p in test_pairs])
++    grids_to_validate.extend([p[1] for p in test_pairs if p[1] is not None])  # type: ignore[misc]
++    for g in grids_to_validate:
++        _validate_grid_v139(g)
++
++    return ArcTaskV139(task_id=str(task_id), train_pairs=tuple(train_pairs), test_pairs=tuple(test_pairs))
++
++
++def write_arc_canonical_jsonl_v139(
++    *, arc_root: str, split: Optional[str], limit: int, out_jsonl: Path, out_manifest: Path
++) -> Dict[str, Any]:
++    tasks_root = _resolve_arc_tasks_root_v139(arc_root=str(arc_root), split=split)
++    if out_jsonl.exists():
++        raise FileExistsError(f"worm_exists:{out_jsonl}")
++    if out_manifest.exists():
++        raise FileExistsError(f"worm_exists:{out_manifest}")
++    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
++    out_manifest.parent.mkdir(parents=True, exist_ok=True)
++
++    task_paths = sorted(tasks_root.rglob("*.json"), key=lambda p: str(p.relative_to(tasks_root)))
++    if int(limit) > 0:
++        task_paths = task_paths[: int(limit)]
++
++    inputs: List[Dict[str, Any]] = []
++    rows: List[str] = []
++    for p in task_paths:
++        task_id = str(p.relative_to(tasks_root)).replace("\\", "/")
++        sha = _sha256_file(p)
++        inputs.append({"task_id": str(task_id), "path": str(p), "sha256": str(sha)})
++        task = _parse_task_json_v139(path=p, task_id=task_id)
++        rows.append(canonical_json_dumps(task.to_dict()))
++
++    with open(out_jsonl, "x", encoding="utf-8") as f:
++        for line in rows:
++            f.write(line + "\n")
++
++    manifest_obj: Dict[str, Any] = {
++        "schema_version": int(ARC_LOADER_SCHEMA_VERSION_V139),
++        "kind": "arc_manifest_v139",
++        "arc_root_input": str(Path(str(arc_root)).resolve()),
++        "tasks_root": str(tasks_root),
++        "split": str(split or ""),
++        "limit": int(limit),
++        "inputs": inputs,
++        "canonical_jsonl_sha256": _sha256_file(out_jsonl),
++    }
++    manifest_obj["manifest_sig"] = sha256_hex(canonical_json_dumps(manifest_obj).encode("utf-8"))
++    with open(out_manifest, "x", encoding="utf-8") as f:
++        json.dump(manifest_obj, f, ensure_ascii=False, sort_keys=True, indent=2)
++        f.write("\n")
++    return manifest_obj
++
++
++def iter_canonical_tasks_v139(jsonl_path: str) -> Iterator[ArcTaskV139]:
++    with open(str(jsonl_path), "r", encoding="utf-8") as f:
++        for line in f:
++            if not line.strip():
++                continue
++            obj = json.loads(line)
++            train_pairs: List[Tuple[GridV124, GridV124]] = []
++            for pair in obj.get("train_pairs", []):
++                inp = _parse_grid_v139(pair.get("in_grid"))
++                out = _parse_grid_v139(pair.get("out_grid"))
++                train_pairs.append((inp, out))
++            test_pairs: List[Tuple[GridV124, Optional[GridV124]]] = []
++            for pair in obj.get("test_pairs", []):
++                inp = _parse_grid_v139(pair.get("in_grid"))
++                out_obj = pair.get("out_grid")
++                out = _parse_grid_v139(out_obj) if out_obj is not None else None
++                test_pairs.append((inp, out))
++            yield ArcTaskV139(task_id=str(obj.get("task_id")), train_pairs=tuple(train_pairs), test_pairs=tuple(test_pairs))
++
+--- /dev/null	2026-01-19 02:10:10
++++ atos_core/arc_solver_v139.py	2026-01-18 23:30:02
+@@ -0,0 +1,888 @@
++from __future__ import annotations
++
++import heapq
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .arc_objects_v132 import connected_components4_v132
++from .arc_ops_v132 import StateV132
++from .arc_ops_v137 import apply_op_v137, step_cost_bits_v137
++from .grid_v124 import (
++    GridV124,
++    bbox_nonzero_v124,
++    crop_to_bbox_nonzero_v124,
++    grid_equal_v124,
++    grid_hash_v124,
++    grid_shape_v124,
++    pad_to_v124,
++    unique_colors_v124,
++)
++
++ARC_SOLVER_SCHEMA_VERSION_V139 = 139
++
++
++def _validate_grid_values_v139(g: GridV124) -> None:
++    for row in g:
++        for v in row:
++            x = int(v)
++            if x < 0 or x > 9:
++                raise ValueError("grid_color_out_of_range")
++
++
++def _summarize_mismatch_v139(*, got: GridV124, want: GridV124) -> Dict[str, Any]:
++    hg, wg = grid_shape_v124(got)
++    hw, ww = grid_shape_v124(want)
++    if (hg, wg) != (hw, ww):
++        return {"kind": "shape_mismatch", "got": {"h": int(hg), "w": int(wg)}, "want": {"h": int(hw), "w": int(ww)}}
++    diff = 0
++    for r in range(hg):
++        for c in range(wg):
++            if int(got[r][c]) != int(want[r][c]):
++                diff += 1
++    return {"kind": "cell_mismatch", "diff_cells": int(diff)}
++
++
++def _stage_from_avail_v139(avail: Set[str]) -> str:
++    if "grid" not in avail:
++        return "none"
++    if "patch" in avail:
++        return "patch"
++    if "bbox" in avail:
++        return "bbox"
++    if "obj" in avail:
++        return "obj"
++    if "objset" in avail:
++        return "objset"
++    return "grid"
++
++
++def _abstract_slots_after_steps_v139(steps: Sequence["ProgramStepV139"]) -> Set[str]:
++    avail: Set[str] = {"grid"}
++    for s in steps:
++        op = str(s.op_id)
++        if op == "cc4":
++            avail.add("objset")
++        elif op == "select_obj":
++            if "objset" in avail:
++                avail.add("obj")
++        elif op == "obj_bbox":
++            if "obj" in avail:
++                avail.add("bbox")
++        elif op in {"bbox_by_color"}:
++            avail.add("bbox")
++        elif op == "crop_bbox":
++            avail.add("patch")
++        elif op == "commit_patch":
++            avail.discard("patch")
++            avail.discard("objset")
++            avail.discard("obj")
++            avail.discard("bbox")
++        elif op == "new_canvas":
++            avail.discard("objset")
++            avail.discard("obj")
++            avail.discard("bbox")
++            avail.discard("patch")
++        elif op in {
++            "rotate90",
++            "rotate180",
++            "rotate270",
++            "reflect_h",
++            "reflect_v",
++            "translate",
++            "overlay_self_translate",
++            "propagate_color_translate",
++            "repeat_grid",
++            "crop_bbox_nonzero",
++            "pad_to",
++            "replace_color",
++            "map_colors",
++        }:
++            avail.discard("objset")
++            avail.discard("obj")
++            avail.discard("bbox")
++            avail.discard("patch")
++        elif op == "bbox_by_color":
++            avail.discard("objset")
++            avail.discard("obj")
++            avail.discard("patch")
++    return avail
++
++
++def _min_steps_to_grid_modify_v139(stage: str) -> int:
++    if str(stage) == "none":
++        return 10**9
++    return 1
++
++
++def _can_reach_shape_v139(*, stage: str, got_shape: Tuple[int, int], want_shape: Tuple[int, int], steps_left: int) -> bool:
++    if steps_left < 0:
++        return False
++    (hg, wg) = (int(got_shape[0]), int(got_shape[1]))
++    (hw, ww) = (int(want_shape[0]), int(want_shape[1]))
++    if (hg, wg) == (hw, ww):
++        return True
++    if steps_left <= 0:
++        return False
++    st = str(stage)
++    if st in {"grid", "objset", "obj", "bbox", "patch"}:
++        return True
++    return False
++
++
++@dataclass(frozen=True)
++class ProgramStepV139:
++    op_id: str
++    args: Dict[str, Any]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {"op_id": str(self.op_id), "args": {str(k): self.args[k] for k in sorted(self.args.keys())}}
++
++
++@dataclass(frozen=True)
++class ProgramV139:
++    steps: Tuple[ProgramStepV139, ...]
++
++    def program_sig(self) -> str:
++        body = {"schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139), "kind": "arc_program_v139", "steps": [s.to_dict() for s in self.steps]}
++        return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++@dataclass(frozen=True)
++class _EvalInfoV139:
++    ok_train: bool
++    loss: Tuple[int, int]
++    mismatch_ex: Optional[Dict[str, Any]]
++    vec_sig: str
++    test_grid: GridV124
++
++
++def _canonical_args_key_v139(args: Dict[str, Any]) -> str:
++    a = {str(k): args[k] for k in sorted(args.keys())}
++    return canonical_json_dumps(a)
++
++
++def _grid_hash_cached_v139(*, g: GridV124, cache: Dict[GridV124, str]) -> str:
++    hit = cache.get(g)
++    if hit is not None:
++        return str(hit)
++    h = grid_hash_v124(g)
++    cache[g] = str(h)
++    return str(h)
++
++
++def _state_sig_dict_cached_v139(*, state: StateV132, grid_hash_cache: Dict[GridV124, str]) -> Dict[str, Any]:
++    return {
++        "grid_hash": _grid_hash_cached_v139(g=state.grid, cache=grid_hash_cache),
++        "objset_sig": str(state.objset.set_sig()) if state.objset is not None else "",
++        "obj_sig": str(state.obj.object_sig()) if state.obj is not None else "",
++        "bbox": state.bbox.to_dict() if state.bbox is not None else None,
++        "patch_hash": _grid_hash_cached_v139(g=state.patch, cache=grid_hash_cache) if state.patch is not None else "",
++    }
++
++
++def _apply_step_cached_v139(
++    *,
++    state: StateV132,
++    op_id: str,
++    args: Dict[str, Any],
++    apply_cache: Dict[str, StateV132],
++    grid_hash_cache: Dict[GridV124, str],
++    metrics: Dict[str, int],
++) -> StateV132:
++    st_key = canonical_json_dumps(_state_sig_dict_cached_v139(state=state, grid_hash_cache=grid_hash_cache))
++    args_key = _canonical_args_key_v139(args)
++    key = f"{st_key}|{str(op_id)}|{args_key}"
++    hit = apply_cache.get(key)
++    if hit is not None:
++        metrics["apply_cache_hits"] = int(metrics.get("apply_cache_hits", 0)) + 1
++        return hit
++    metrics["apply_cache_misses"] = int(metrics.get("apply_cache_misses", 0)) + 1
++    nxt = apply_op_v137(state=state, op_id=str(op_id), args=dict(args))
++    apply_cache[key] = nxt
++    return nxt
++
++
++def _apply_program_state_cached_v139(
++    *,
++    grid: GridV124,
++    steps: Sequence[ProgramStepV139],
++    apply_cache: Dict[str, StateV132],
++    grid_hash_cache: Dict[GridV124, str],
++    metrics: Dict[str, int],
++) -> StateV132:
++    st = StateV132(grid=grid)
++    for s in steps:
++        st = _apply_step_cached_v139(
++            state=st,
++            op_id=str(s.op_id),
++            args=dict(s.args),
++            apply_cache=apply_cache,
++            grid_hash_cache=grid_hash_cache,
++            metrics=metrics,
++        )
++    return st
++
++
++def apply_program_v139(prog: ProgramV139, grid: GridV124) -> GridV124:
++    st = StateV132(grid=grid)
++    for step in prog.steps:
++        st = apply_op_v137(state=st, op_id=str(step.op_id), args=dict(step.args))
++    return st.grid
++
++
++def _program_cost_bits_v139(steps: Sequence[ProgramStepV139]) -> int:
++    total = 0
++    for st in steps:
++        total += int(step_cost_bits_v137(op_id=str(st.op_id), args=dict(st.args)))
++    return int(total)
++
++
++def _infer_color_mapping_v139(inp: GridV124, out: GridV124) -> Optional[Dict[str, int]]:
++    from .arc_solver_v134 import _infer_color_mapping_v134
++
++    return _infer_color_mapping_v134(inp, out)
++
++
++def _bg_candidates_v139(grids: Sequence[GridV124]) -> Tuple[int, ...]:
++    from .arc_solver_v134 import _bg_candidates_v134
++
++    return _bg_candidates_v134(grids)
++
++
++def _infer_repeat_grid_steps_v139(train_pairs: Sequence[Tuple[GridV124, GridV124]]) -> List[ProgramStepV139]:
++    from .arc_solver_v134 import _infer_repeat_grid_steps_v134
++
++    steps_v134 = _infer_repeat_grid_steps_v134(train_pairs)
++    return [ProgramStepV139(op_id=str(s.op_id), args=dict(s.args)) for s in steps_v134]
++
++
++def _infer_overlay_self_translate_steps_v139(
++    *, train_pairs: Sequence[Tuple[GridV124, GridV124]], bg_candidates: Sequence[int]
++) -> List[ProgramStepV139]:
++    from .arc_solver_v135 import _infer_overlay_self_translate_steps_v135
++
++    steps_v135 = _infer_overlay_self_translate_steps_v135(train_pairs=train_pairs, bg_candidates=tuple(int(x) for x in bg_candidates))
++    return [ProgramStepV139(op_id=str(s.op_id), args=dict(s.args)) for s in steps_v135]
++
++
++def _infer_propagate_color_translate_steps_v139(
++    *, train_pairs: Sequence[Tuple[GridV124, GridV124]], bg_candidates: Sequence[int]
++) -> List[ProgramStepV139]:
++    from .arc_solver_v137 import _infer_propagate_color_translate_steps_v137
++
++    steps_v137 = _infer_propagate_color_translate_steps_v137(train_pairs=train_pairs, bg_candidates=tuple(int(x) for x in bg_candidates))
++    return [ProgramStepV139(op_id=str(s.op_id), args=dict(s.args)) for s in steps_v137]
++
++
++def _infer_direct_steps_v139(*, train_pairs: Sequence[Tuple[GridV124, GridV124]], test_in: GridV124) -> List[ProgramStepV139]:
++    direct: List[ProgramStepV139] = []
++
++    for op_id in ["rotate90", "rotate180", "rotate270", "reflect_h", "reflect_v"]:
++        ok = True
++        step = ProgramStepV139(op_id=str(op_id), args={})
++        for inp, out in train_pairs:
++            got = apply_program_v139(ProgramV139(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    mapping: Dict[str, int] = {}
++    mapping_ok = True
++    for inp, out in train_pairs:
++        m = _infer_color_mapping_v139(inp, out)
++        if m is None:
++            mapping_ok = False
++            break
++        for k in m.keys():
++            if k in mapping and int(mapping[k]) != int(m[k]):
++                mapping_ok = False
++                break
++            mapping[k] = int(m[k])
++        if not mapping_ok:
++            break
++    if mapping_ok and mapping:
++        step = ProgramStepV139(op_id="map_colors", args={"mapping": {str(k): int(mapping[k]) for k in sorted(mapping.keys())}})
++        ok = True
++        for inp, out in train_pairs:
++            got = apply_program_v139(ProgramV139(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    bgs = _bg_candidates_v139([p[0] for p in train_pairs] + [test_in])
++    for bg in bgs:
++        shift: Optional[Tuple[int, int]] = None
++        consistent = True
++        for inp, out in train_pairs:
++            hi, wi = grid_shape_v124(inp)
++            ho, wo = grid_shape_v124(out)
++            if (hi, wi) != (ho, wo):
++                consistent = False
++                break
++            ir0, ic0, _, _ = bbox_nonzero_v124(inp, bg=int(bg))
++            or0, oc0, _, _ = bbox_nonzero_v124(out, bg=int(bg))
++            dy = int(or0 - ir0)
++            dx = int(oc0 - ic0)
++            if shift is None:
++                shift = (dy, dx)
++            elif shift != (dy, dx):
++                consistent = False
++                break
++        if not consistent or shift is None:
++            continue
++        dy, dx = shift
++        if dy == 0 and dx == 0:
++            continue
++        step = ProgramStepV139(op_id="translate", args={"dx": int(dx), "dy": int(dy), "pad": int(bg)})
++        ok = True
++        for inp, out in train_pairs:
++            got = apply_program_v139(ProgramV139(steps=(step,)), inp)
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(step)
++
++    for bg in bgs:
++        ok = True
++        for inp, out in train_pairs:
++            got = crop_to_bbox_nonzero_v124(inp, bg=int(bg))
++            if not grid_equal_v124(got, out):
++                ok = False
++                break
++        if ok:
++            direct.append(ProgramStepV139(op_id="crop_bbox_nonzero", args={"bg": int(bg)}))
++
++    shapes_out = sorted({grid_shape_v124(out) for _, out in train_pairs})
++    for h, w in shapes_out:
++        for bg in bgs:
++            ok = True
++            for inp, out in train_pairs:
++                got = pad_to_v124(inp, height=int(h), width=int(w), pad=int(bg))
++                if not grid_equal_v124(got, out):
++                    ok = False
++                    break
++            if ok:
++                direct.append(ProgramStepV139(op_id="pad_to", args={"height": int(h), "width": int(w), "pad": int(bg)}))
++
++    direct.extend(_infer_repeat_grid_steps_v139(train_pairs))
++    direct.extend(_infer_overlay_self_translate_steps_v139(train_pairs=train_pairs, bg_candidates=bgs))
++    direct.extend(_infer_propagate_color_translate_steps_v139(train_pairs=train_pairs, bg_candidates=bgs))
++
++    direct.sort(key=lambda s: canonical_json_dumps(s.to_dict()))
++    seen: Set[str] = set()
++    out_steps: List[ProgramStepV139] = []
++    for s in direct:
++        sig = sha256_hex(canonical_json_dumps(s.to_dict()).encode("utf-8"))
++        if sig in seen:
++            continue
++        seen.add(sig)
++        out_steps.append(s)
++    return out_steps
++
++
++def _propose_bbox_by_color_steps_v139(*, train_pairs: Sequence[Tuple[GridV124, GridV124]]) -> List[ProgramStepV139]:
++    if not train_pairs:
++        return []
++    colors_all: Optional[Set[int]] = None
++    for inp, _ in train_pairs:
++        cs = set(int(c) for c in unique_colors_v124(inp))
++        colors_all = cs if colors_all is None else (colors_all & cs)
++        if not colors_all:
++            return []
++    assert colors_all is not None
++    return [ProgramStepV139(op_id="bbox_by_color", args={"color": int(c)}) for c in sorted(colors_all)]
++
++
++def _cc4_nonempty_for_all_v139(*, grids: Sequence[GridV124], bg: int) -> bool:
++    for g in grids:
++        try:
++            oset = connected_components4_v132(g, bg=int(bg))
++        except Exception:
++            return False
++        if not getattr(oset, "objects", None):
++            return False
++        if len(oset.objects) <= 0:
++            return False
++    return True
++
++
++def _crop_bbox_nonzero_is_noop_v139(*, train_in: Sequence[GridV124], bg: int) -> bool:
++    for g in train_in:
++        h, w = grid_shape_v124(g)
++        r0, c0, r1, c1 = bbox_nonzero_v124(g, bg=int(bg))
++        if int(r0) != 0 or int(c0) != 0 or int(r1) != int(h) or int(c1) != int(w):
++            return False
++    return True
++
++
++def _pad_to_is_noop_v139(*, train_in_shapes: Sequence[Tuple[int, int]], height: int, width: int) -> bool:
++    for h, w in train_in_shapes:
++        if int(h) > int(height) or int(w) > int(width):
++            return False
++    return True
++
++
++def _propose_next_steps_v139(
++    *,
++    steps_so_far: Sequence[ProgramStepV139],
++    train_pairs: Sequence[Tuple[GridV124, GridV124]],
++    test_in: GridV124,
++    bg_candidates: Sequence[int],
++    shapes_out: Sequence[Tuple[int, int]],
++    palette_out: Sequence[int],
++    direct_steps: Sequence[ProgramStepV139],
++) -> List[ProgramStepV139]:
++    avail = _abstract_slots_after_steps_v139(steps_so_far)
++    train_in = [p[0] for p in train_pairs]
++    train_in_shapes = [grid_shape_v124(g) for g in train_in]
++    out_steps: List[ProgramStepV139] = []
++
++    for s in direct_steps:
++        out_steps.append(s)
++
++    if "bbox" not in avail:
++        out_steps.extend(_propose_bbox_by_color_steps_v139(train_pairs=train_pairs))
++
++    if "objset" not in avail:
++        for bg in bg_candidates:
++            if not _cc4_nonempty_for_all_v139(grids=train_in + [test_in], bg=int(bg)):
++                continue
++            out_steps.append(ProgramStepV139(op_id="cc4", args={"bg": int(bg)}))
++
++    if "objset" in avail and "obj" not in avail:
++        from .arc_solver_v134 import _infer_select_obj_args_v134
++
++        args_list = _infer_select_obj_args_v134(train_pairs=train_pairs, bg=int(bg_candidates[0] if bg_candidates else 0), max_rank=1)
++        for a in args_list:
++            out_steps.append(ProgramStepV139(op_id="select_obj", args=dict(a)))
++
++    if "obj" in avail and "bbox" not in avail:
++        out_steps.append(ProgramStepV139(op_id="obj_bbox", args={}))
++
++    if "bbox" in avail:
++        out_steps.append(ProgramStepV139(op_id="crop_bbox", args={}))
++
++    for bg in bg_candidates:
++        if not _crop_bbox_nonzero_is_noop_v139(train_in=train_in + [test_in], bg=int(bg)):
++            out_steps.append(ProgramStepV139(op_id="crop_bbox_nonzero", args={"bg": int(bg)}))
++
++    for (h, w) in shapes_out:
++        for bg in bg_candidates:
++            if _pad_to_is_noop_v139(train_in_shapes=train_in_shapes + [grid_shape_v124(test_in)], height=int(h), width=int(w)):
++                continue
++            out_steps.append(ProgramStepV139(op_id="pad_to", args={"height": int(h), "width": int(w), "pad": int(bg)}))
++
++    for (h, w) in shapes_out:
++        for bg in bg_candidates:
++            out_steps.append(ProgramStepV139(op_id="new_canvas", args={"height": int(h), "width": int(w), "bg": int(bg)}))
++
++    if "bbox" in avail:
++        for c in palette_out:
++            out_steps.append(ProgramStepV139(op_id="paint_rect", args={"color": int(c)}))
++            out_steps.append(ProgramStepV139(op_id="draw_rect_border", args={"color": int(c), "thickness": 1}))
++
++    out_steps.sort(key=lambda s: canonical_json_dumps(s.to_dict()))
++    seen: Set[str] = set()
++    uniq: List[ProgramStepV139] = []
++    for s in out_steps:
++        sig = sha256_hex(canonical_json_dumps(s.to_dict()).encode("utf-8"))
++        if sig in seen:
++            continue
++        seen.add(sig)
++        uniq.append(s)
++    return uniq
++
++
++@dataclass(frozen=True)
++class SolveConfigV139:
++    max_depth: int = 4
++    max_programs: int = 4000
++    trace_program_limit: int = 80
++    max_ambiguous_outputs: int = 8
++
++
++def solve_arc_task_v139(*, train_pairs: Sequence[Tuple[GridV124, GridV124]], test_in: GridV124, config: SolveConfigV139) -> Dict[str, Any]:
++    # Fail-closed on invalid grids: return structured failure, do not throw.
++    try:
++        for inp, out in train_pairs:
++            _validate_grid_values_v139(inp)
++            _validate_grid_values_v139(out)
++        _validate_grid_values_v139(test_in)
++    except Exception as e:
++        return {
++            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++            "kind": "arc_solve_result_v139",
++            "status": "FAIL",
++            "program_sig": "",
++            "program_cost_bits": 0,
++            "predicted_grid_hash": "",
++            "failure_reason": {"kind": "INVARIANT_VIOLATION", "details": {"error": str(e)}},
++            "trace": {"schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139), "kind": "arc_trace_v139", "tried": 0},
++        }
++
++    bgs = _bg_candidates_v139([p[0] for p in train_pairs] + [test_in])
++    shapes_out = tuple(sorted({grid_shape_v124(out) for _, out in train_pairs}))
++    palette_out_set: Set[int] = set()
++    for _, out in train_pairs:
++        palette_out_set |= set(int(c) for c in unique_colors_v124(out))
++    palette_out = tuple(sorted(palette_out_set))
++
++    direct_steps = _infer_direct_steps_v139(train_pairs=train_pairs, test_in=test_in)
++
++    max_depth = int(config.max_depth)
++    max_programs = int(config.max_programs)
++    trace_program_limit = int(config.trace_program_limit)
++
++    apply_cache: Dict[str, StateV132] = {}
++    eval_cache: Dict[str, _EvalInfoV139] = {}
++    grid_hash_cache: Dict[GridV124, str] = {}
++    metrics: Dict[str, int] = {
++        "apply_cache_hits": 0,
++        "apply_cache_misses": 0,
++        "eval_cache_hits": 0,
++        "eval_cache_misses": 0,
++    }
++
++    def eval_program(steps: Tuple[ProgramStepV139, ...]) -> _EvalInfoV139:
++        prog = ProgramV139(steps=steps)
++        psig = prog.program_sig()
++        cached = eval_cache.get(psig)
++        if cached is not None:
++            metrics["eval_cache_hits"] = int(metrics.get("eval_cache_hits", 0)) + 1
++            return cached
++        metrics["eval_cache_misses"] = int(metrics.get("eval_cache_misses", 0)) + 1
++
++        # Determine stage for vec_sig (coarse, but includes slot signatures).
++        avail = _abstract_slots_after_steps_v139(steps)
++        stage = _stage_from_avail_v139(avail)
++        cc4_bg: Optional[int] = None
++        for st in steps:
++            if str(st.op_id) == "cc4":
++                cc4_bg = int((st.args or {}).get("bg") or 0)
++
++        shape_pen = 0
++        diff_sum = 0
++        mismatch_ex: Optional[Dict[str, Any]] = None
++        train_state_sigs: List[str] = []
++
++        for inp, out in train_pairs:
++            try:
++                end_state = _apply_program_state_cached_v139(
++                    grid=inp,
++                    steps=steps,
++                    apply_cache=apply_cache,
++                    grid_hash_cache=grid_hash_cache,
++                    metrics=metrics,
++                )
++                got = end_state.grid
++            except Exception as e:
++                # Prefix is not executable; extensions won't fix.
++                ee = {"kind": "exception", "error": str(e)}
++                cached_fail = _EvalInfoV139(ok_train=False, loss=(10**9, 10**9), mismatch_ex=ee, vec_sig="", test_grid=test_in)
++                eval_cache[psig] = cached_fail
++                return cached_fail
++
++            mm = _summarize_mismatch_v139(got=got, want=out)
++            if mm["kind"] == "shape_mismatch":
++                shape_pen += 100000
++            else:
++                diff_sum += int(mm.get("diff_cells") or 0)
++            if mismatch_ex is None and (mm["kind"] != "cell_mismatch" or int(mm.get("diff_cells") or 0) != 0):
++                mismatch_ex = mm
++
++            train_state_sigs.append(
++                canonical_json_dumps(
++                    {
++                        "stage": str(stage),
++                        "cc4_bg": int(cc4_bg) if cc4_bg is not None else -1,
++                        "state": _state_sig_dict_cached_v139(state=end_state, grid_hash_cache=grid_hash_cache),
++                    }
++                )
++            )
++
++        ok_train = shape_pen == 0 and diff_sum == 0
++
++        try:
++            test_state = _apply_program_state_cached_v139(
++                grid=test_in,
++                steps=steps,
++                apply_cache=apply_cache,
++                grid_hash_cache=grid_hash_cache,
++                metrics=metrics,
++            )
++        except Exception:
++            # If program cannot be applied to test, treat as fail (still keep trace).
++            test_state = StateV132(grid=test_in)
++
++        test_state_sig = canonical_json_dumps(
++            {
++                "stage": str(stage),
++                "cc4_bg": int(cc4_bg) if cc4_bg is not None else -1,
++                "state": _state_sig_dict_cached_v139(state=test_state, grid_hash_cache=grid_hash_cache),
++            }
++        )
++        vec_sig = sha256_hex(
++            canonical_json_dumps(
++                {
++                    "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++                    "kind": "arc_vec_state_sig_v139",
++                    "stage": str(stage),
++                    "cc4_bg": int(cc4_bg) if cc4_bg is not None else -1,
++                    "train": list(train_state_sigs),
++                    "test": str(test_state_sig),
++                }
++            ).encode("utf-8")
++        )
++        out = _EvalInfoV139(
++            ok_train=bool(ok_train),
++            loss=(int(shape_pen), int(diff_sum)),
++            mismatch_ex=mismatch_ex,
++            vec_sig=str(vec_sig),
++            test_grid=test_state.grid,
++        )
++        eval_cache[psig] = out
++        return out
++
++    heap: List[Tuple[Tuple[int, int, int, int, str, str], Tuple[ProgramStepV139, ...]]] = []
++    start: Tuple[ProgramStepV139, ...] = tuple()
++    start_prog = ProgramV139(steps=start)
++    start_cost = _program_cost_bits_v139(start)
++    start_eval = eval_program(start)
++    heapq.heappush(
++        heap,
++        (
++            (int(start_cost), int(start_eval.loss[0]), int(start_eval.loss[1]), 0, str(start_eval.vec_sig), start_prog.program_sig()),
++            start,
++        ),
++    )
++
++    best_cost_by_vec_sig: Dict[str, int] = {}
++    trace_programs: List[Dict[str, Any]] = []
++    tried = 0
++    min_cost_bits: Optional[int] = None
++    min_cost_solution_sigs: List[str] = []
++
++    pruned_by_shape_reachability = 0
++    pruned_by_palette_reachability = 0
++    pruned_by_dominated_state = 0
++    pruned_by_no_grid_modify_in_time = 0
++    expanded_states = 0
++    frontier_max = 0
++
++    def record_trace(*, steps: Tuple[ProgramStepV139, ...], cost_bits: int, depth: int, ok_train: bool, mismatch: Optional[Dict[str, Any]]) -> None:
++        if len(trace_programs) >= trace_program_limit:
++            return
++        trace_programs.append(
++            {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++                "kind": "arc_trace_program_v139",
++                "program_sig": ProgramV139(steps=steps).program_sig(),
++                "cost_bits": int(cost_bits),
++                "depth": int(depth),
++                "ok_train": bool(ok_train),
++                "mismatch": mismatch,
++                "steps": [s.to_dict() for s in steps],
++            }
++        )
++
++    while heap and tried < max_programs:
++        frontier_max = max(frontier_max, len(heap))
++        (_pri, steps) = heapq.heappop(heap)
++        tried += 1
++        expanded_states += 1
++
++        depth = int(len(steps))
++        cost_bits = _program_cost_bits_v139(steps)
++        stage = _stage_from_avail_v139(_abstract_slots_after_steps_v139(steps))
++        steps_left = int(max_depth - depth)
++
++        shapes_ok = True
++        for (inp, out) in train_pairs:
++            if not _can_reach_shape_v139(stage=stage, got_shape=grid_shape_v124(inp), want_shape=grid_shape_v124(out), steps_left=steps_left):
++                shapes_ok = False
++                break
++        if not shapes_ok:
++            pruned_by_shape_reachability += 1
++            continue
++        if steps_left > 0 and int(_min_steps_to_grid_modify_v139(stage)) > int(steps_left):
++            pruned_by_no_grid_modify_in_time += 1
++            continue
++
++        ev = eval_program(steps)
++        record_trace(steps=steps, cost_bits=cost_bits, depth=depth, ok_train=ev.ok_train, mismatch=ev.mismatch_ex)
++        if ev.mismatch_ex is not None and str(ev.mismatch_ex.get("kind") or "") == "exception":
++            continue
++
++        if ev.vec_sig:
++            dom_cost = best_cost_by_vec_sig.get(str(ev.vec_sig))
++            if dom_cost is not None and int(dom_cost) <= int(cost_bits):
++                pruned_by_dominated_state += 1
++                continue
++            best_cost_by_vec_sig[str(ev.vec_sig)] = int(cost_bits)
++
++        if ev.ok_train:
++            prog_sig = ProgramV139(steps=steps).program_sig()
++            if min_cost_bits is None or int(cost_bits) < int(min_cost_bits):
++                min_cost_bits = int(cost_bits)
++                min_cost_solution_sigs = [str(prog_sig)]
++            elif int(cost_bits) == int(min_cost_bits):
++                min_cost_solution_sigs.append(str(prog_sig))
++            continue
++
++        if depth >= max_depth:
++            continue
++
++        next_steps = _propose_next_steps_v139(
++            steps_so_far=list(steps),
++            train_pairs=train_pairs,
++            test_in=test_in,
++            bg_candidates=tuple(int(x) for x in bgs),
++            shapes_out=tuple(shapes_out),
++            palette_out=tuple(int(c) for c in palette_out),
++            direct_steps=list(direct_steps),
++        )
++        for ns in next_steps:
++            new_steps = steps + (ns,)
++            new_cost = int(cost_bits + step_cost_bits_v137(op_id=str(ns.op_id), args=dict(ns.args)))
++            new_ev = eval_program(new_steps)
++            new_sig = ProgramV139(steps=new_steps).program_sig()
++            pri = (int(new_cost), int(new_ev.loss[0]), int(new_ev.loss[1]), int(len(new_steps)), str(new_ev.vec_sig), str(new_sig))
++            heapq.heappush(heap, (pri, new_steps))
++
++    if min_cost_bits is not None and min_cost_solution_sigs:
++        outputs: Dict[str, Dict[str, Any]] = {}
++        for psig in min_cost_solution_sigs:
++            entry = eval_cache.get(str(psig))
++            if entry is None:
++                continue
++            out_grid = entry.test_grid
++            gh = _grid_hash_cached_v139(g=out_grid, cache=grid_hash_cache)
++            cur = outputs.get(gh)
++            if cur is None or str(psig) < str(cur.get("min_program_sig") or ""):
++                outputs[gh] = {"grid": out_grid, "min_program_sig": str(psig)}
++
++        if len(outputs) == 1:
++            out_grid = list(outputs.values())[0]["grid"]
++            return {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++                "kind": "arc_solve_result_v139",
++                "status": "SOLVED",
++                "program_sig": str(min_cost_solution_sigs[0]),
++                "program_cost_bits": int(min_cost_bits),
++                "predicted_grid": [list(r) for r in out_grid],
++                "predicted_grid_hash": grid_hash_v124(out_grid),
++                "trace": {
++                    "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++                    "kind": "arc_trace_v139",
++                    "max_depth": int(max_depth),
++                    "max_programs": int(max_programs),
++                    "tried": int(tried),
++                    "min_cost_solutions": int(len(min_cost_solution_sigs)),
++                    "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++                    "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++                    "pruned_by_dominated_state": int(pruned_by_dominated_state),
++                    "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++                    "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
++                    "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
++                    "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
++                    "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
++                    "unique_states": int(len(best_cost_by_vec_sig)),
++                    "expanded_states": int(expanded_states),
++                    "frontier_max": int(frontier_max),
++                    "trace_programs": trace_programs,
++                },
++            }
++
++        ordered = sorted(outputs.items(), key=lambda kv: (str(kv[1].get("min_program_sig") or ""), str(kv[0])))
++        max_keep = int(max(1, int(config.max_ambiguous_outputs)))
++        kept = ordered[:max_keep]
++        predicted_grids = [
++            {
++                "grid_hash": str(h),
++                "program_sig": str(obj.get("min_program_sig") or ""),
++                "grid": [list(r) for r in obj["grid"]],
++            }
++            for h, obj in kept
++        ]
++        return {
++            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++            "kind": "arc_solve_result_v139",
++            "status": "UNKNOWN",
++            "program_sig": "",
++            "program_cost_bits": int(min_cost_bits or 0),
++            "predicted_grid_hash": "",
++            "predicted_grids": predicted_grids,
++            "failure_reason": {
++                "kind": "AMBIGUOUS_RULE",
++                "details": {
++                    "min_cost_solutions": int(len(min_cost_solution_sigs)),
++                    "predicted_grid_hashes": [str(h) for h, _ in ordered],
++                    "predicted_grids_truncated": bool(len(ordered) > len(kept)),
++                    "predicted_grids_kept": int(len(kept)),
++                },
++            },
++            "trace": {
++                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++                "kind": "arc_trace_v139",
++                "max_depth": int(max_depth),
++                "max_programs": int(max_programs),
++                "tried": int(tried),
++                "min_cost_solutions": int(len(min_cost_solution_sigs)),
++                "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++                "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++                "pruned_by_dominated_state": int(pruned_by_dominated_state),
++                "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++                "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
++                "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
++                "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
++                "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
++                "unique_states": int(len(best_cost_by_vec_sig)),
++                "expanded_states": int(expanded_states),
++                "frontier_max": int(frontier_max),
++                "trace_programs": trace_programs,
++            },
++        }
++
++    failure_kind = "SEARCH_BUDGET_EXCEEDED" if tried >= max_programs else "MISSING_OPERATOR"
++    return {
++        "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++        "kind": "arc_solve_result_v139",
++        "status": "FAIL",
++        "program_sig": "",
++        "program_cost_bits": 0,
++        "predicted_grid_hash": "",
++        "failure_reason": {
++            "kind": str(failure_kind),
++            "details": {
++                "candidates_tested": int(tried),
++                "max_depth": int(max_depth),
++                "search_exhausted": bool(not heap),
++            },
++        },
++        "trace": {
++            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V139),
++            "kind": "arc_trace_v139",
++            "max_depth": int(max_depth),
++            "max_programs": int(max_programs),
++            "tried": int(tried),
++            "min_cost_solutions": 0,
++            "pruned_by_shape_reachability": int(pruned_by_shape_reachability),
++            "pruned_by_palette_reachability": int(pruned_by_palette_reachability),
++            "pruned_by_dominated_state": int(pruned_by_dominated_state),
++            "pruned_by_no_grid_modify_in_time": int(pruned_by_no_grid_modify_in_time),
++            "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
++            "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
++            "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
++            "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
++            "unique_states": int(len(best_cost_by_vec_sig)),
++            "expanded_states": int(expanded_states),
++            "frontier_max": int(frontier_max),
++            "trace_programs": trace_programs,
++        },
++    }
+--- /dev/null	2026-01-19 02:10:10
++++ scripts/run_arc_scalpel_v139.py	2026-01-18 23:12:32
+@@ -0,0 +1,627 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _write_text_x(path: Path, text: str) -> None:
++    _ensure_absent(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "x", encoding="utf-8") as f:
++        f.write(text)
++
++
++def _excluded_dir_parts_v139() -> set:
++    return {
++        ".git",
++        "__pycache__",
++        ".pycache",
++        "results",
++        "external_world",
++        "external_world_v122",
++        "external_world_v122_try2",
++        "external_world_v122_try3",
++        "external_world_v122_try4",
++        "external_world_v122_try5",
++        "external_world_v122_try6",
++    }
++
++
++def _repo_snapshot_sha256_v139(*, root: Path, exclude_paths: Sequence[Path]) -> str:
++    excluded = _excluded_dir_parts_v139()
++    excludes = [p.resolve() for p in exclude_paths]
++    rows: List[Dict[str, Any]] = []
++    for p in root.rglob("*"):
++        if not p.is_file():
++            continue
++        if any(part in excluded for part in p.parts):
++            continue
++        rp = p.resolve()
++        if any(str(rp).startswith(str(ex)) for ex in excludes):
++            continue
++        rel = p.relative_to(root).as_posix()
++        rows.append({"path": str(rel), "sha256": _sha256_file(p)})
++    rows.sort(key=lambda r: str(r["path"]))
++    body = {"schema_version": 139, "kind": "repo_snapshot_v139", "files": rows}
++    from atos_core.act import canonical_json_dumps, sha256_hex
++
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def _sanitize_task_id(task_id: str) -> str:
++    s = "".join([c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(task_id)])
++    return s or "task"
++
++
++def _grid_equal(a: Sequence[Sequence[int]], b: Sequence[Sequence[int]]) -> bool:
++    if len(a) != len(b):
++        return False
++    for ra, rb in zip(a, b):
++        if list(ra) != list(rb):
++            return False
++    return True
++
++
++def _benchmark_profile_default_trials(profile: str) -> int:
++    p = str(profile)
++    if p == "ARC_AGI2_PROFILE":
++        return 2
++    return 3  # ARC_AGI1_PROFILE default
++
++
++def _score_test_case_all_k_v139(
++    *, solver_res: Dict[str, Any], want_grid: Optional[Sequence[Sequence[int]]]
++) -> Dict[str, Any]:
++    status = str(solver_res.get("status") or "")
++    if want_grid is None:
++        fk = ""
++        fr = solver_res.get("failure_reason")
++        if isinstance(fr, dict):
++            fk = str(fr.get("kind") or "")
++        return {
++            "solver_status": status if status in {"SOLVED", "UNKNOWN"} else "FAIL",
++            "scored": False,
++            "failure_kind": fk,
++            "k": {"1": {"status": status}, "2": {"status": status}, "3": {"status": status}},
++        }
++
++    preds: List[Sequence[Sequence[int]]] = []
++    if status == "SOLVED":
++        pred = solver_res.get("predicted_grid")
++        if isinstance(pred, list):
++            preds = [pred]  # type: ignore[list-item]
++    elif status == "UNKNOWN":
++        pg = solver_res.get("predicted_grids")
++        if isinstance(pg, list):
++            for item in pg:
++                if isinstance(item, dict) and isinstance(item.get("grid"), list):
++                    preds.append(item["grid"])  # type: ignore[list-item]
++
++    def solved_at_k(k: int) -> bool:
++        kk = int(k)
++        for g in preds[:kk]:
++            if _grid_equal(g, want_grid):
++                return True
++        return False
++
++    out_k: Dict[str, Any] = {}
++    for kk in (1, 2, 3):
++        ok = solved_at_k(kk)
++        if status == "FAIL":
++            out_k[str(kk)] = {"status": "FAIL", "attempts_used": 1}
++        elif ok:
++            out_k[str(kk)] = {"status": "SOLVED", "attempts_used": min(int(kk), max(1, len(preds)))}
++        else:
++            out_k[str(kk)] = {"status": "UNKNOWN" if status == "UNKNOWN" else "FAIL", "attempts_used": min(int(kk), max(1, len(preds)))}
++
++    failure_kind = ""
++    if not solved_at_k(1):
++        if status == "UNKNOWN":
++            failure_kind = "AMBIGUOUS_RULE"
++        elif status == "SOLVED":
++            failure_kind = "TEST_OUTPUT_MISMATCH"
++        else:
++            fr = solver_res.get("failure_reason")
++            if isinstance(fr, dict):
++                failure_kind = str(fr.get("kind") or "")
++            failure_kind = failure_kind or "FAIL"
++
++    return {
++        "solver_status": status,
++        "scored": True,
++        "failure_kind": failure_kind,
++        "k": out_k,
++    }
++
++
++def _build_report_markdown_v139(*, eval_obj: Dict[str, Any], clusters: Sequence[Dict[str, Any]], backlog: Sequence[Dict[str, Any]]) -> str:
++    total = int(eval_obj.get("tasks_total") or 0)
++    solved_k = eval_obj.get("tasks_solved_by_k")
++    solved_k = solved_k if isinstance(solved_k, dict) else {}
++    failures = eval_obj.get("failure_counts")
++    failures = failures if isinstance(failures, dict) else {}
++    top_fail = sorted(((str(k), int(failures[k])) for k in failures.keys()), key=lambda kv: (-int(kv[1]), str(kv[0])))[:15]
++
++    lines: List[str] = []
++    lines.append("# ARC_DIAG_REPORT_v139")
++    lines.append("")
++    lines.append("## Solve rate (scored vs test outputs)")
++    lines.append(f"- tasks_total={total}")
++    for kk in ("1", "2", "3"):
++        s = int(solved_k.get(kk, 0) or 0)
++        r = (float(s) / float(total)) if total else 0.0
++        lines.append(f"- solved@{kk}={s} solve_rate@{kk}={r:.3f}")
++    lines.append("")
++    lines.append("## Top failures (official_k failure_kind)")
++    if not top_fail:
++        lines.append("- (none)")
++    else:
++        for k, n in top_fail:
++            lines.append(f"- {k}: {n}")
++    lines.append("")
++    lines.append("## Failure clusters (structural signature; no task_id)")
++    if not clusters:
++        lines.append("- (none)")
++    else:
++        for c in clusters[:10]:
++            lines.append(f"- count={c['count']} key={c['key']} example_failure={c['failure_kind']}")
++    lines.append("")
++    lines.append("## Backlog (general operator/concept gaps)")
++    if not backlog:
++        lines.append("- (none)")
++    else:
++        for item in backlog:
++            lines.append(f"### {item['name']}")
++            lines.append(f"- signature: `{item['signature']}`")
++            lines.append(f"- invariants: {item['invariants']}")
++            lines.append(f"- examples: {item['examples']}")
++            lines.append(f"- covers: {item['covers']}")
++            lines.append("")
++    return "\n".join(lines)
++
++
++def _derive_backlog_v139(*, failure_counts: Dict[str, int]) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if "MISSING_OPERATOR" in failure_counts:
++        out.append(
++            {
++                "name": "shape-changing operators with inverse propose (gap)",
++                "signature": "(GRID)->GRID (scale/tile/resize families)",
++                "invariants": "Determinístico; parâmetros inferidos de demonstrações; tipado.",
++                "examples": "scale_cell, tile_repeat, resize_nearest integer factors.",
++                "covers": "MISSING_OPERATOR clusters with shape_change.",
++            }
++        )
++    if "SEARCH_BUDGET_EXCEEDED" in failure_counts:
++        out.append(
++            {
++                "name": "state-space search scaling (gap)",
++                "signature": "memoization + dominance + constraint propagation",
++                "invariants": "No task_id; only train evidence; deterministic ordering.",
++                "examples": "cache apply_op, cache eval, prune dominated states.",
++                "covers": "SEARCH_BUDGET_EXCEEDED clusters.",
++            }
++        )
++    return out[:10]
++
++
++def _structural_signature_v139(task_obj: Dict[str, Any]) -> str:
++    try:
++        train = task_obj.get("train_pairs") or []
++        if not isinstance(train, list) or not train:
++            return "no_train"
++        inp0 = train[0].get("in_grid")
++        out0 = train[0].get("out_grid")
++        hi = len(inp0) if isinstance(inp0, list) else 0
++        wi = len(inp0[0]) if isinstance(inp0, list) and inp0 and isinstance(inp0[0], list) else 0
++        ho = len(out0) if isinstance(out0, list) else 0
++        wo = len(out0[0]) if isinstance(out0, list) and out0 and isinstance(out0[0], list) else 0
++        shape_rel = "same" if (hi, wi) == (ho, wo) else "diff"
++        # palette relation on first pair only (cheap; deterministic).
++        pal_in: Set[int] = set()
++        pal_out: Set[int] = set()
++        if isinstance(inp0, list):
++            for r in inp0:
++                if isinstance(r, list):
++                    for x in r:
++                        pal_in.add(int(x))
++        if isinstance(out0, list):
++            for r in out0:
++                if isinstance(r, list):
++                    for x in r:
++                        pal_out.add(int(x))
++        if pal_out == pal_in:
++            pal_rel = "equal"
++        elif pal_out.issubset(pal_in):
++            pal_rel = "subset"
++        elif pal_in.issubset(pal_out):
++            pal_rel = "superset"
++        else:
++            pal_rel = "mixed"
++        # delta density bucket (first pair).
++        diff = 0
++        total = max(1, min(hi, ho) * min(wi, wo))
++        if isinstance(inp0, list) and isinstance(out0, list) and hi == ho and wi == wo:
++            for r in range(hi):
++                for c in range(wi):
++                    if int(inp0[r][c]) != int(out0[r][c]):
++                        diff += 1
++        ratio = float(diff) / float(total)
++        if ratio <= 0.05:
++            dens = "sparse"
++        elif ratio <= 0.3:
++            dens = "local"
++        else:
++            dens = "dense"
++        return f"shape={shape_rel}|pal={pal_rel}|dens={dens}"
++    except Exception:
++        return "sig_error"
++
++
++def _build_outputs_manifest_v139(*, out_dir: Path) -> Dict[str, Any]:
++    per_task_dir = out_dir / "per_task"
++    per_task_files = [p for p in per_task_dir.glob("*.json") if p.is_file()]
++    per_task_files.sort(key=lambda p: p.name)
++
++    def rel(p: Path) -> str:
++        return p.relative_to(out_dir).as_posix()
++
++    files: List[Dict[str, Any]] = []
++    fixed = [
++        out_dir / "summary.json",
++        out_dir / "smoke_summary.json",
++        out_dir / "eval.json",
++        out_dir / "per_task_manifest.jsonl",
++        out_dir / "trace_candidates.jsonl",
++        out_dir / "ARC_DIAG_REPORT_v139.md",
++        out_dir / "isolation_check_v139.json",
++        out_dir / "input" / "arc_manifest_v139.json",
++        out_dir / "input" / "arc_tasks_canonical_v139.jsonl",
++    ]
++    for p in fixed:
++        files.append({"path": rel(p), "sha256": _sha256_file(p)})
++    for p in per_task_files:
++        files.append({"path": rel(p), "sha256": _sha256_file(p)})
++
++    body = {"schema_version": 139, "kind": "arc_outputs_manifest_v139", "files": files}
++    from atos_core.act import canonical_json_dumps, sha256_hex
++
++    body["manifest_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
++
++def _run_one(
++    *,
++    arc_root: str,
++    split: str,
++    limit: int,
++    seed: int,
++    out_dir: Path,
++    benchmark_profile: str,
++    max_trials: int,
++    max_depth: int,
++    max_programs: int,
++) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++    os.environ["PYTHONPYCACHEPREFIX"] = str(out_dir / ".pycache")
++
++    from atos_core.act import canonical_json_dumps, sha256_hex
++    from atos_core.arc_loader_v139 import iter_canonical_tasks_v139, write_arc_canonical_jsonl_v139
++    from atos_core.arc_solver_v139 import SolveConfigV139, solve_arc_task_v139
++
++    repo_root = Path(__file__).resolve().parent.parent
++    snap_before = _repo_snapshot_sha256_v139(root=repo_root, exclude_paths=[out_dir])
++
++    input_dir = out_dir / "input"
++    input_dir.mkdir(parents=True, exist_ok=False)
++    canon_jsonl = input_dir / "arc_tasks_canonical_v139.jsonl"
++    manifest_path = input_dir / "arc_manifest_v139.json"
++    write_arc_canonical_jsonl_v139(
++        arc_root=str(arc_root),
++        split=str(split),
++        limit=int(limit),
++        out_jsonl=canon_jsonl,
++        out_manifest=manifest_path,
++    )
++
++    per_task_dir = out_dir / "per_task"
++    per_task_dir.mkdir(parents=True, exist_ok=False)
++
++    per_task_manifest_path = out_dir / "per_task_manifest.jsonl"
++    trace_candidates_path = out_dir / "trace_candidates.jsonl"
++    _ensure_absent(per_task_manifest_path)
++    _ensure_absent(trace_candidates_path)
++
++    tasks_total = 0
++    solved_by_k = {"1": 0, "2": 0, "3": 0}
++    unknown_by_k = {"1": 0, "2": 0, "3": 0}
++    failed_by_k = {"1": 0, "2": 0, "3": 0}
++    failure_counts: Dict[str, int] = {}
++    clusters: Dict[str, int] = {}
++
++    per_task_rows: List[Dict[str, Any]] = []
++    trace_rows: List[Dict[str, Any]] = []
++
++    cfg = SolveConfigV139(
++        max_depth=int(max_depth),
++        max_programs=int(max_programs),
++        trace_program_limit=80,
++        max_ambiguous_outputs=16,
++    )
++
++    for task in iter_canonical_tasks_v139(str(canon_jsonl)):
++        tasks_total += 1
++
++        test_case_results: List[Dict[str, Any]] = []
++        solver_results: List[Dict[str, Any]] = []
++        for test_in, test_out in task.test_pairs:
++            res = solve_arc_task_v139(train_pairs=list(task.train_pairs), test_in=test_in, config=cfg)
++            solver_results.append(res)
++            want_grid = [list(r) for r in test_out] if test_out is not None else None
++            test_case_results.append(_score_test_case_all_k_v139(solver_res=res, want_grid=want_grid))
++
++        # Aggregate per k.
++        for kk in ("1", "2", "3"):
++            if all(r["k"][kk]["status"] == "SOLVED" for r in test_case_results):
++                solved_by_k[kk] = int(solved_by_k[kk]) + 1
++            elif any(r["k"][kk]["status"] == "FAIL" for r in test_case_results):
++                failed_by_k[kk] = int(failed_by_k[kk]) + 1
++            else:
++                unknown_by_k[kk] = int(unknown_by_k[kk]) + 1
++
++        official_k = str(int(max_trials))
++        status = "SOLVED" if all(r["k"][official_k]["status"] == "SOLVED" for r in test_case_results) else (
++            "FAIL" if any(r["k"][official_k]["status"] == "FAIL" for r in test_case_results) else "UNKNOWN"
++        )
++
++        failure_kind = ""
++        if status != "SOLVED":
++            kinds: List[str] = []
++            for r in test_case_results:
++                k = str(r.get("failure_kind") or "")
++                if k:
++                    kinds.append(k)
++            pri = ["TEST_OUTPUT_MISMATCH", "SEARCH_BUDGET_EXCEEDED", "MISSING_OPERATOR", "AMBIGUOUS_RULE", "FAIL"]
++            for k in pri:
++                if k in kinds:
++                    failure_kind = k
++                    break
++            if not failure_kind and kinds:
++                failure_kind = sorted(kinds)[0]
++        if status == "FAIL" and failure_kind:
++            failure_counts[failure_kind] = int(failure_counts.get(failure_kind, 0)) + 1
++
++        sig = _structural_signature_v139(task.to_dict())
++        if status != "SOLVED":
++            clusters[f"{failure_kind}|{sig}"] = int(clusters.get(f"{failure_kind}|{sig}", 0)) + 1
++
++        per_task_obj = {
++            "kind": "arc_per_task_v139",
++            "schema_version": 139,
++            "task": task.to_dict(),
++            "solver_results": solver_results,
++            "scoring": {
++                "schema_version": 139,
++                "benchmark_profile": str(benchmark_profile),
++                "max_trials": int(max_trials),
++                "status": str(status),
++                "failure_kind": str(failure_kind),
++                "test_case_results": test_case_results,
++            },
++        }
++        task_path = per_task_dir / f"{_sanitize_task_id(task.task_id)}.json"
++        _write_once_json(task_path, per_task_obj)
++
++        per_task_rows.append(
++            {
++                "schema_version": 139,
++                "kind": "arc_per_task_manifest_row_v139",
++                "task_id": str(task.task_id),
++                "status": str(status),
++                "failure_kind": str(failure_kind),
++                "benchmark_profile": str(benchmark_profile),
++                "max_trials": int(max_trials),
++                "solver_statuses": [str(r.get("status") or "") for r in solver_results],
++            }
++        )
++
++        for idx, res in enumerate(solver_results):
++            trace = res.get("trace") if isinstance(res.get("trace"), dict) else {}
++            for tp in trace.get("trace_programs", []) if isinstance(trace.get("trace_programs"), list) else []:
++                if isinstance(tp, dict):
++                    trace_rows.append(
++                        {
++                            "schema_version": 139,
++                            "kind": "arc_trace_candidate_v139",
++                            "task_id": str(task.task_id),
++                            "test_index": int(idx),
++                            "program_sig": str(tp.get("program_sig") or ""),
++                            "cost_bits": int(tp.get("cost_bits") or 0),
++                            "depth": int(tp.get("depth") or 0),
++                            "ok_train": bool(tp.get("ok_train") or False),
++                            "mismatch_kind": str(((tp.get("mismatch") or {}) if isinstance(tp.get("mismatch"), dict) else {}).get("kind") or ""),
++                            "steps": tp.get("steps") if isinstance(tp.get("steps"), list) else [],
++                        }
++                    )
++
++    with open(per_task_manifest_path, "x", encoding="utf-8") as f:
++        for row in per_task_rows:
++            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
++    with open(trace_candidates_path, "x", encoding="utf-8") as f:
++        for row in trace_rows:
++            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
++
++    clusters_top = sorted(((k, int(v)) for k, v in clusters.items()), key=lambda kv: (-int(kv[1]), str(kv[0])))[:30]
++    clusters_rows = [{"key": str(k), "count": int(v), "failure_kind": str(k).split("|", 1)[0]} for k, v in clusters_top]
++
++    eval_obj: Dict[str, Any] = {
++        "schema_version": 139,
++        "kind": "arc_eval_v139",
++        "tasks_total": int(tasks_total),
++        "tasks_solved_by_k": {str(k): int(solved_by_k[k]) for k in ("1", "2", "3")},
++        "tasks_unknown_by_k": {str(k): int(unknown_by_k[k]) for k in ("1", "2", "3")},
++        "tasks_failed_by_k": {str(k): int(failed_by_k[k]) for k in ("1", "2", "3")},
++        "solve_rate_by_k": {
++            str(k): float(float(solved_by_k[k]) / float(tasks_total) if tasks_total else 0.0) for k in ("1", "2", "3")
++        },
++        "benchmark_profile": str(benchmark_profile),
++        "max_trials": int(max_trials),
++        "official_k": int(max_trials),
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "clusters_top": clusters_rows,
++        "max_depth": int(max_depth),
++        "max_programs": int(max_programs),
++    }
++    eval_obj["eval_sig"] = sha256_hex(canonical_json_dumps(eval_obj).encode("utf-8"))
++    _write_once_json(out_dir / "eval.json", eval_obj)
++
++    summary_obj: Dict[str, Any] = {
++        "schema_version": 139,
++        "kind": "arc_summary_v139",
++        "arc_root": str(arc_root),
++        "split": str(split),
++        "limit": int(limit),
++        "seed": int(seed),
++        "benchmark_profile": str(benchmark_profile),
++        "max_trials": int(max_trials),
++        "max_depth": int(max_depth),
++        "max_programs": int(max_programs),
++        "tasks_total": int(tasks_total),
++        "tasks_solved_by_k": {str(k): int(solved_by_k[k]) for k in ("1", "2", "3")},
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "eval_sig": str(eval_obj["eval_sig"]),
++    }
++    summary_obj["summary_sig"] = sha256_hex(canonical_json_dumps(summary_obj).encode("utf-8"))
++    _write_once_json(out_dir / "summary.json", summary_obj)
++    _write_once_json(out_dir / "smoke_summary.json", {"schema_version": 139, "kind": "arc_smoke_summary_v139", "summary_sha256": summary_obj["summary_sig"]})
++
++    backlog = _derive_backlog_v139(failure_counts=failure_counts)
++    report_md = _build_report_markdown_v139(eval_obj=eval_obj, clusters=clusters_rows, backlog=backlog)
++    _write_text_x(out_dir / "ARC_DIAG_REPORT_v139.md", report_md)
++
++    snap_after = _repo_snapshot_sha256_v139(root=repo_root, exclude_paths=[out_dir])
++    isolation = {
++        "schema_version": 139,
++        "kind": "isolation_check_v139",
++        "repo_root": str(repo_root),
++        "snapshot_before": str(snap_before),
++        "snapshot_after": str(snap_after),
++        "ok": bool(snap_before == snap_after),
++    }
++    _write_once_json(out_dir / "isolation_check_v139.json", isolation)
++    if not bool(isolation["ok"]):
++        raise SystemExit("isolation_failed")
++
++    outputs_manifest = _build_outputs_manifest_v139(out_dir=out_dir)
++    _write_once_json(out_dir / "outputs_manifest.json", outputs_manifest)
++
++    return {
++        "schema_version": 139,
++        "kind": "arc_run_result_v139",
++        "out_dir": str(out_dir),
++        "summary_sha256": str(summary_obj["summary_sig"]),
++        "outputs_manifest_sig": str(outputs_manifest["manifest_sig"]),
++        "tasks_total": int(tasks_total),
++        "tasks_solved_by_k": {str(k): int(solved_by_k[k]) for k in ("1", "2", "3")},
++        "failure_counts": {str(k): int(failure_counts[k]) for k in sorted(failure_counts.keys())},
++        "isolation_ok": True,
++    }
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--arc_root", required=True)
++    ap.add_argument("--split", required=True)
++    ap.add_argument("--limit", type=int, default=20)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--benchmark_profile", default="ARC_AGI1_PROFILE")
++    ap.add_argument("--max_trials", type=int, default=0)
++    ap.add_argument("--max_depth", type=int, default=4)
++    ap.add_argument("--max_programs", type=int, default=4000)
++    args = ap.parse_args(argv)
++
++    profile = str(args.benchmark_profile)
++    mt = int(args.max_trials)
++    effective_trials = int(mt) if int(mt) > 0 else int(_benchmark_profile_default_trials(profile))
++    if effective_trials < 1 or effective_trials > 3:
++        raise SystemExit("invalid_max_trials")
++
++    out_base = Path(str(args.out_base))
++    out_try1 = Path(str(out_base) + "_try1")
++    out_try2 = Path(str(out_base) + "_try2")
++
++    r1 = _run_one(
++        arc_root=str(args.arc_root),
++        split=str(args.split),
++        limit=int(args.limit),
++        seed=int(args.seed),
++        out_dir=out_try1,
++        benchmark_profile=profile,
++        max_trials=int(effective_trials),
++        max_depth=int(args.max_depth),
++        max_programs=int(args.max_programs),
++    )
++    r2 = _run_one(
++        arc_root=str(args.arc_root),
++        split=str(args.split),
++        limit=int(args.limit),
++        seed=int(args.seed),
++        out_dir=out_try2,
++        benchmark_profile=profile,
++        max_trials=int(effective_trials),
++        max_depth=int(args.max_depth),
++        max_programs=int(args.max_programs),
++    )
++
++    determinism_ok = str(r1.get("summary_sha256")) == str(r2.get("summary_sha256")) and str(r1.get("outputs_manifest_sig")) == str(
++        r2.get("outputs_manifest_sig")
++    )
++    if not determinism_ok:
++        raise SystemExit("determinism_failed")
++
++    out = {"ok": True, "determinism_ok": True, "try1": r1, "try2": r2}
++    print(json.dumps(out, ensure_ascii=False, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+--- /dev/null	2026-01-19 02:10:10
++++ tests/test_arc_solver_v139.py	2026-01-18 23:13:29
+@@ -0,0 +1,55 @@
++from __future__ import annotations
++
++import re
++import unittest
++from pathlib import Path
++
++from atos_core.arc_solver_v139 import SolveConfigV139, solve_arc_task_v139
++from atos_core.grid_v124 import grid_from_list_v124
++
++
++class TestArcSolverV139(unittest.TestCase):
++    def test_determinism_same_seed(self) -> None:
++        train_in = grid_from_list_v124([[1, 2], [3, 4]])
++        train_out = grid_from_list_v124([[2, 1], [4, 3]])  # reflect_h
++        test_in = grid_from_list_v124([[5, 6], [7, 8]])
++        cfg = SolveConfigV139(max_depth=2, max_programs=200, trace_program_limit=5, max_ambiguous_outputs=8)
++        r1 = solve_arc_task_v139(train_pairs=[(train_in, train_out)], test_in=test_in, config=cfg)
++        r2 = solve_arc_task_v139(train_pairs=[(train_in, train_out)], test_in=test_in, config=cfg)
++        self.assertEqual(r1.get("status"), "SOLVED")
++        self.assertEqual(r1.get("predicted_grid_hash"), r2.get("predicted_grid_hash"))
++        self.assertEqual(r1.get("program_sig"), r2.get("program_sig"))
++
++    def test_ambiguous_rule_fail_closed(self) -> None:
++        # reflect_h and reflect_v coincide on train, but diverge on test.
++        train_in = grid_from_list_v124([[1, 2], [2, 1]])
++        train_out = grid_from_list_v124([[2, 1], [1, 2]])  # both reflect_h and reflect_v
++        test_in = grid_from_list_v124([[1, 2], [3, 4]])
++        cfg = SolveConfigV139(max_depth=1, max_programs=100, trace_program_limit=5, max_ambiguous_outputs=8)
++        r = solve_arc_task_v139(train_pairs=[(train_in, train_out)], test_in=test_in, config=cfg)
++        self.assertEqual(r.get("status"), "UNKNOWN")
++        self.assertIsInstance(r.get("predicted_grids"), list)
++        self.assertGreaterEqual(len(r.get("predicted_grids") or []), 2)
++
++    def test_invariant_violation_classification(self) -> None:
++        # Use raw tuple-of-tuples to bypass grid_from_list_v124 validation and
++        # exercise solver's own invariant checks.
++        train_in = ((10,),)  # type: ignore[assignment]
++        train_out = grid_from_list_v124([[0]])
++        test_in = grid_from_list_v124([[0]])
++        cfg = SolveConfigV139(max_depth=1, max_programs=10, trace_program_limit=1, max_ambiguous_outputs=2)
++        r = solve_arc_task_v139(train_pairs=[(train_in, train_out)], test_in=test_in, config=cfg)
++        self.assertEqual(r.get("status"), "FAIL")
++        fr = r.get("failure_reason") or {}
++        self.assertEqual(fr.get("kind"), "INVARIANT_VIOLATION")
++
++    def test_static_anti_hack_scan(self) -> None:
++        # Solver/ops must not contain dataset/path/task_id conditionals.
++        root = Path(__file__).resolve().parent.parent
++        src = (root / "atos_core" / "arc_solver_v139.py").read_text(encoding="utf-8")
++        self.assertNotRegex(src, r"\btask_id\b")
++        self.assertNotIn("Path(", src)
++        self.assertNotIn("glob(", src)
++        self.assertNotIn("rglob(", src)
++        # hex task ids like deadbeef.json
++        self.assertIsNone(re.search(r"\b[0-9a-f]{8}(?:\.json)?\b", src))

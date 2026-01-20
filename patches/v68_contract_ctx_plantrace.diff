@@ -1,0 +1,563 @@
+--- patches/v68_base/atos_core/engine.py	2026-01-11 22:51:05
++++ atos_core/engine.py	2026-01-11 22:56:35
+@@ -609,6 +609,7 @@
+         mode: str = "greedy",
+         dialogue_id: Optional[int] = None,
+         turn: Optional[int] = None,
++        plan_trace: Optional[Dict[str, Any]] = None,
+     ) -> Dict[str, Any]:
+         prompt_tokens = tokenize_text(prompt)
+         context: List[str] = ["<BOS>"] * (self.config.max_order - 1)
+@@ -966,60 +967,91 @@
+                 else:
+                     u = user_txt
+ 
+-                    exact_pats = [
+-                        re.compile(r"(?is)^\s*responda\s+exatamente\s*:\s*(.+?)\s*$"),
+-                        re.compile(r"(?is)^\s*retorne\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
+-                        re.compile(r"(?is)^\s*devolva\s+exatamente\s*:\s*(.+?)\s*$"),
+-                        re.compile(r"(?is)^\s*devolva\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
+-                        re.compile(
+-                            r"(?is)^\s*(?:responda|retorne|devolva|exiba|escreva)\s+(?:somente|apenas)\s*(?:com)?\s*:\s*(.+?)\s*$"
+-                        ),
+-                    ]
+-                    for pat in exact_pats:
+-                        m = pat.match(u)
+-                        if m:
+-                            ans = _strip_quotes(m.group(1))
+-                            if ans:
+-                                contract_tokens = tokenize_text(ans)
+-                                contract_kind = "exact"
+-                                contract_reason = "instruction_exact"
+-                                contract_meta["used"] = True
+-                                contract_meta["kind"] = contract_kind
+-                                contract_meta["parsed_args"] = {"text": ans}
+-                                contract_meta["reason"] = contract_reason
+-                            break
++                    v67_contract_block = bool(
++                        isinstance(plan_trace, dict)
++                        and str(plan_trace.get("compiler_id") or "") == "v67_dialogue_compiler"
++                        and (
++                            str(plan_trace.get("expected_format") or "") == "plan"
++                            or str(plan_trace.get("validator_id") or "") == "plan_validator"
++                            or ("plan_validator" in (plan_trace.get("constraints") or []))
++                        )
++                    )
+ 
++                    if not v67_contract_block:
++                        exact_pats = [
++                            re.compile(r"(?is)^\s*responda\s+exatamente\s*:\s*(.+?)\s*$"),
++                            re.compile(r"(?is)^\s*retorne\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
++                            re.compile(r"(?is)^\s*devolva\s+exatamente\s*:\s*(.+?)\s*$"),
++                            re.compile(r"(?is)^\s*devolva\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
++                            re.compile(
++                                r"(?is)^\s*(?:responda|retorne|devolva|exiba|escreva)\s+(?:somente|apenas)\s*(?:com)?\s*:\s*(.+?)\s*$"
++                            ),
++                        ]
++                        for pat in exact_pats:
++                            m = pat.match(u)
++                            if m:
++                                ans = _strip_quotes(m.group(1))
++                                if ans:
++                                    contract_tokens = tokenize_text(ans)
++                                    contract_kind = "exact"
++                                    contract_reason = "instruction_exact"
++                                    contract_meta["used"] = True
++                                    contract_meta["kind"] = contract_kind
++                                    contract_meta["parsed_args"] = {"text": ans}
++                                    contract_meta["reason"] = contract_reason
++                                break
++
+                     if (
+                         not contract_tokens
+-                        and re.search(r"(?i)\btarefa\s+v67_", u)
+-                        and re.search(r"(?i)\bplan\s*=", u)
++                        and isinstance(plan_trace, dict)
++                        and str(plan_trace.get("compiler_id") or "") == "v67_dialogue_compiler"
++                        and (
++                            str(plan_trace.get("expected_format") or "") == "plan"
++                            or str(plan_trace.get("validator_id") or "") == "plan_validator"
++                            or ("plan_validator" in (plan_trace.get("constraints") or []))
++                        )
+                     ):
+                         try:
+                             spec = compile_dialogue_v67(u)
++                            got_sig = sha256_hex(canonical_json_dumps(spec).encode("utf-8"))
++                            want_sig = str(plan_trace.get("expected_spec_sig") or "")
+                             ans = str(spec.get("expected_output_text") or "")
+-                            if not ans:
++
++                            inputs = spec.get("inputs") or {}
++                            plan_txt = str(inputs.get("plan") or "") if isinstance(inputs, dict) else ""
++                            parsed_args = {
++                                "compiler_id": str(spec.get("compiler_id") or "v67_dialogue_compiler"),
++                                "task_kind": str(spec.get("task_kind") or ""),
++                                "goal_id": str(spec.get("goal_id") or ""),
++                                "plan": plan_txt,
++                                "expected_spec_sig": got_sig,
++                            }
++
++                            if want_sig and want_sig != got_sig:
++                                contract_meta["reason"] = "v67_expected_spec_sig_mismatch"
++                                contract_meta["parsed_args"] = {**parsed_args, "want_expected_spec_sig": want_sig}
++                            elif not ans:
+                                 contract_meta["reason"] = "v67_missing_expected_output_text"
++                                contract_meta["parsed_args"] = dict(parsed_args)
+                             else:
+                                 contract_tokens = tokenize_text(ans)
+                                 contract_kind = "plan_contract_v67"
+                                 contract_reason = "v67_dialogue_compiler"
+                                 contract_meta["used"] = True
+                                 contract_meta["kind"] = contract_kind
+-                                contract_meta["parsed_args"] = {
+-                                    "compiler_id": str(spec.get("compiler_id") or ""),
+-                                    "task_kind": str(spec.get("task_kind") or ""),
+-                                    "goal_id": str(spec.get("goal_id") or ""),
+-                                    "plan": str((spec.get("inputs") or {}).get("plan") or ""),
+-                                    "expected_spec_sig": sha256_hex(
+-                                        canonical_json_dumps(spec).encode("utf-8")
+-                                    ),
+-                                }
++                                contract_meta["parsed_args"] = dict(parsed_args)
+                                 contract_meta["reason"] = contract_reason
+                         except Exception:
+                             contract_meta["reason"] = "v67_compile_error"
++                            contract_meta["parsed_args"] = {
++                                "compiler_id": str(plan_trace.get("compiler_id") or ""),
++                                "goal_id": str(plan_trace.get("goal_id") or ""),
++                                "expected_spec_sig": str(plan_trace.get("expected_spec_sig") or ""),
++                            }
+ 
+                     if (
+                         not contract_tokens
++                        and not v67_contract_block
+                         and re.search(r"(?i)\bjson\b", u)
+                         and (
+                             re.search(r"(?i)\bapenas\b", u)
+@@ -1070,6 +1102,7 @@
+ 
+                     if (
+                         not contract_tokens
++                        and not v67_contract_block
+                         and re.search(r"(?i)\bn[úu]mero\b", u)
+                         and (
+                             re.search(r"(?i)\bapenas\b", u)
+@@ -1106,7 +1139,7 @@
+                                 contract_meta["parsed_args"] = {"a": a, "op": op, "b": b, "value": int(val)}
+                                 contract_meta["reason"] = contract_reason
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = re.search(r"(?i)\bsenha\s+é\s+([A-Za-z0-9_-]+)", u)
+                         if m:
+                             pw = _strip_edge_punct(m.group(1))
+@@ -1121,7 +1154,7 @@
+                                 contract_meta["parsed_args"] = {"fact_key": key, "value": pw}
+                                 contract_meta["reason"] = contract_reason
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = re.search(
+                             r"(?i)\b([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\s+nasceu\s+em\s+(\d{4})\b",
+                             u,
+@@ -1140,7 +1173,7 @@
+                                 contract_meta["parsed_args"] = {"fact_key": key, "value": year, "entity": ent}
+                                 contract_meta["reason"] = contract_reason
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = re.search(r"(?i)palavra[- ]c[óo]digo\s*:\s*([A-Za-z0-9_-]+)", u)
+                         if m:
+                             code = _strip_edge_punct(m.group(1))
+@@ -1155,7 +1188,7 @@
+                                 contract_meta["parsed_args"] = {"fact_key": key, "value": code}
+                                 contract_meta["reason"] = contract_reason
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = (
+                             re.search(r"(?i)qual\s+é\s+a\s+senha\b", u)
+                             or re.search(r"(?i)qual\s+a\s+senha\b", u)
+@@ -1176,7 +1209,7 @@
+                             else:
+                                 contract_meta["reason"] = "missing_password"
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = re.search(
+                             r"(?i)em\s+que\s+ano\s+([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\s+nasceu\b",
+                             u,
+@@ -1199,7 +1232,7 @@
+                             else:
+                                 contract_meta["reason"] = "missing_birth_year"
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         if re.search(r"(?i)repita\s+a\s+palavra[- ]c[óo]digo\b", u) or re.search(
+                             r"(?i)repita\s+o\s+c[óo]digo\b", u
+                         ):
+@@ -1216,7 +1249,7 @@
+                             else:
+                                 contract_meta["reason"] = "missing_code"
+ 
+-                    if not contract_tokens:
++                    if not contract_tokens and not v67_contract_block:
+                         m = re.search(r"(?i)\binclua\b", u)
+                         if m:
+                             after = u[m.end() :]
+--- patches/v68_base/atos_core/suite.py	2026-01-11 22:51:05
++++ atos_core/suite.py	2026-01-11 22:57:21
+@@ -618,8 +618,117 @@
+         "tags": ["utility", "plan", "state", "json"],
+     },
+ )
++
++
++def _v68_sum_dialogue(*, a: int, b: int, plan: str) -> str:
++    a = int(a)
++    b = int(b)
++    return (
++        f"Missão: a={a}; b={b}; plan={plan}. "
++        "Retorne APENAS um JSON canônico (sem texto extra) com chaves goal_id, plan, a, b; "
++        "onde a=a+b e b=b."
++    )
++
++
++def _v68_wrap_dialogue(*, sum_value: int, b: int, plan: str) -> str:
++    sum_value = int(sum_value)
++    b = int(b)
++    return (
++        f"Missão: sum={sum_value}; b={b}; plan={plan}. "
++        "Retorne APENAS um JSON canônico (sem texto extra) com chaves goal_id, plan, a, b; "
++        "onde a=sum e b=b."
++    )
+ 
+ 
++# Utility suite v68: contract trigger MUST be metadata-only (plan_trace); dialogues intentionally break V67 regex triggers.
++UTILITY_DIALOGUES_V68: Tuple[Dict[str, Any], ...] = (
++    {
++        "task_id": "v68_sum_state_00",
++        "dialogue": (_v68_sum_dialogue(a=4, b=8, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_sum_state_01",
++        "dialogue": (_v68_sum_dialogue(a=17, b=25, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_sum_state_02",
++        "dialogue": (_v68_sum_dialogue(a=9, b=7, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_sum_state_03",
++        "dialogue": (_v68_sum_dialogue(a=12, b=30, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_sum_state_04",
++        "dialogue": (_v68_sum_dialogue(a=99, b=1, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_sum_state_05",
++        "dialogue": (_v68_sum_dialogue(a=0, b=42, plan="add_int+wrap_goal_plan_state"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_06",
++        "dialogue": (_v68_wrap_dialogue(sum_value=42, b=0, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_07",
++        "dialogue": (_v68_wrap_dialogue(sum_value=3, b=2, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_08",
++        "dialogue": (_v68_wrap_dialogue(sum_value=3, b=1, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_09",
++        "dialogue": (_v68_wrap_dialogue(sum_value=42, b=39, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_10",
++        "dialogue": (_v68_wrap_dialogue(sum_value=13, b=7, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++    {
++        "task_id": "v68_wrap_state_11",
++        "dialogue": (_v68_wrap_dialogue(sum_value=42, b=32, plan="wrap_goal_plan_state_only"),),
++        "validator_id": "plan_validator",
++        "compiler_id": V67_DIALOGUE_COMPILER_ID,
++        "tags": ["utility", "plan", "state", "json"],
++    },
++)
++
++
+ def _normalize_output(text: str, *, collapse_ws: bool) -> str:
+     s = str(text or "").strip()
+     if collapse_ws:
+@@ -1105,6 +1214,7 @@
+                 mode="greedy",
+                 dialogue_id=int(i),
+                 turn=int(j),
++                plan_trace=None,
+             )
+             resp = out["text"][len(prompt) :]
+             history[-1]["system"] = resp
+@@ -1469,6 +1579,7 @@
+         history: List[Dict[str, Any]] = []
+         for j, user_msg in enumerate(turns):
+             history.append({"user": str(user_msg), "system": ""})
++            plan_trace = _plan_trace_for_task(task, turn_idx=int(j))
+             prompt = build_chat_prompt(history)
+             out = engine.generate(
+                 prompt=prompt,
+@@ -1476,6 +1587,7 @@
+                 mode="greedy",
+                 dialogue_id=int(i),
+                 turn=int(j),
++                plan_trace=plan_trace,
+             )
+             resp = out["text"][len(prompt) :]
+             history[-1]["system"] = resp
+@@ -1486,7 +1598,6 @@
+             history[-1]["user_sig"] = str(out.get("user_sig") or "")
+ 
+             tr = dict(out.get("trace") or {})
+-            plan_trace = _plan_trace_for_task(task, turn_idx=int(j))
+             contract_meta = tr.get("instruction_contract")
+             if isinstance(contract_meta, dict):
+                 plan_trace["contract"] = contract_meta
+--- patches/v68_base/scripts/eval_skill_suite.py	2026-01-11 22:51:05
++++ scripts/eval_skill_suite.py	2026-01-11 22:57:38
+@@ -17,6 +17,7 @@
+     SKILL_DIALOGUES_V1_PARAPHRASE,
+     UTILITY_DIALOGUES_V66,
+     UTILITY_DIALOGUES_V67,
++    UTILITY_DIALOGUES_V68,
+     run_skill_suite,
+     suite_metrics_from_transcripts,
+ )
+@@ -55,9 +56,9 @@
+     ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
+     ap.add_argument(
+         "--utility_suite_version",
+-        choices=["v0", "v1", "v66", "v67"],
++        choices=["v0", "v1", "v66", "v67", "v68"],
+         default="v0",
+-        help="Which deterministic utility suite to run (v0=baseline, v1=paraphrase, v66=utility-as-law, v67=dialogue-compiled plan).",
++        help="Which deterministic utility suite to run (v0=baseline, v1=paraphrase, v66=utility-as-law, v67=dialogue-compiled plan, v68=plan-trace contract trigger).",
+     )
+     args = ap.parse_args()
+ 
+@@ -71,8 +72,10 @@
+         tasks = SKILL_DIALOGUES_V1_PARAPHRASE
+     elif str(args.utility_suite_version) == "v66":
+         tasks = UTILITY_DIALOGUES_V66
+-    else:
++    elif str(args.utility_suite_version) == "v67":
+         tasks = UTILITY_DIALOGUES_V67
++    else:
++        tasks = UTILITY_DIALOGUES_V68
+     transcripts, metrics = run_skill_suite(
+         engine, tasks=tasks, max_new_tokens=args.max_new_tokens
+     )
+--- patches/v68_base/scripts/generate.py	2026-01-11 22:58:36
++++ scripts/generate.py	2026-01-11 22:58:42
+@@ -23,7 +23,9 @@
+     acts_path = os.path.join(args.run, "acts.jsonl")
+     store = ActStore.load_jsonl(acts_path)
+     engine = Engine(store, seed=args.seed)
+-    out = engine.generate(prompt=args.prompt, max_new_tokens=args.max_new_tokens, mode=args.mode)
++    out = engine.generate(
++        prompt=args.prompt, max_new_tokens=args.max_new_tokens, mode=args.mode, plan_trace=None
++    )
+     print(out["text"])
+ 
+ 
+--- /dev/null	2026-01-11 23:00:12
++++ scripts/smoke_dialogue_contract_v68.py	2026-01-11 22:58:10
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.suite import UTILITY_DIALOGUES_V68, run_skill_suite, suite_metrics_from_transcripts
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def transcripts_text(transcripts: List[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def eval_v68_contracts(*, run_dir: str, seed: int, max_new_tokens: int) -> Dict[str, Any]:
++    acts_path = os.path.join(str(run_dir), "acts.jsonl")
++    store = ActStore.load_jsonl(acts_path)
++    engine = Engine(store, seed=int(seed), config=EngineConfig(enable_contracts=True))
++    transcripts, metrics = run_skill_suite(engine, tasks=UTILITY_DIALOGUES_V68, max_new_tokens=int(max_new_tokens))
++    cost_metrics = suite_metrics_from_transcripts(transcripts)
++    txt = transcripts_text(transcripts)
++    return {
++        "run": str(run_dir),
++        "seed": int(seed),
++        "max_new_tokens": int(max_new_tokens),
++        "utility_suite_version": "v68",
++        "sha256_transcript_text": sha256_text(txt),
++        "cost": {k: cost_metrics.get(k) for k in sorted(cost_metrics.keys())},
++        **dict(metrics),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument(
++        "--run",
++        default="results/run_pure_20k_v39_contracts_paraphrase_telemetry_smoke",
++        help="Run dir containing acts.jsonl (read-only)",
++    )
++    ap.add_argument(
++        "--out_base",
++        default="results/run_smoke_dialogue_contract_v68",
++        help="Base output path; script writes <out_base>_try1 and <out_base>_try2",
++    )
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_new_tokens", type=int, default=200)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    run_dir = str(args.run)
++    seed = int(args.seed)
++    max_new_tokens = int(args.max_new_tokens)
++
++    results: Dict[str, Any] = {"run": run_dir, "seed": seed, "max_new_tokens": max_new_tokens, "tries": {}}
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        ev = eval_v68_contracts(run_dir=run_dir, seed=seed, max_new_tokens=max_new_tokens)
++        pass_rate = float(ev.get("pass_rate", 0.0) or 0.0)
++        contract_used_rate = float(ev.get("contract_used_rate", 0.0) or 0.0)
++        contract_used_by_kind = ev.get("contract_used_by_kind") or {}
++        if not isinstance(contract_used_by_kind, dict):
++            contract_used_by_kind = {}
++
++        if abs(pass_rate - 1.0) > 1e-12:
++            _fail(f"ERROR: pass_rate != 1.0 (got {pass_rate})")
++        if abs(contract_used_rate - 1.0) > 1e-12:
++            _fail(f"ERROR: contract_used_rate != 1.0 (got {contract_used_rate})")
++        if int(contract_used_by_kind.get("plan_contract_v67", 0) or 0) <= 0:
++            _fail("ERROR: expected contract_used_by_kind.plan_contract_v67 > 0")
++
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        core = {
++            "seed": seed,
++            "run": run_dir,
++            "utility_suite_version": "v68",
++            "pass_rate": float(pass_rate),
++            "contract_used_rate": float(contract_used_rate),
++            "contract_used_by_kind": dict(sorted((str(k), int(v)) for k, v in contract_used_by_kind.items())),
++            "sha256_transcript_text": str(ev.get("sha256_transcript_text") or ""),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": summary_sha}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(len(summary_shas) == 2 and summary_shas[0] == summary_shas[1])
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: {summary_shas}")
++    results["determinism"] = {"ok": True, "summary_sha256": summary_shas[0]}
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

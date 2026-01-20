@@ -1,0 +1,279 @@
+--- patches/v35_base/engine.py	2026-01-10 19:04:07
++++ atos_core/engine.py	2026-01-10 19:04:25
+@@ -1267,6 +1267,24 @@
+ 
+             context.append(nxt)
+             context = context[-(self.config.max_order - 1) :]
++
++        # Turn-level "subgraph" trace (unique, ordered): minimal causal footprint per turn.
++        # This is observability-only and must not affect generation.
++        exec_pred_unique: List[str] = []
++        rr_hit_unique: List[str] = []
++        try:
++            exec_set = {str(pid) for ids in trace_executed_predictor_ids for pid in (ids or []) if pid}
++            exec_pred_unique = sorted(
++                exec_set, key=lambda pid: (int(self._predictor_order.get(pid, 10**9)), pid)
++            )
++        except Exception:
++            exec_pred_unique = []
++        try:
++            rr_set = {str(rid) for ids in trace_rewrite_rule_hit_ids for rid in (ids or []) if rid}
++            rr_order = {str(a.id): i for i, a in enumerate(self._rewrite_rules)}
++            rr_hit_unique = sorted(rr_set, key=lambda rid: (int(rr_order.get(rid, 10**9)), rid))
++        except Exception:
++            rr_hit_unique = []
+ 
+         return {
+             "prompt": prompt,
+@@ -1308,6 +1326,10 @@
+                 "instruction_contract_used": trace_instruction_contract_used,
+                 "instruction_contract_kind": trace_instruction_contract_kind,
+                 "instruction_contract_reason": trace_instruction_contract_reason,
++                "subgraph": {
++                    "executed_predictor_act_ids": exec_pred_unique,
++                    "rewrite_rule_hit_ids": rr_hit_unique,
++                },
+             },
+             "mode": mode_state,
+             "mode_act_id": mode_act_id,
+--- patches/v35_base/learn.py	2026-01-10 19:04:07
++++ atos_core/learn.py	2026-01-10 19:06:57
+@@ -991,35 +991,53 @@
+ 
+         # Extract causal traces (per token) from suite transcripts.
+         seqs_all: List[List[str]] = []
+-        seqs_mine: List[List[str]] = []
++        seq_pairs_mine: List[Tuple[List[str], List[str]]] = []
+         set_tokens_all: List[Tuple[str, ...]] = []
+         set_counts: Counter = Counter()
++        set_contexts: Dict[Tuple[str, ...], set] = {}
+         transition_counts: Counter = Counter()
+         rewrite_hit_counts: Counter = Counter()
+ 
+         for rec in transcripts:
+             turns = rec.get("turns", [])
+             for t in turns:
++                mode = str(t.get("mode") or "default")
+                 tr = t.get("trace") or {}
+                 if not isinstance(tr, dict):
+                     continue
++                ctx_keys0 = tr.get("context_keys") or []
++                if not isinstance(ctx_keys0, list):
++                    ctx_keys0 = []
+ 
+                 sel_ids = tr.get("selected_source_act_ids")
+                 if not isinstance(sel_ids, list):
+                     sel_ids = tr.get("selected_act_ids") or []
+                 if not isinstance(sel_ids, list):
+                     sel_ids = []
+-                seq = [
+-                    str(x)
+-                    for x in sel_ids
+-                    if isinstance(x, str) and x and (not x.startswith("__"))
+-                ]
++                Ls = int(len(sel_ids))
++                if ctx_keys0:
++                    Ls = min(int(Ls), int(len(ctx_keys0)))
+                 if max_tokens > 0:
++                    Ls = min(int(Ls), int(max_tokens))
++
++                seq: List[str] = []
++                seq_ctx: List[str] = []
++                for i in range(int(Ls)):
++                    aid = sel_ids[i]
++                    if not isinstance(aid, str) or (not aid) or aid.startswith("__"):
++                        continue
++                    seq.append(str(aid))
++                    ck = ctx_keys0[i] if i < len(ctx_keys0) else ""
++                    if isinstance(ck, str) and ck:
++                        seq_ctx.append(f"{mode}\u241f{ck}")
++                    else:
++                        seq_ctx.append("")
++                if max_tokens > 0:
+                     seq = seq[:max_tokens]
+                 if seq:
+                     seqs_all.append(seq)
+                     if len(seq) >= n_min:
+-                        seqs_mine.append(seq)
++                        seq_pairs_mine.append((seq, seq_ctx))
+ 
+                 # Predictor co-activation sets (token-aligned).
+                 exec_by_tok = tr.get("executed_predictor_ids") or []
+@@ -1048,6 +1066,14 @@
+                     st = tuple(uniq)
+                     set_tokens_all.append(st)
+                     set_counts[st] += 1
++                    ck = ctx_keys0[i] if i < len(ctx_keys0) else ""
++                    if isinstance(ck, str) and ck:
++                        ctx_sig = f"{mode}\u241f{ck}"
++                        s = set_contexts.get(st)
++                        if s is None:
++                            s = set()
++                            set_contexts[st] = s
++                        s.add(ctx_sig)
+                     if prev_set is not None:
+                         transition_counts[(prev_set, st)] += 1
+                     prev_set = st
+@@ -1175,15 +1201,23 @@
+             set_tokens_all, existing_set_map
+         )
+ 
+-        # Mine candidate sequential patterns.
++        # Mine candidate sequential patterns (+ distinct contexts).
+         seq_ngram_counts: Counter = Counter()
+-        for seq in seqs_mine:
+-            L = len(seq)
++        seq_ngram_contexts: Dict[Tuple[str, ...], set] = {}
++        for seq, seq_ctx in seq_pairs_mine:
++            L = int(len(seq))
+             for n in range(n_min, n_max + 1):
+                 if L < n:
+                     continue
+-                for i in range(L - n + 1):
+-                    seq_ngram_counts[tuple(seq[i : i + n])] += 1
++                for i in range(int(L - n + 1)):
++                    ng = tuple(seq[i : i + n])
++                    seq_ngram_counts[ng] += 1
++                    if i < len(seq_ctx) and seq_ctx[i]:
++                        s = seq_ngram_contexts.get(ng)
++                        if s is None:
++                            s = set()
++                            seq_ngram_contexts[ng] = s
++                        s.add(str(seq_ctx[i]))
+         seq_items = [(ng, int(c)) for ng, c in seq_ngram_counts.items() if int(c) >= min_count]
+         seq_items.sort(key=lambda kv: (-int(kv[1]) * (len(kv[0]) - 1), -int(kv[1]), kv[0]))
+ 
+@@ -1200,17 +1234,22 @@
+             pat = ent.get("pattern")
+             if not isinstance(pat, list):
+                 continue
++            ctx_n = 0
+             if typ == "seq":
+                 key = tuple(str(x) for x in pat if x is not None)
+                 c = int(seq_ngram_counts.get(key, 0) or 0)
++                ctx_n = int(len(seq_ngram_contexts.get(key, set())))
+             elif typ == "set":
+                 key2 = tuple(sorted(str(x) for x in pat if x is not None))
+                 c = int(set_counts.get(key2, 0) or 0)
++                ctx_n = int(len(set_contexts.get(key2, set())))
+             else:
+                 continue
+             if c > 0:
+                 ent["count"] = int(ent.get("count", 0) or 0) + int(c)
+                 ent["last_seen_step"] = int(step)
++                if ctx_n > 0:
++                    ent["contexts_distinct"] = max(int(ent.get("contexts_distinct", 0) or 0), int(ctx_n))
+                 updated_existing += 1
+ 
+         # Greedy selection: pick up to max_new macros with positive *real* MDL gain vs current macros.
+@@ -1224,7 +1263,9 @@
+         cur_seq_bits = int(base_seq_bits)
+         cur_set_bits = int(base_set_bits)
+ 
+-        def _new_seq_entry(mid: str, pat: Tuple[str, ...], c: int, gain_bits: int) -> Dict[str, Any]:
++        def _new_seq_entry(
++            mid: str, pat: Tuple[str, ...], c: int, gain_bits: int, ctx_n: int
++        ) -> Dict[str, Any]:
+             return {
+                 "id": mid,
+                 "type": "seq",
+@@ -1233,10 +1274,13 @@
+                 "n": int(len(pat)),
+                 "count": int(c),
+                 "last_seen_step": int(step),
++                "contexts_distinct": int(max(0, int(ctx_n))),
+                 "gain_real_bits_est": int(gain_bits),
+             }
+ 
+-        def _new_set_entry(mid: str, pat: Tuple[str, ...], c: int, gain_bits: int) -> Dict[str, Any]:
++        def _new_set_entry(
++            mid: str, pat: Tuple[str, ...], c: int, gain_bits: int, ctx_n: int
++        ) -> Dict[str, Any]:
+             return {
+                 "id": mid,
+                 "type": "set",
+@@ -1245,6 +1289,7 @@
+                 "k": int(len(pat)),
+                 "count": int(c),
+                 "last_seen_step": int(step),
++                "contexts_distinct": int(max(0, int(ctx_n))),
+                 "gain_real_bits_est": int(gain_bits),
+             }
+ 
+@@ -1264,7 +1309,8 @@
+                 delta = int(cur_seq_bits - new_seq_bits)
+                 if delta <= 0:
+                     continue
+-                entry = _new_seq_entry(mid, tuple(pat), int(c), int(delta))
++                ctx_n = int(len(seq_ngram_contexts.get(tuple(pat), set())))
++                entry = _new_seq_entry(mid, tuple(pat), int(c), int(delta), int(ctx_n))
+                 cost = macro_entry_cost_bits(entry)
+                 gain = int(delta - cost)
+                 if gain <= 0:
+@@ -1286,7 +1332,8 @@
+                 delta = int(cur_set_bits - new_set_bits)
+                 if delta <= 0:
+                     continue
+-                entry = _new_set_entry(mid, tuple(st), int(c), int(delta))
++                ctx_n = int(len(set_contexts.get(tuple(st), set())))
++                entry = _new_set_entry(mid, tuple(st), int(c), int(delta), int(ctx_n))
+                 cost = macro_entry_cost_bits(entry)
+                 gain = int(delta - cost)
+                 if gain <= 0:
+@@ -1302,7 +1349,8 @@
+             if kind == "seq":
+                 raw = ("seq|" + "|".join(pat)).encode("utf-8")
+                 mid = f"mseq_{sha256_hex(raw)[:12]}"
+-                entry = _new_seq_entry(mid, tuple(pat), int(c), int(gain))
++                ctx_n = int(len(seq_ngram_contexts.get(tuple(pat), set())))
++                entry = _new_seq_entry(mid, tuple(pat), int(c), int(gain), int(ctx_n))
+                 macros[mid] = entry
+                 cur_seq_patterns = list(pats2) if pats2 is not None else cur_seq_patterns
+                 cur_seq_bits, _sym_after, _cov, _hits = _compress_seq_bits(seqs_all, cur_seq_patterns)
+@@ -1310,7 +1358,8 @@
+             else:
+                 raw = ("set|" + "|".join(pat)).encode("utf-8")
+                 mid = f"mset_{sha256_hex(raw)[:12]}"
+-                entry = _new_set_entry(mid, tuple(pat), int(c), int(gain))
++                ctx_n = int(len(set_contexts.get(tuple(pat), set())))
++                entry = _new_set_entry(mid, tuple(pat), int(c), int(gain), int(ctx_n))
+                 macros[mid] = entry
+                 cur_set_map = dict(map2) if map2 is not None else cur_set_map
+                 cur_set_bits, _b, _a, _h = _compress_set_bits(set_tokens_all, cur_set_map)
+@@ -1443,6 +1492,7 @@
+                     "type": str(ent.get("type", "")),
+                     "count": int(c),
+                     "gain_real_bits_est": int(g),
++                    "contexts_distinct": int(ent.get("contexts_distinct", 0) or 0),
+                     "pattern": list(ent.get("pattern") or []),
+                 }
+             )
+@@ -1607,16 +1657,16 @@
+                     continue
+                 ctx_keys = tr.get("context_keys") or []
+                 exec_by_tok = tr.get("executed_predictor_ids") or []
+-                pred_matched = tr.get("predictor_matched") or []
++                pred_iter = tr.get("predictor_iterated") or []
+                 sel_toks = tr.get("selected_tokens") or []
+                 winners = tr.get("selected_source_act_ids") or []
+-                if not isinstance(ctx_keys, list) or not isinstance(exec_by_tok, list) or not isinstance(pred_matched, list):
++                if not isinstance(ctx_keys, list) or not isinstance(exec_by_tok, list) or not isinstance(pred_iter, list):
+                     continue
+                 if not isinstance(sel_toks, list):
+                     sel_toks = []
+                 if not isinstance(winners, list):
+                     winners = []
+-                L = min(len(ctx_keys), len(exec_by_tok), len(pred_matched))
++                L = min(len(ctx_keys), len(exec_by_tok), len(pred_iter))
+                 if sel_toks:
+                     L = min(int(L), int(len(sel_toks)))
+                 if winners:
+@@ -1624,7 +1674,7 @@
+                 for i in range(int(L)):
+                     ck = ctx_keys[i]
+                     ids = exec_by_tok[i]
+-                    m = pred_matched[i]
++                    m = pred_iter[i]
+                     win = winners[i] if i < len(winners) else None
+                     if not isinstance(ck, str) or not isinstance(ids, list):
+                         continue

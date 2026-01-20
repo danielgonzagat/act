@@ -1,0 +1,8 @@
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+ from atos_core.engine import Engine, EngineConfig
++from atos_core.metrics import tokenize_text
+ from atos_core.store import ActStore
+ from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
+*** End Patch

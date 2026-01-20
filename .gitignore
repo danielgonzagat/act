@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+
+external_world/
+external_world_*/
+data/raw/
+data/history/
+
+tmp/
+cache/
+artifacts/

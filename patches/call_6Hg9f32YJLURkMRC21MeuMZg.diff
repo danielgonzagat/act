@@ -1,0 +1,17 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+                 "candidates_post_rewrite": trace_candidates_post,
+                 "predictor_matched": trace_predictor_matched,
+                 "predictor_emitted": trace_predictor_emitted,
++                "router_live_used": trace_router_live_used,
++                "router_live_fallback": trace_router_live_fallback,
++                "router_live_fallback_reason": trace_router_live_fallback_reason,
++                "router_live_allowed_predictor_ids": trace_router_live_allowed_predictor_ids,
++                "router_live_predictors_evaluated": trace_router_live_predictors_evaluated,
++                "baseline_predictors_evaluated": trace_baseline_predictors_evaluated,
++                "router_live_mismatch": trace_router_live_mismatch,
++                "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
++                "router_live_debug_gate_token": trace_router_live_debug_gate_token,
+             },
+*** End Patch

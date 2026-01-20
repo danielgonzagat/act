@@ -1,0 +1,2169 @@
+--- /dev/null	2026-01-12 16:04:47
++++ atos_core/match_v79.py	2026-01-12 15:45:58
+@@ -0,0 +1,40 @@
++from __future__ import annotations
++
++from typing import List
++
++from .act import Act
++
++
++def is_act_allowed_for_goal_kind(*, act: Act, goal_kind: str) -> bool:
++    """
++    Explicit (audit-first) match semantics for routing:
++      - If act.match has no valid goal_kinds list -> allowed (global).
++      - If act.match.goal_kinds is a list -> allowed iff goal_kind in that list.
++    """
++    if act is None:
++        return False
++    mk = act.match if isinstance(getattr(act, "match", None), dict) else {}
++    gks = mk.get("goal_kinds")
++    if not isinstance(gks, list):
++        return True
++    allowed = {str(x) for x in gks if str(x)}
++    return str(goal_kind or "") in allowed
++
++
++def filter_concept_ids_for_goal_kind(*, store, goal_kind: str) -> List[str]:
++    """
++    Helper for deterministic inspection/debug: list allowed concept_csv act IDs.
++    """
++    out: List[str] = []
++    try:
++        concept_acts = store.concept_acts()
++    except Exception:
++        concept_acts = []
++    for act in concept_acts:
++        if act is None:
++            continue
++        if is_act_allowed_for_goal_kind(act=act, goal_kind=str(goal_kind or "")):
++            out.append(str(act.id))
++    out.sort(key=str)
++    return out
++
+--- /dev/null	2026-01-12 16:04:47
++++ atos_core/planner_v79.py	2026-01-12 15:46:45
+@@ -0,0 +1,260 @@
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
++
++from .act import Act, canonical_json_dumps, sha256_hex
++from .goal_spec_v72 import GoalSpecV72
++from .match_v79 import is_act_allowed_for_goal_kind
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _sorted_keys(d: Dict[str, Any]) -> List[str]:
++    return [str(k) for k in sorted(d.keys(), key=str)]
++
++
++def _state_sig(vars_avail: Set[str]) -> str:
++    return _stable_hash_obj({"vars": sorted(set(str(v) for v in vars_avail if str(v)))})
++
++
++@dataclass(frozen=True)
++class PlanStepV79:
++    step_id: str
++    idx: int
++    concept_id: str
++    bind_map: Dict[str, str]
++    produces: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "step_id": str(self.step_id),
++            "idx": int(self.idx),
++            "concept_id": str(self.concept_id),
++            "bind_map": {str(k): str(self.bind_map.get(k) or "") for k in sorted(self.bind_map.keys(), key=str)},
++            "produces": str(self.produces),
++        }
++
++
++@dataclass(frozen=True)
++class PlanV79:
++    steps: List[PlanStepV79]
++    plan_sig: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {"schema_version": 1, "steps": [s.to_dict() for s in self.steps], "plan_sig": str(self.plan_sig)}
++
++
++@dataclass(frozen=True)
++class OperatorTemplateV79:
++    concept_id: str
++    input_keys: List[str]
++    output_key: str
++    validator_id: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "concept_id": str(self.concept_id),
++            "input_keys": list(self.input_keys),
++            "output_key": str(self.output_key),
++            "validator_id": str(self.validator_id),
++        }
++
++
++def _operator_templates_from_store(*, store, goal_kind: str) -> List[OperatorTemplateV79]:
++    ops: List[OperatorTemplateV79] = []
++    concept_acts: Iterable[Act]
++    try:
++        concept_acts = store.concept_acts()
++    except Exception:
++        concept_acts = []
++    for act in concept_acts:
++        if act is None or str(getattr(act, "kind", "")) != "concept_csv" or (not bool(getattr(act, "active", True))):
++            continue
++        if not is_act_allowed_for_goal_kind(act=act, goal_kind=str(goal_kind or "")):
++            continue
++        ev = act.evidence if isinstance(act.evidence, dict) else {}
++        iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++        iface = iface if isinstance(iface, dict) else {}
++        in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++        out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++        validator_id = str(iface.get("validator_id") or "")
++        in_keys = _sorted_keys(in_schema)
++        out_keys = _sorted_keys(out_schema)
++        for out_k in out_keys:
++            ops.append(
++                OperatorTemplateV79(
++                    concept_id=str(act.id),
++                    input_keys=list(in_keys),
++                    output_key=str(out_k),
++                    validator_id=str(validator_id),
++                )
++            )
++    ops.sort(key=lambda o: (str(o.concept_id), str(o.output_key)))
++    return ops
++
++
++def _enumerate_bind_maps(
++    *,
++    input_keys: Sequence[str],
++    vars_avail: Sequence[str],
++    max_maps: int = 64,
++) -> List[Dict[str, str]]:
++    """
++    Deterministic bind_map enumeration:
++      - Prefer identity bindings when possible.
++      - Otherwise allow mapping each input slot to an available var.
++      - Enforce distinct var bindings when input_keys are distinct.
++    """
++    avail = [str(v) for v in vars_avail if str(v)]
++    avail = sorted(set(avail))
++    if not input_keys:
++        return [{}]
++    keys = [str(k) for k in input_keys]
++
++    # Candidate vars per slot: identity-first then others.
++    cand_per: List[List[str]] = []
++    for k in keys:
++        cands = []
++        if k in avail:
++            cands.append(k)
++        cands.extend([v for v in avail if v != k])
++        seen: Set[str] = set()
++        out: List[str] = []
++        for v in cands:
++            if v not in seen:
++                seen.add(v)
++                out.append(v)
++        cand_per.append(out)
++
++    out_maps: List[Dict[str, str]] = []
++
++    def _rec(i: int, cur: Dict[str, str], used: Set[str]) -> None:
++        if len(out_maps) >= int(max_maps):
++            return
++        if i >= len(keys):
++            out_maps.append(dict(cur))
++            return
++        slot = keys[i]
++        for v in cand_per[i]:
++            # Enforce distinctness across different input slots.
++            if slot not in cur and v in used:
++                continue
++            cur[slot] = v
++            used2 = set(used)
++            used2.add(v)
++            _rec(i + 1, cur, used2)
++            cur.pop(slot, None)
++            if len(out_maps) >= int(max_maps):
++                return
++
++    _rec(0, {}, set())
++
++    out_maps.sort(key=lambda m: canonical_json_dumps({str(k): str(m.get(k) or "") for k in sorted(m.keys(), key=str)}))
++    return out_maps
++
++
++def _apply_operator(
++    *,
++    op: OperatorTemplateV79,
++    vars_avail: Set[str],
++) -> Optional[Tuple[Set[str], Dict[str, str]]]:
++    if str(op.output_key) in vars_avail:
++        return None
++    if not vars_avail:
++        return None
++    req = [str(k) for k in (op.input_keys or []) if str(k)]
++    if any(k not in vars_avail for k in req):
++        return None
++    bm0 = {str(k): str(k) for k in req}
++    nxt = set(vars_avail)
++    nxt.add(str(op.output_key))
++    return nxt, bm0
++
++
++@dataclass
++class PlannerV79:
++    max_depth: int = 6
++    max_expansions: int = 256
++
++    def plan(self, *, goal_spec: GoalSpecV72, store) -> Tuple[Optional[PlanV79], Dict[str, Any]]:
++        """
++        Deterministic small search over interface-defined operators.
++        Match-aware routing: filters concept acts by explicit act.match.goal_kinds metadata.
++        """
++        ops = _operator_templates_from_store(store=store, goal_kind=str(goal_spec.goal_kind))
++        init_vars = set(str(k) for k in (goal_spec.bindings or {}).keys() if str(k))
++        target = str(goal_spec.output_key or "")
++        debug: Dict[str, Any] = {
++            "init_vars": sorted(init_vars),
++            "target": str(target),
++            "goal_kind": str(goal_spec.goal_kind),
++            "operators_total": int(len(ops)),
++            "expanded": 0,
++            "found": False,
++        }
++        if not target:
++            return None, {**debug, "reason": "missing_target"}
++        if target in init_vars:
++            plan_body = {"schema_version": 1, "steps": []}
++            psig = _stable_hash_obj(plan_body)
++            return PlanV79(steps=[], plan_sig=psig), {**debug, "found": True, "reason": "already_satisfied"}
++
++        frontier: List[Tuple[int, int, str, Set[str], List[Tuple[OperatorTemplateV79, Dict[str, str]]]]] = []
++        frontier.append((0, 0, _state_sig(init_vars), set(init_vars), []))
++        seen: Set[str] = set()
++
++        def _push(ent: Tuple[int, int, str, Set[str], List[Tuple[OperatorTemplateV79, Dict[str, str]]]]) -> None:
++            frontier.append(ent)
++            frontier.sort(key=lambda x: (int(x[0]), int(x[1]), str(x[2])))
++
++        while frontier and debug["expanded"] < int(self.max_expansions):
++            cost, depth, sig, vars_avail, path = frontier.pop(0)
++            if sig in seen:
++                continue
++            seen.add(sig)
++            debug["expanded"] = int(debug["expanded"]) + 1
++
++            if target in vars_avail:
++                steps: List[PlanStepV79] = []
++                for idx, (op, bm) in enumerate(path):
++                    step_body = {
++                        "idx": int(idx),
++                        "concept_id": str(op.concept_id),
++                        "bind_map": {str(k): str(bm.get(k) or "") for k in sorted(bm.keys(), key=str)},
++                        "produces": str(op.output_key),
++                    }
++                    step_id = _stable_hash_obj(step_body)
++                    steps.append(
++                        PlanStepV79(
++                            step_id=str(step_id),
++                            idx=int(idx),
++                            concept_id=str(op.concept_id),
++                            bind_map=dict(step_body["bind_map"]),
++                            produces=str(op.output_key),
++                        )
++                    )
++                plan_body = {"schema_version": 1, "steps": [s.to_dict() for s in steps]}
++                psig = _stable_hash_obj(plan_body)
++                debug["found"] = True
++                debug["reason"] = "ok"
++                debug["plan_sig"] = str(psig)
++                return PlanV79(steps=steps, plan_sig=str(psig)), debug
++
++            if int(depth) >= int(self.max_depth):
++                continue
++
++            for op in ops:
++                applied = _apply_operator(op=op, vars_avail=set(vars_avail))
++                if applied is None:
++                    continue
++                nxt_vars, bm = applied
++                nxt_sig = _state_sig(nxt_vars)
++                nxt_path = list(path) + [(op, dict(bm))]
++                _push((int(cost) + 1, int(depth) + 1, nxt_sig, nxt_vars, nxt_path))
++
++        return None, {**debug, "reason": "search_exhausted"}
++
+--- /dev/null	2026-01-12 16:04:47
++++ atos_core/agent_loop_v79.py	2026-01-12 15:57:02
+@@ -0,0 +1,404 @@
++from __future__ import annotations
++
++import copy
++import os
++from typing import Any, Dict, List, Sequence
++
++from .act import Act, canonical_json_dumps, sha256_hex
++from .ato_v71 import ATOv71
++from .engine import Engine, EngineConfig
++from .mind_graph_v71 import MindGraphV71
++from .planner_v79 import PlanV79, PlannerV79
++from .render_v71 import render_projection
++from .store import ActStore
++from .validators import run_validator
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _safe_deepcopy(obj: Any) -> Any:
++    try:
++        return copy.deepcopy(obj)
++    except Exception:
++        if isinstance(obj, dict):
++            return dict(obj)
++        if isinstance(obj, list):
++            return list(obj)
++        return obj
++
++
++def _concept_ato_from_act(*, act: Act, step: int, concept_state: str = "ACTIVE") -> ATOv71:
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++    out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++    validator_id = str(iface.get("validator_id") or "")
++    interface_sig = _stable_hash_obj({"in": in_schema, "out": out_schema, "validator_id": validator_id})
++    program_sha256 = _stable_hash_obj([ins.to_dict() for ins in (act.program or [])])
++    slots = {"inputs": sorted(str(k) for k in in_schema.keys()), "outputs": sorted(str(k) for k in out_schema.keys())}
++    invariants = {
++        "input_schema": {str(k): str(v) for k, v in sorted(in_schema.items(), key=lambda kv: str(kv[0]))},
++        "output_schema": {str(k): str(v) for k, v in sorted(out_schema.items(), key=lambda kv: str(kv[0]))},
++        "validator_id": str(validator_id),
++    }
++    subgraph = {
++        "interface_sig": str(interface_sig),
++        "program_sha256": str(program_sha256),
++        "program_len": int(len(act.program or [])),
++        "concept_state": str(concept_state),
++    }
++    return ATOv71(
++        ato_id=str(act.id),
++        ato_type="CONCEPT",
++        subgraph=subgraph,
++        slots=slots,
++        bindings={},
++        cost=float(len(act.program or [])),
++        evidence_refs=[{"kind": "concept_act", "act_id": str(act.id)}],
++        invariants=invariants,
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _ingest_concept_calls_as_edges(
++    *,
++    mg: MindGraphV71,
++    store: ActStore,
++    step_base: int,
++    concept_calls: Sequence[Dict[str, Any]],
++) -> Dict[str, Any]:
++    calls = [c for c in concept_calls if isinstance(c, dict)]
++    created_nodes = 0
++    created_edges = 0
++    stack: Dict[int, str] = {}
++
++    for idx, ce in enumerate(calls):
++        cid = str(ce.get("concept_id") or "")
++        if not cid:
++            continue
++        if cid not in [n.get("ato_id") for n in (mg.snapshot_graph_state().get("nodes") or []) if isinstance(n, dict)]:
++            act = store.get_concept_act(cid)
++            if act is not None:
++                mg.add_node(step=int(step_base) + int(idx), ato=_concept_ato_from_act(act=act, step=int(step_base)), reason="from_concept_call")
++                created_nodes += 1
++
++        depth = int(ce.get("call_depth", 0) or 0)
++        if depth > 0 and (depth - 1) in stack:
++            caller = str(stack.get(depth - 1) or "")
++            callee = cid
++            if caller and callee and caller != callee:
++                ev_ref = {
++                    "kind": "concept_call",
++                    "idx": int(idx),
++                    "call_depth": int(depth),
++                    "bindings_sig": str(ce.get("bindings_sig") or ""),
++                    "return_sig": str(ce.get("return_sig") or ""),
++                    "concept_sig": str(ce.get("concept_sig") or ""),
++                    "interface_sig": str(ce.get("interface_sig") or ""),
++                    "program_sha256": str(ce.get("program_sha256") or ""),
++                    "bindings": ce.get("bindings") if isinstance(ce.get("bindings"), dict) else {},
++                    "return": ce.get("return") if isinstance(ce.get("return"), dict) else {},
++                }
++                mg.add_edge(
++                    step=int(step_base) + int(idx),
++                    src_ato_id=str(caller),
++                    dst_ato_id=str(callee),
++                    edge_type="CALLS",
++                    evidence_refs=[_safe_deepcopy(ev_ref)],
++                    reason="from_engine_concept_calls",
++                )
++                created_edges += 1
++
++        stack[depth] = cid
++        for k in list(stack.keys()):
++            if k > depth:
++                stack.pop(k, None)
++
++    return {"nodes_added": int(created_nodes), "edges_added": int(created_edges)}
++
++
++def run_goal_spec_v79(
++    *,
++    goal_spec,
++    store: ActStore,
++    seed: int,
++    out_dir: str,
++    max_depth: int = 6,
++    max_expansions: int = 256,
++    max_events: int = 512,
++) -> Dict[str, Any]:
++    """
++    V79 minimal agent loop:
++      GOAL_SPEC -> MATCH-AWARE PLANNER -> EXECUTOR -> MIND_GRAPH (WORM) -> RENDER/RESPONSE
++    """
++    planner = PlannerV79(max_depth=int(max_depth), max_expansions=int(max_expansions))
++    plan, planner_debug = planner.plan(goal_spec=goal_spec, store=store)
++    if plan is None:
++        return {"ok": False, "reason": "plan_not_found", "planner": dict(planner_debug)}
++
++    mg_dir = f"{str(out_dir).rstrip(os.sep)}/mind_graph"
++    mg = MindGraphV71(mg_dir)
++
++    step_ctr = 0
++    goal_id = goal_spec.goal_id()
++    goal_sig = goal_spec.goal_sig()
++    plan_id = f"plan_v79_{str(plan.plan_sig)}"
++
++    goal_node = ATOv71(
++        ato_id=str(goal_id),
++        ato_type="GOAL",
++        subgraph={"goal_kind": str(goal_spec.goal_kind), "goal_sig": str(goal_sig), "validator_id": str(goal_spec.validator_id)},
++        slots={"output_key": str(goal_spec.output_key)},
++        bindings=_safe_deepcopy(goal_spec.bindings),
++        cost=0.0,
++        evidence_refs=[{"kind": "goal_spec_v72", "goal_sig": str(goal_sig)}],
++        invariants={"expected": goal_spec.expected, "validator_id": str(goal_spec.validator_id)},
++        created_step=int(step_ctr),
++        last_step=int(step_ctr),
++    )
++    mg.add_node(step=int(step_ctr), ato=goal_node, reason="goal_spec")
++    step_ctr += 1
++
++    plan_node = ATOv71(
++        ato_id=str(plan_id),
++        ato_type="PLAN",
++        subgraph={"plan_sig": str(plan.plan_sig), "planner": "planner_v79"},
++        slots={"steps_total": int(len(plan.steps))},
++        bindings={"output_key": str(goal_spec.output_key)},
++        cost=float(len(plan.steps)),
++        evidence_refs=[{"kind": "planner_debug", "state": _safe_deepcopy(planner_debug)}],
++        invariants={"plan": plan.to_dict()},
++        created_step=int(step_ctr),
++        last_step=int(step_ctr),
++    )
++    mg.add_node(step=int(step_ctr), ato=plan_node, reason="plan")
++    mg.add_edge(
++        step=int(step_ctr),
++        src_ato_id=str(goal_id),
++        dst_ato_id=str(plan_id),
++        edge_type="DEPENDS_ON",
++        evidence_refs=[{"kind": "goal_depends_on_plan", "goal_sig": str(goal_sig), "plan_sig": str(plan.plan_sig)}],
++        reason="goal_plan",
++    )
++    step_ctr += 1
++
++    concept_acts = store.concept_acts()
++    for act in sorted(concept_acts, key=lambda a: str(a.id)):
++        mg.add_node(step=int(step_ctr), ato=_concept_ato_from_act(act=act, step=int(step_ctr)), reason="concept_catalog")
++        step_ctr += 1
++
++    vars_state: Dict[str, Any] = _safe_deepcopy(goal_spec.bindings)
++    engine = Engine(store, seed=int(seed), config=EngineConfig(enable_contracts=False))
++
++    all_concept_calls: List[Dict[str, Any]] = []
++    state_ids: List[str] = []
++
++    for s in plan.steps:
++        op_id = f"op_v79_{str(s.step_id)}"
++        op_node = ATOv71(
++            ato_id=str(op_id),
++            ato_type="OPERATOR",
++            subgraph={"kind": "CALL_CONCEPT", "concept_id": str(s.concept_id), "produces": str(s.produces), "idx": int(s.idx)},
++            slots={"bind_map": _safe_deepcopy(s.bind_map)},
++            bindings={},
++            cost=1.0,
++            evidence_refs=[{"kind": "plan_step", "step": s.to_dict()}],
++            invariants={"requires": list(sorted(s.bind_map.keys()))},
++            created_step=int(step_ctr),
++            last_step=int(step_ctr),
++        )
++        mg.add_node(step=int(step_ctr), ato=op_node, reason="operator_step")
++        mg.add_edge(
++            step=int(step_ctr),
++            src_ato_id=str(plan_id),
++            dst_ato_id=str(op_id),
++            edge_type="DEPENDS_ON",
++            evidence_refs=[{"kind": "plan_depends_on_operator", "idx": int(s.idx), "step_id": str(s.step_id)}],
++            reason="plan_ops",
++        )
++        mg.add_edge(
++            step=int(step_ctr),
++            src_ato_id=str(op_id),
++            dst_ato_id=str(s.concept_id),
++            edge_type="CALLS",
++            evidence_refs=[{"kind": "operator_calls_concept", "concept_id": str(s.concept_id)}],
++            reason="op_calls_concept",
++        )
++        step_ctr += 1
++
++        concept_inputs: Dict[str, Any] = {}
++        for k, vname in sorted(s.bind_map.items(), key=lambda kv: str(kv[0])):
++            concept_inputs[str(k)] = vars_state.get(str(vname))
++
++        exec_res = engine.execute_concept_csv(
++            concept_act_id=str(s.concept_id),
++            inputs=dict(concept_inputs),
++            expected=None,
++            step=int(step_ctr),
++            max_depth=8,
++            max_events=int(max_events),
++            validate_output=False,
++        )
++        meta = exec_res.get("meta") if isinstance(exec_res, dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++        ok_exec = bool(meta.get("ok", False))
++        out_text = str(meta.get("output_text") or exec_res.get("output") or "")
++        out_sig = str(meta.get("output_sig") or "")
++
++        vars_state[str(s.produces)] = out_text
++
++        state_snapshot = _safe_deepcopy(vars_state)
++        state_sig = _stable_hash_obj({"vars": state_snapshot, "idx": int(s.idx)})
++        state_id = f"state_v79_{state_sig}"
++        state_ids.append(state_id)
++        st_node = ATOv71(
++            ato_id=str(state_id),
++            ato_type="STATE",
++            subgraph={"idx": int(s.idx), "after_op": str(op_id)},
++            slots={"keys": sorted(str(k) for k in state_snapshot.keys())},
++            bindings=state_snapshot,
++            cost=0.0,
++            evidence_refs=[{"kind": "operator_result", "ok": bool(ok_exec), "output_sig": str(out_sig)}],
++            invariants={},
++            created_step=int(step_ctr),
++            last_step=int(step_ctr),
++        )
++        mg.add_node(step=int(step_ctr), ato=st_node, reason="state_after_step")
++        mg.add_edge(
++            step=int(step_ctr),
++            src_ato_id=str(op_id),
++            dst_ato_id=str(state_id),
++            edge_type="CAUSES",
++            evidence_refs=[
++                {
++                    "kind": "op_causes_state",
++                    "idx": int(s.idx),
++                    "produces": str(s.produces),
++                    "output_text": str(out_text),
++                    "output_sig": str(out_sig),
++                    "bind_map": _safe_deepcopy(s.bind_map),
++                }
++            ],
++            reason="op_state",
++        )
++
++        tr = exec_res.get("trace") if isinstance(exec_res.get("trace"), dict) else {}
++        concept_calls = tr.get("concept_calls") if isinstance(tr.get("concept_calls"), list) else []
++        all_concept_calls.extend([_safe_deepcopy(c) for c in concept_calls if isinstance(c, dict)])
++        _ingest_concept_calls_as_edges(
++            mg=mg,
++            store=store,
++            step_base=int(step_ctr) + 1,
++            concept_calls=concept_calls,
++        )
++        step_ctr += 2
++
++    final_val = vars_state.get(str(goal_spec.output_key))
++    vres = run_validator(str(goal_spec.validator_id), str(final_val or ""), goal_spec.expected)
++    eval_ok = bool(vres.passed)
++    eval_id = f"eval_v79_{goal_sig}"
++    eval_node = ATOv71(
++        ato_id=str(eval_id),
++        ato_type="EVAL",
++        subgraph={"goal_sig": str(goal_sig), "plan_sig": str(plan.plan_sig)},
++        slots={"output_key": str(goal_spec.output_key)},
++        bindings={"ok": bool(eval_ok), "reason": str(vres.reason), "got": str(final_val or ""), "expected": goal_spec.expected},
++        cost=0.0,
++        evidence_refs=[{"kind": "validator", "validator_id": str(goal_spec.validator_id), "reason": str(vres.reason)}],
++        invariants={},
++        created_step=int(step_ctr),
++        last_step=int(step_ctr),
++    )
++    mg.add_node(step=int(step_ctr), ato=eval_node, reason="eval_final")
++    if state_ids:
++        mg.add_edge(
++            step=int(step_ctr),
++            src_ato_id=str(eval_id),
++            dst_ato_id=str(state_ids[-1]),
++            edge_type="DERIVED_FROM",
++            evidence_refs=[{"kind": "eval_from_state", "state_id": str(state_ids[-1])}],
++            reason="eval_state",
++        )
++    step_ctr += 1
++
++    snap_before_irrelevant = mg.snapshot_graph_state()
++    graph_sig_before_irrelevant = mg.graph_sig()
++    roots = [str(goal_id), str(plan_id), str(eval_id)]
++    r_v1 = render_projection(
++        graph_snapshot=snap_before_irrelevant,
++        root_ids=roots,
++        max_depth=16,
++        bindings=_safe_deepcopy(goal_spec.bindings),
++        goals=[{"goal_id": str(goal_id), "goal_sig": str(goal_sig)}],
++        plan_state={"plan_id": str(plan_id), "plan_sig": str(plan.plan_sig)},
++        style="v1",
++    )
++    r_v2 = render_projection(
++        graph_snapshot=snap_before_irrelevant,
++        root_ids=roots,
++        max_depth=16,
++        bindings=_safe_deepcopy(goal_spec.bindings),
++        goals=[{"goal_id": str(goal_id), "goal_sig": str(goal_sig)}],
++        plan_state={"plan_id": str(plan_id), "plan_sig": str(plan.plan_sig)},
++        style="v2",
++    )
++
++    irrelevant = ATOv71(
++        ato_id="obs_v79_irrelevant_00",
++        ato_type="OBS",
++        subgraph={"kind": "irrelevant"},
++        slots={},
++        bindings={"note": "ignored"},
++        cost=0.0,
++        evidence_refs=[{"kind": "irrelevant"}],
++        invariants={},
++        created_step=int(step_ctr),
++        last_step=int(step_ctr),
++    )
++    mg.add_node(step=int(step_ctr), ato=irrelevant, reason="irrelevant_unreachable")
++    step_ctr += 1
++
++    snap_after_irrelevant = mg.snapshot_graph_state()
++    graph_sig_after_irrelevant = mg.graph_sig()
++    r_v1_after = render_projection(
++        graph_snapshot=snap_after_irrelevant,
++        root_ids=roots,
++        max_depth=16,
++        bindings=_safe_deepcopy(goal_spec.bindings),
++        goals=[{"goal_id": str(goal_id), "goal_sig": str(goal_sig)}],
++        plan_state={"plan_id": str(plan_id), "plan_sig": str(plan.plan_sig)},
++        style="v1",
++    )
++
++    return {
++        "ok": bool(eval_ok),
++        "goal_id": str(goal_id),
++        "goal_sig": str(goal_sig),
++        "plan": plan.to_dict(),
++        "planner": dict(planner_debug),
++        "final": {
++            "output_key": str(goal_spec.output_key),
++            "got": str(final_val or ""),
++            "expected": goal_spec.expected,
++            "validator": {"passed": bool(vres.passed), "reason": str(vres.reason)},
++        },
++        "graph": {
++            "graph_sig_before_irrelevant": str(graph_sig_before_irrelevant),
++            "graph_sig": str(graph_sig_after_irrelevant),
++            "chains": mg.verify_chains(),
++        },
++        "render": {
++            "render_sig_v1": str(r_v1.get("render_sig") or ""),
++            "render_sig_v2": str(r_v2.get("render_sig") or ""),
++            "render_sig_v1_after_irrelevant": str(r_v1_after.get("render_sig") or ""),
++            "text_v1": str(r_v1.get("text") or ""),
++            "text_v2": str(r_v2.get("text") or ""),
++        },
++        "trace": {"concept_calls": list(all_concept_calls)},
++        "snapshot": snap_after_irrelevant,
++    }
++
+--- /dev/null	2026-01-12 16:04:47
++++ atos_core/agent_loop_goals_v79.py	2026-01-12 15:59:33
+@@ -0,0 +1,918 @@
++from __future__ import annotations
++
++import datetime as _dt
++import hashlib
++import json
++import os
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .agent_loop_v79 import run_goal_spec_v79
++from .goal_act_v75 import goal_sig_v75, goal_v75_is_satisfied, goal_v75_update_from_run, list_goal_acts_v75
++from .goal_spec_v72 import GoalSpecV72
++from .mine_promote_v74 import (
++    extract_rep_steps,
++    materialize_composed_act_v74,
++    mine_candidates_v74,
++    mutate_bindings_plus1_numeric,
++)
++from .pcc_v74 import build_certificate_v2, verify_pcc_v2
++from .store import ActStore
++from .trace_v73 import TraceV73, trace_from_agent_loop_v72
++
++
++def _fail(msg: str) -> None:
++    raise ValueError(msg)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"path_exists:{path}")
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++_EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
++
++
++def goal_created_step_v75(goal_act) -> int:
++    """
++    Deterministic created_step derived from goal_act.created_at (deterministic_iso).
++    """
++    try:
++        ts = str(getattr(goal_act, "created_at", "") or "")
++        if not ts:
++            return 0
++        dt = _dt.datetime.fromisoformat(ts)
++        if dt.tzinfo is None:
++            dt = dt.replace(tzinfo=_dt.timezone.utc)
++        return int((dt - _EPOCH).total_seconds())
++    except Exception:
++        return 0
++
++
++def run_dir_sha256_v79(*, run_dir: str) -> str:
++    mg_dir = os.path.join(str(run_dir), "mind_graph")
++    nodes_path = os.path.join(mg_dir, "mind_nodes.jsonl")
++    edges_path = os.path.join(mg_dir, "mind_edges.jsonl")
++    nodes_sha = sha256_file(nodes_path)
++    edges_sha = sha256_file(edges_path)
++    return _sha256_canon({"mind_nodes_sha256": str(nodes_sha), "mind_edges_sha256": str(edges_sha)})
++
++
++def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(row))
++        f.write("\n")
++
++
++def _write_json_once(path: str, obj: Any) -> None:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def goal_spec_v72_from_goal_act_v75(goal_act) -> Tuple[Optional[GoalSpecV72], str]:
++    if goal_act is None or str(getattr(goal_act, "kind", "")) != "goal_v75":
++        return None, "not_goal_v75_act"
++    ev = goal_act.evidence if isinstance(goal_act.evidence, dict) else {}
++    goal = ev.get("goal") if isinstance(ev.get("goal"), dict) else {}
++
++    goal_kind = str(goal.get("goal_kind") or "")
++    bindings = goal.get("bindings") if isinstance(goal.get("bindings"), dict) else {}
++    output_key = str(goal.get("output_key") or "")
++    expected = goal.get("expected")
++    validator_id = str(goal.get("validator_id") or "text_exact")
++    if not output_key:
++        return None, "missing_output_key"
++    return (
++        GoalSpecV72(
++            goal_kind=str(goal_kind),
++            bindings={str(k): bindings.get(k) for k in sorted(bindings.keys(), key=str)},
++            output_key=str(output_key),
++            expected=expected,
++            validator_id=str(validator_id),
++            created_step=0,
++        ),
++        "ok",
++    )
++
++
++def goal_kind_from_goal_act_v75(goal_act) -> str:
++    if goal_act is None or str(getattr(goal_act, "kind", "")) != "goal_v75":
++        return ""
++    ev = goal_act.evidence if isinstance(goal_act.evidence, dict) else {}
++    goal = ev.get("goal") if isinstance(ev.get("goal"), dict) else {}
++    return str(goal.get("goal_kind") or "")
++
++
++def _find_subpath_start(path: Sequence[str], subpath: Sequence[str]) -> Optional[int]:
++    p = [str(x) for x in path]
++    sp = [str(x) for x in subpath]
++    if not sp or len(sp) > len(p):
++        return None
++    for i in range(0, len(p) - len(sp) + 1):
++        if p[i : i + len(sp)] == sp:
++            return int(i)
++    return None
++
++
++def _trace_contains_subpath(trace: TraceV73, subpath: Sequence[str]) -> bool:
++    try:
++        return _find_subpath_start(trace.acts_path(), subpath) is not None
++    except Exception:
++        return False
++
++
++def _candidate_goal_kinds_supported(cand, traces_ok: Sequence[TraceV73]) -> List[str]:
++    kinds: List[str] = []
++    for tr in traces_ok:
++        if not isinstance(tr, TraceV73):
++            continue
++        if _trace_contains_subpath(tr, cand.subpath):
++            k = str(tr.goal_kind or "")
++            if k and k not in kinds:
++                kinds.append(k)
++    kinds.sort(key=str)
++    return kinds
++
++
++def _execute_prefix_state(
++    *,
++    store_base: ActStore,
++    trace: TraceV73,
++    upto_idx: int,
++    seed: int = 0,
++) -> Dict[str, Any]:
++    if int(upto_idx) <= 0:
++        return dict(trace.bindings)
++
++    from .engine import Engine, EngineConfig
++
++    vars_state: Dict[str, Any] = dict(trace.bindings)
++    engine = Engine(store_base, seed=int(seed), config=EngineConfig(enable_contracts=False))
++    steps = list(trace.steps)
++    for i, st in enumerate(steps[: int(upto_idx)]):
++        bm = st.bind_map if isinstance(st.bind_map, dict) else {}
++        inps: Dict[str, Any] = {}
++        for slot in sorted(bm.keys(), key=str):
++            vn = str(bm.get(slot) or "")
++            inps[str(slot)] = vars_state.get(vn)
++        out = engine.execute_concept_csv(
++            concept_act_id=str(st.concept_id),
++            inputs=dict(inps),
++            expected=None,
++            step=int(i),
++            max_depth=8,
++            max_events=512,
++            validate_output=False,
++        )
++        meta = out.get("meta") if isinstance(out, dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++        out_text = str(meta.get("output_text") or out.get("output") or "")
++        vars_state[str(st.produces)] = out_text
++    return dict(vars_state)
++
++
++def _expected_for_steps(
++    *,
++    store_base: ActStore,
++    steps: Sequence,
++    start_state: Dict[str, Any],
++    seed: int = 0,
++) -> str:
++    from .mine_promote_v74 import execute_steps_expected_output
++
++    return execute_steps_expected_output(store_base=store_base, steps=steps, bindings=start_state, seed=int(seed))
++
++
++def _build_vector_specs_v79(
++    *,
++    store_base: ActStore,
++    act_candidate,
++    cand,
++    traces_ok: Sequence[TraceV73],
++    seed: int,
++) -> Tuple[Optional[List[Dict[str, Any]]], str]:
++    input_keys: List[str] = []
++    if isinstance(act_candidate.evidence, dict):
++        iface = act_candidate.evidence.get("interface") if isinstance(act_candidate.evidence.get("interface"), dict) else {}
++        iface = iface if isinstance(iface, dict) else {}
++        in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++        input_keys = [str(k) for k in sorted(in_schema.keys(), key=str)]
++
++    support_set = set(str(x) for x in (cand.contexts or []) if str(x))
++    support_traces = [t for t in traces_ok if str(t.context_id) in support_set]
++    support_traces.sort(key=lambda t: str(t.trace_sig()))
++    if len(support_traces) < 2:
++        return None, "insufficient_support_traces"
++
++    vector_specs: List[Dict[str, Any]] = []
++    for st in support_traces:
++        start = _find_subpath_start(st.acts_path(), cand.subpath)
++        if start is None:
++            continue
++        state0 = _execute_prefix_state(store_base=store_base, trace=st, upto_idx=int(start), seed=int(seed))
++        sub_steps = list(st.steps)[int(start) : int(start) + int(len(cand.subpath))]
++        exp = _expected_for_steps(store_base=store_base, steps=sub_steps, start_state=state0, seed=int(seed))
++        inputs = {k: state0.get(k) for k in input_keys}
++        ctx_sig = _sha256_canon({"ctx": str(st.context_id), "sub_sig": str(cand.sub_sig), "inputs": inputs})
++        vector_specs.append({"context_id": f"{st.context_id}:{ctx_sig}", "inputs": dict(inputs), "expected": str(exp)})
++
++    vector_specs.sort(key=lambda v: _sha256_canon({"inputs": v.get("inputs", {}), "expected": v.get("expected")}))
++    vector_specs = vector_specs[:3]
++
++    base = support_traces[0]
++    start0 = _find_subpath_start(base.acts_path(), cand.subpath) or 0
++    mutated_bindings = mutate_bindings_plus1_numeric(bindings=dict(base.bindings), key_preference=["x", "y"])
++    state_mut = _execute_prefix_state(
++        store_base=store_base,
++        trace=TraceV73(
++            context_id=str(base.context_id),
++            goal_sig=str(base.goal_sig),
++            goal_id=str(base.goal_id),
++            goal_kind=str(base.goal_kind),
++            bindings=dict(mutated_bindings),
++            output_key=str(base.output_key),
++            expected=base.expected,
++            validator_id=str(base.validator_id),
++            steps=list(base.steps),
++            outcome=dict(base.outcome),
++            cost_units=dict(base.cost_units),
++        ),
++        upto_idx=int(start0),
++        seed=int(seed),
++    )
++    sub_steps0 = list(base.steps)[int(start0) : int(start0) + int(len(cand.subpath))]
++    exp_mut = _expected_for_steps(store_base=store_base, steps=sub_steps0, start_state=state_mut, seed=int(seed))
++    inputs_mut = {k: state_mut.get(k) for k in input_keys}
++    extra_ctx = _sha256_canon({"extra": True, "sub_sig": str(cand.sub_sig), "inputs": inputs_mut})
++    vector_specs.append({"context_id": f"extra:{extra_ctx}", "inputs": dict(inputs_mut), "expected": str(exp_mut)})
++
++    uniq: Dict[str, Dict[str, Any]] = {}
++    for vs in vector_specs:
++        sig = _sha256_canon({"inputs": vs.get("inputs", {}), "expected": vs.get("expected")})
++        if sig not in uniq:
++            uniq[sig] = vs
++    vector_specs = [uniq[k] for k in sorted(uniq.keys(), key=str)]
++    if len(vector_specs) < 3:
++        return None, "insufficient_vector_specs_after_dedup"
++
++    return list(vector_specs), "ok"
++
++
++def _compression_points_from_events(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    points: List[Dict[str, Any]] = []
++    idxs: List[int] = []
++    for i, r in enumerate(rows):
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("event_kind") or "") == "promotion_attempt" and str(r.get("decision") or "") == "promoted":
++            idxs.append(int(i))
++
++    for i, ev_idx in enumerate(idxs):
++        before = None
++        for r in reversed(list(rows[:ev_idx])):
++            if not isinstance(r, dict):
++                continue
++            if str(r.get("event_kind") or "") != "goal_attempt":
++                continue
++            before = int(r.get("steps_total", 0) or 0)
++            break
++        after = None
++        for r in list(rows[ev_idx + 1 :]):
++            if not isinstance(r, dict):
++                continue
++            if str(r.get("event_kind") or "") != "goal_attempt":
++                continue
++            after = int(r.get("steps_total", 0) or 0)
++            break
++        if before is None or after is None:
++            continue
++        points.append(
++            {
++                "promotion_index": int(i),
++                "steps_before": int(before),
++                "steps_after": int(after),
++                "delta_steps": int(int(before) - int(after)),
++            }
++        )
++    return points
++
++
++def run_goals_v79(
++    *,
++    store: ActStore,
++    seed: int,
++    out_dir: str,
++    max_rounds: int = 10,
++    max_goals_per_round: int = 1,
++    enable_promotion: bool = True,
++    promotion_budget_bits: int = 2048,
++    promotion_min_traces: int = 2,
++    promotion_top_k: int = 8,
++    max_promotions_per_run: int = 3,
++    promotion_kind_diversity_min: int = 1,
++) -> Dict[str, Any]:
++    """
++    V79: deterministic goal loop with multi online promotions + curriculum scheduler (created_step ASC),
++    using match-aware planner routing (no store_view).
++    """
++    ensure_absent(out_dir)
++    os.makedirs(out_dir, exist_ok=False)
++
++    events_path = os.path.join(out_dir, "goals_v79_events.jsonl")
++    ensure_absent(events_path)
++
++    traces: List[TraceV73] = []
++    attempts_total = 0
++    promoted_total = 0
++    used_bits = 0
++
++    promotions_dir = os.path.join(out_dir, "promotion")
++    promotions_path = os.path.join(promotions_dir, "v79_promotions.jsonl")
++    candidates_dir = os.path.join(out_dir, "candidates")
++    traces_path = os.path.join(out_dir, "traces_v79.json")
++    mined_path = os.path.join(out_dir, "mined_candidates_v79.json")
++    curve_path = os.path.join(out_dir, "compression_curve.json")
++
++    store_hash_init = str(store.content_hash())
++    step_ctr = 0
++    events_buf: List[Dict[str, Any]] = []
++    mining_attempts: List[Dict[str, Any]] = []
++
++    window_start_idx = 0
++
++    def _emit_event(row: Dict[str, Any]) -> None:
++        nonlocal step_ctr
++        body = dict(row)
++        body["created_at"] = deterministic_iso(step=int(step_ctr))
++        _append_jsonl(events_path, body)
++        events_buf.append(dict(body))
++        step_ctr += 1
++
++    def _emit_promo_row(row: Dict[str, Any]) -> None:
++        os.makedirs(promotions_dir, exist_ok=True)
++        _append_jsonl(promotions_path, row)
++
++    for r in range(0, int(max_rounds)):
++        goals = list_goal_acts_v75(store)
++        pending = [g for g in goals if not goal_v75_is_satisfied(g)]
++        pending.sort(key=lambda a: (int(goal_created_step_v75(a)), str(getattr(a, "id", ""))))
++
++        if not pending:
++            break
++
++        to_run = pending[: int(max_goals_per_round)]
++        skipped = pending[int(max_goals_per_round) :]
++
++        for g in skipped:
++            store_hash_before = str(store.content_hash())
++            _emit_event(
++                {
++                    "round": int(r),
++                    "event_kind": "goal_skipped",
++                    "promotion_index": -1,
++                    "goal_id": str(getattr(g, "id", "")),
++                    "goal_sig": str(goal_sig_v75(g)),
++                    "goal_kind": str(goal_kind_from_goal_act_v75(g)),
++                    "goal_created_step": int(goal_created_step_v75(g)),
++                    "decision": "skipped",
++                    "reason": "max_goals_per_round",
++                    "plan_sig": "",
++                    "trace_sig": "",
++                    "steps_total": 0,
++                    "run_dir_sha256": "",
++                    "candidate_id": "",
++                    "certificate_sig": "",
++                    "overhead_bits": 0,
++                    "gain_bits_est": 0,
++                    "used_bits_after": int(used_bits),
++                    "store_hash_before": str(store_hash_before),
++                    "store_hash_after": str(store_hash_before),
++                }
++            )
++
++        for g in to_run:
++            store_hash_before = str(store.content_hash())
++            goal_spec, reason = goal_spec_v72_from_goal_act_v75(g)
++            goal_kind = str(goal_kind_from_goal_act_v75(g))
++            goal_step = int(goal_created_step_v75(g))
++            if goal_spec is None:
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "goal_attempt",
++                        "promotion_index": -1,
++                        "goal_id": str(getattr(g, "id", "")),
++                        "goal_sig": str(goal_sig_v75(g)),
++                        "goal_kind": str(goal_kind),
++                        "goal_created_step": int(goal_step),
++                        "decision": "active",
++                        "reason": str(reason),
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": "",
++                        "certificate_sig": "",
++                        "overhead_bits": 0,
++                        "gain_bits_est": 0,
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                continue
++
++            gid_short = str(getattr(g, "id", ""))[:24]
++            run_subdir = os.path.join(out_dir, f"round{int(r):02d}", f"goal_{gid_short}")
++            ensure_absent(run_subdir)
++            os.makedirs(run_subdir, exist_ok=False)
++
++            res = run_goal_spec_v79(goal_spec=goal_spec, store=store, seed=int(seed), out_dir=run_subdir)
++            attempts_total += 1
++
++            tr = trace_from_agent_loop_v72(goal_spec=goal_spec, result=res)
++            traces.append(tr)
++            tr_sig = str(tr.trace_sig())
++
++            run_sha = run_dir_sha256_v79(run_dir=run_subdir)
++            updated = goal_v75_update_from_run(
++                act=g,
++                run_res=res,
++                trace_sig=str(tr_sig),
++                run_dir_sha256=str(run_sha),
++                step=int(step_ctr),
++            )
++            store.add(updated)
++
++            plan = res.get("plan") if isinstance(res.get("plan"), dict) else {}
++            plan = plan if isinstance(plan, dict) else {}
++            raw_steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
++            plan_sig = str(plan.get("plan_sig") or "")
++            steps_total = int(len(raw_steps))
++
++            satisfied = goal_v75_is_satisfied(updated)
++            decision = "satisfied" if satisfied else "active"
++            reason2 = ""
++            if not satisfied:
++                reason2 = str(res.get("reason") or "")
++                if not reason2:
++                    final = res.get("final") if isinstance(res.get("final"), dict) else {}
++                    final = final if isinstance(final, dict) else {}
++                    v = final.get("validator") if isinstance(final.get("validator"), dict) else {}
++                    reason2 = str(v.get("reason") or "")
++
++            store_hash_after = str(store.content_hash())
++            _emit_event(
++                {
++                    "round": int(r),
++                    "event_kind": "goal_attempt",
++                    "promotion_index": -1,
++                    "goal_id": str(updated.id),
++                    "goal_sig": str(goal_sig_v75(updated)),
++                    "goal_kind": str(goal_kind),
++                    "goal_created_step": int(goal_step),
++                    "decision": str(decision),
++                    "reason": str(reason2),
++                    "plan_sig": str(plan_sig),
++                    "trace_sig": str(tr_sig),
++                    "steps_total": int(steps_total),
++                    "run_dir_sha256": str(run_sha),
++                    "candidate_id": "",
++                    "certificate_sig": "",
++                    "overhead_bits": 0,
++                    "gain_bits_est": 0,
++                    "used_bits_after": int(used_bits),
++                    "store_hash_before": str(store_hash_before),
++                    "store_hash_after": str(store_hash_after),
++                }
++            )
++
++        if not bool(enable_promotion):
++            continue
++        if int(promoted_total) >= int(max_promotions_per_run):
++            continue
++        if int(used_bits) >= int(promotion_budget_bits):
++            continue
++
++        window_traces = traces[int(window_start_idx) :]
++        traces_ok = [t for t in window_traces if bool(t.outcome.get("ok", False))]
++        if len(traces_ok) < int(promotion_min_traces):
++            continue
++
++        mined, mined_debug = mine_candidates_v74(traces=traces_ok, max_k=3, min_support=2, top_k=int(promotion_top_k))
++
++        mined_logged: List[Dict[str, Any]] = []
++        for cand in mined:
++            kinds = _candidate_goal_kinds_supported(cand, traces_ok)
++            d = cand.to_dict()
++            d["goal_kinds_supported"] = list(kinds)
++            d["goal_kinds_supported_count"] = int(len(kinds))
++            mined_logged.append(d)
++
++        mining_attempts.append(
++            {
++                "promotion_index": int(promoted_total),
++                "round": int(r),
++                "required_goal_kind_diversity": int(promotion_kind_diversity_min if int(promoted_total) == 0 else 1),
++                "window": {
++                    "trace_sigs": [str(t.trace_sig()) for t in sorted(traces_ok, key=lambda t: str(t.trace_sig()))],
++                    "goal_kinds": [str(x) for x in sorted(set(str(t.goal_kind) for t in traces_ok), key=str)],
++                    "goal_kinds_distinct": int(len(set(str(t.goal_kind) for t in traces_ok))),
++                },
++                "debug": dict(mined_debug),
++                "candidates": list(mined_logged),
++            }
++        )
++
++        if not mined:
++            store_hash_before = str(store.content_hash())
++            _emit_event(
++                {
++                    "round": int(r),
++                    "event_kind": "promotion_attempt",
++                    "promotion_index": int(promoted_total),
++                    "goal_id": "",
++                    "goal_sig": "",
++                    "goal_kind": "",
++                    "goal_created_step": 0,
++                    "decision": "skipped",
++                    "reason": "no_mined_candidates",
++                    "plan_sig": "",
++                    "trace_sig": "",
++                    "steps_total": 0,
++                    "run_dir_sha256": "",
++                    "candidate_id": "",
++                    "certificate_sig": "",
++                    "overhead_bits": 0,
++                    "gain_bits_est": 0,
++                    "used_bits_after": int(used_bits),
++                    "store_hash_before": str(store_hash_before),
++                    "store_hash_after": str(store_hash_before),
++                }
++            )
++            continue
++
++        if not os.path.exists(candidates_dir):
++            ensure_absent(candidates_dir)
++            os.makedirs(candidates_dir, exist_ok=False)
++        if not os.path.exists(promotions_dir):
++            ensure_absent(promotions_dir)
++            os.makedirs(promotions_dir, exist_ok=False)
++
++        traces_by_sig = {str(t.trace_sig()): t for t in traces_ok}
++
++        for cand_idx, cand in enumerate(mined):
++            promotion_index = int(promoted_total)
++            store_hash_before = str(store.content_hash())
++
++            kinds = _candidate_goal_kinds_supported(cand, traces_ok)
++            required_kinds = int(promotion_kind_diversity_min) if int(promotion_index) == 0 else 1
++            if len(kinds) < int(required_kinds):
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "promotion_attempt",
++                        "promotion_index": int(promotion_index),
++                        "goal_id": "",
++                        "goal_sig": "",
++                        "goal_kind": "",
++                        "goal_created_step": 0,
++                        "decision": "skipped",
++                        "reason": "insufficient_goal_kind_diversity",
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": "",
++                        "certificate_sig": "",
++                        "overhead_bits": 0,
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                _emit_promo_row(
++                    {
++                        "created_at": deterministic_iso(step=10_000 + int(step_ctr) + int(cand_idx)),
++                        "candidate_id": "",
++                        "certificate_sig": "",
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "overhead_bits": 0,
++                        "decision": "skipped",
++                        "reason": "insufficient_goal_kind_diversity",
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                        "goal_kinds_supported": list(kinds),
++                        "required_goal_kind_diversity": int(required_kinds),
++                    }
++                )
++                continue
++
++            rep_steps = extract_rep_steps(
++                traces_by_sig=traces_by_sig,
++                rep_trace_sig=str(cand.rep_trace_sig),
++                start_idx=int(cand.start_idx),
++                subpath_len=int(len(cand.subpath)),
++            )
++            act, _dbg = materialize_composed_act_v74(
++                store_base=store,
++                steps=rep_steps,
++                support_contexts=int(cand.support_contexts),
++                contexts=list(cand.contexts),
++                seed_step=0,
++            )
++            if kinds:
++                act.match = {"goal_kinds": list(kinds)}
++            overhead_bits = int((act.cost or {}).get("overhead_bits", 1024) or 1024)
++
++            if store.get(str(act.id)) is not None:
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "promotion_attempt",
++                        "promotion_index": int(promotion_index),
++                        "goal_id": "",
++                        "goal_sig": "",
++                        "goal_kind": "",
++                        "goal_created_step": 0,
++                        "decision": "skipped",
++                        "reason": "already_in_store",
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "overhead_bits": int(overhead_bits),
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                _emit_promo_row(
++                    {
++                        "created_at": deterministic_iso(step=11_000 + int(step_ctr) + int(cand_idx)),
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "overhead_bits": int(overhead_bits),
++                        "decision": "skipped",
++                        "reason": "already_in_store",
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                continue
++
++            if int(used_bits) + int(overhead_bits) > int(promotion_budget_bits):
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "promotion_attempt",
++                        "promotion_index": int(promotion_index),
++                        "goal_id": "",
++                        "goal_sig": "",
++                        "goal_kind": "",
++                        "goal_created_step": 0,
++                        "decision": "skipped",
++                        "reason": "budget_exceeded",
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "overhead_bits": int(overhead_bits),
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                _emit_promo_row(
++                    {
++                        "created_at": deterministic_iso(step=12_000 + int(step_ctr) + int(cand_idx)),
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "overhead_bits": int(overhead_bits),
++                        "decision": "skipped",
++                        "reason": "budget_exceeded",
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                continue
++
++            vector_specs, v_reason = _build_vector_specs_v79(
++                store_base=store,
++                act_candidate=act,
++                cand=cand,
++                traces_ok=traces_ok,
++                seed=int(seed),
++            )
++            if vector_specs is None:
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "promotion_attempt",
++                        "promotion_index": int(promotion_index),
++                        "goal_id": "",
++                        "goal_sig": "",
++                        "goal_kind": "",
++                        "goal_created_step": 0,
++                        "decision": "skipped",
++                        "reason": str(v_reason),
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "overhead_bits": int(overhead_bits),
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                _emit_promo_row(
++                    {
++                        "created_at": deterministic_iso(step=13_000 + int(step_ctr) + int(cand_idx)),
++                        "candidate_id": str(act.id),
++                        "certificate_sig": "",
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "overhead_bits": int(overhead_bits),
++                        "decision": "skipped",
++                        "reason": str(v_reason),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                continue
++
++            mined_from = {
++                "trace_sigs": [str(t.trace_sig()) for t in sorted(traces_ok, key=lambda t: str(t.trace_sig()))],
++                "goal_kinds": [str(x) for x in sorted(set(str(t.goal_kind) for t in traces_ok), key=str)],
++                "goal_kinds_distinct": int(len(set(str(t.goal_kind) for t in traces_ok))),
++                "candidate": {"sub_sig": str(cand.sub_sig), "subpath": [str(x) for x in cand.subpath], "goal_kinds_supported": list(kinds)},
++            }
++            cert = build_certificate_v2(candidate_act=act, store_base=store, mined_from=mined_from, vector_specs=vector_specs, seed=int(seed))
++            ok_pcc, reason_pcc, _details_pcc = verify_pcc_v2(candidate_act=act, certificate=cert, store_base=store, seed=int(seed))
++            if not ok_pcc:
++                _emit_event(
++                    {
++                        "round": int(r),
++                        "event_kind": "promotion_attempt",
++                        "promotion_index": int(promotion_index),
++                        "goal_id": "",
++                        "goal_sig": "",
++                        "goal_kind": "",
++                        "goal_created_step": 0,
++                        "decision": "skipped",
++                        "reason": f"pcc_fail:{reason_pcc}",
++                        "plan_sig": "",
++                        "trace_sig": "",
++                        "steps_total": 0,
++                        "run_dir_sha256": "",
++                        "candidate_id": str(act.id),
++                        "certificate_sig": str(cert.get("certificate_sig") or ""),
++                        "overhead_bits": int(overhead_bits),
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "used_bits_after": int(used_bits),
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                _emit_promo_row(
++                    {
++                        "created_at": deterministic_iso(step=14_000 + int(step_ctr) + int(cand_idx)),
++                        "candidate_id": str(act.id),
++                        "certificate_sig": str(cert.get("certificate_sig") or ""),
++                        "gain_bits_est": int(cand.gain_bits_est),
++                        "overhead_bits": int(overhead_bits),
++                        "decision": "skipped",
++                        "reason": f"pcc_fail:{reason_pcc}",
++                        "store_hash_before": str(store_hash_before),
++                        "store_hash_after": str(store_hash_before),
++                    }
++                )
++                continue
++
++            cert_sig = str(cert.get("certificate_sig") or "")
++            store.add(act)
++            used_bits = int(used_bits) + int(overhead_bits)
++            store_hash_after = str(store.content_hash())
++
++            act_path = os.path.join(candidates_dir, f"candidate_{promotion_index:03d}_act.json")
++            cert_path = os.path.join(candidates_dir, f"candidate_{promotion_index:03d}_certificate_v2.json")
++            _write_json_once(act_path, act.to_dict())
++            _write_json_once(cert_path, cert)
++
++            _emit_event(
++                {
++                    "round": int(r),
++                    "event_kind": "promotion_attempt",
++                    "promotion_index": int(promotion_index),
++                    "goal_id": "",
++                    "goal_sig": "",
++                    "goal_kind": "",
++                    "goal_created_step": 0,
++                    "decision": "promoted",
++                    "reason": "pcc_ok_under_budget",
++                    "plan_sig": "",
++                    "trace_sig": "",
++                    "steps_total": 0,
++                    "run_dir_sha256": "",
++                    "candidate_id": str(act.id),
++                    "certificate_sig": str(cert_sig),
++                    "overhead_bits": int(overhead_bits),
++                    "gain_bits_est": int(cand.gain_bits_est),
++                    "used_bits_after": int(used_bits),
++                    "store_hash_before": str(store_hash_before),
++                    "store_hash_after": str(store_hash_after),
++                }
++            )
++            _emit_promo_row(
++                {
++                    "created_at": deterministic_iso(step=15_000 + int(step_ctr) + int(cand_idx)),
++                    "candidate_id": str(act.id),
++                    "certificate_sig": str(cert_sig),
++                    "gain_bits_est": int(cand.gain_bits_est),
++                    "overhead_bits": int(overhead_bits),
++                    "decision": "promoted",
++                    "reason": "pcc_ok_under_budget",
++                    "store_hash_before": str(store_hash_before),
++                    "store_hash_after": str(store_hash_after),
++                    "goal_kinds_supported": list(kinds),
++                }
++            )
++
++            promoted_total += 1
++            window_start_idx = int(len(traces))
++            break
++
++    traces_sorted = sorted([t.to_canonical_dict(include_sig=True) for t in traces], key=lambda d: str(d.get("trace_sig") or ""))
++    _write_json_once(traces_path, {"schema_version": 1, "traces": list(traces_sorted)})
++    _write_json_once(mined_path, {"schema_version": 1, "mining_attempts": list(mining_attempts)})
++
++    points = _compression_points_from_events(events_buf)
++    curve_core = {"schema_version": 1, "points": list(points)}
++    curve_core["curve_sig"] = _sha256_canon({"points": list(points)})
++    _write_json_once(curve_path, curve_core)
++
++    artifacts: Dict[str, Any] = {
++        "goals_v79_events_jsonl_sha256": sha256_file(events_path),
++        "traces_v79_json_sha256": sha256_file(traces_path),
++        "mined_candidates_v79_json_sha256": sha256_file(mined_path),
++        "compression_curve_json_sha256": sha256_file(curve_path),
++    }
++    if os.path.exists(promotions_path):
++        artifacts["v79_promotions_jsonl_sha256"] = sha256_file(promotions_path)
++    for k in range(0, int(promoted_total)):
++        ap = os.path.join(candidates_dir, f"candidate_{k:03d}_act.json")
++        cp = os.path.join(candidates_dir, f"candidate_{k:03d}_certificate_v2.json")
++        if os.path.exists(ap):
++            artifacts[f"candidate_{k:03d}_act_json_sha256"] = sha256_file(ap)
++        if os.path.exists(cp):
++            artifacts[f"candidate_{k:03d}_certificate_v2_json_sha256"] = sha256_file(cp)
++
++    return {
++        "schema_version": 1,
++        "seed": int(seed),
++        "store_hash_init": str(store_hash_init),
++        "store_hash_final": str(store.content_hash()),
++        "goals_total": int(len(list_goal_acts_v75(store))),
++        "goals_satisfied": int(len([g for g in list_goal_acts_v75(store) if goal_v75_is_satisfied(g)])),
++        "attempts_total": int(attempts_total),
++        "traces_total": int(len(traces_sorted)),
++        "promoted_total": int(promoted_total),
++        "budget_bits": int(promotion_budget_bits),
++        "used_bits": int(used_bits),
++        "promotion_kind_diversity_min": int(promotion_kind_diversity_min),
++        "compression_curve": dict(curve_core),
++        "artifacts": dict(artifacts),
++        "__internal_traces": list(traces),
++    }
++
+--- /dev/null	2026-01-12 16:04:47
++++ scripts/smoke_goal_act_agent_loop_v79_match_aware_planner.py	2026-01-12 16:01:38
+@@ -0,0 +1,532 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.agent_loop_goals_v79 import run_goals_v79
++from atos_core.goal_act_v75 import make_goal_act_v75
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def make_concept_act(
++    *,
++    act_id: str,
++    match: Optional[Dict[str, Any]] = None,
++    input_schema: Dict[str, str],
++    output_schema: Dict[str, str],
++    validator_id: str,
++    program: List[Instruction],
++) -> Act:
++    return Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match=dict(match) if isinstance(match, dict) else {},
++        program=list(program),
++        evidence={
++            "interface": {
++                "input_schema": dict(input_schema),
++                "output_schema": dict(output_schema),
++                "validator_id": str(validator_id),
++            }
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            rows.append(json.loads(line))
++    return rows
++
++
++def _points_from_events(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    idxs: List[int] = []
++    for i, r in enumerate(events):
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("event_kind") or "") == "promotion_attempt" and str(r.get("decision") or "") == "promoted":
++            idxs.append(int(i))
++
++    points: List[Dict[str, Any]] = []
++    for pi, ev_idx in enumerate(idxs):
++        before = None
++        for r in reversed(list(events[:ev_idx])):
++            if not isinstance(r, dict):
++                continue
++            if str(r.get("event_kind") or "") != "goal_attempt":
++                continue
++            before = int(r.get("steps_total", 0) or 0)
++            break
++        after = None
++        for r in list(events[ev_idx + 1 :]):
++            if not isinstance(r, dict):
++                continue
++            if str(r.get("event_kind") or "") != "goal_attempt":
++                continue
++            after = int(r.get("steps_total", 0) or 0)
++            break
++        if before is None or after is None:
++            _fail("ERROR: could not derive before/after steps around promotion event")
++        points.append(
++            {
++                "promotion_index": int(pi),
++                "steps_before": int(before),
++                "steps_after": int(after),
++                "delta_steps": int(int(before) - int(after)),
++            }
++        )
++    return points
++
++
++def _iface_output_keys_from_act_json(act_json: Dict[str, Any]) -> List[str]:
++    ev = act_json.get("evidence") if isinstance(act_json.get("evidence"), dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++    return [str(k) for k in sorted(out_schema.keys(), key=str)]
++
++
++def _trace_by_sig(traces_json: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
++    out: Dict[str, Dict[str, Any]] = {}
++    trs = traces_json.get("traces") if isinstance(traces_json.get("traces"), list) else []
++    for tr in trs:
++        if not isinstance(tr, dict):
++            continue
++        sig = str(tr.get("trace_sig") or "")
++        if sig:
++            out[sig] = dict(tr)
++    return out
++
++
++def _acts_path_from_trace(tr: Dict[str, Any]) -> List[str]:
++    ap = tr.get("acts_path")
++    if isinstance(ap, list):
++        return [str(x) for x in ap if str(x)]
++    steps = tr.get("steps") if isinstance(tr.get("steps"), list) else []
++    out: List[str] = []
++    for s in steps:
++        if not isinstance(s, dict):
++            continue
++        cid = str(s.get("concept_id") or "")
++        if cid:
++            out.append(cid)
++    return out
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    store = ActStore()
++
++    # Base micro-world (4-step baseline):
++    # normalize_x: x -> nx
++    # normalize_y: y -> ny
++    # add_nx_ny: nx,ny -> sum
++    # fmt_sum: sum -> out (out = "SUM=" + sum) [only for v79_fmt_sum]
++    # fmt_total: sum -> out (out = "TOTAL=" + sum) [only for v79_fmt_total]
++    normalize_x_id = "concept_v72_normalize_x_v0"
++    normalize_y_id = "concept_v72_normalize_y_v0"
++    add_nx_ny_id = "concept_v72_add_nx_ny_v0"
++    fmt_sum_id = "concept_v79_fmt_sum_v0"
++    fmt_total_id = "concept_v79_fmt_total_v0"
++
++    store.add(
++        make_concept_act(
++            act_id=normalize_x_id,
++            match={},
++            input_schema={"x": "str"},
++            output_schema={"nx": "str"},
++            validator_id="text_exact",
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["x"], "out": "d"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "nx"}),
++                Instruction("CSV_RETURN", {"var": "nx"}),
++            ],
++        )
++    )
++    store.add(
++        make_concept_act(
++            act_id=normalize_y_id,
++            match={},
++            input_schema={"y": "str"},
++            output_schema={"ny": "str"},
++            validator_id="text_exact",
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "y", "out": "y"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["y"], "out": "d"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "ny"}),
++                Instruction("CSV_RETURN", {"var": "ny"}),
++            ],
++        )
++    )
++    store.add(
++        make_concept_act(
++            act_id=add_nx_ny_id,
++            match={},
++            input_schema={"nx": "str", "ny": "str"},
++            output_schema={"sum": "str"},
++            validator_id="text_exact",
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "nx", "out": "nx"}),
++                Instruction("CSV_GET_INPUT", {"name": "ny", "out": "ny"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["nx"], "out": "dx"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["ny"], "out": "dy"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["dx"], "out": "ix"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["dy"], "out": "iy"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["ix", "iy"], "out": "sum_i"}),
++                Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["sum_i"], "out": "sum"}),
++                Instruction("CSV_RETURN", {"var": "sum"}),
++            ],
++        )
++    )
++    store.add(
++        make_concept_act(
++            act_id=fmt_sum_id,
++            match={"goal_kinds": ["v79_fmt_sum"]},
++            input_schema={"sum": "str"},
++            output_schema={"out": "str"},
++            validator_id="text_exact",
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "sum", "out": "sum"}),
++                Instruction("CSV_CONST", {"out": "prefix", "value": "SUM="}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["prefix", "sum"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++        )
++    )
++    store.add(
++        make_concept_act(
++            act_id=fmt_total_id,
++            match={"goal_kinds": ["v79_fmt_total"]},
++            input_schema={"sum": "str"},
++            output_schema={"out": "str"},
++            validator_id="text_exact",
++            program=[
++                Instruction("CSV_GET_INPUT", {"name": "sum", "out": "sum"}),
++                Instruction("CSV_CONST", {"out": "prefix", "value": "TOTAL="}),
++                Instruction("CSV_PRIMITIVE", {"fn": "str_concat", "in": ["prefix", "sum"], "out": "out"}),
++                Instruction("CSV_RETURN", {"var": "out"}),
++            ],
++        )
++    )
++
++    # Six goals. Curriculum order chosen to:
++    #  - enable cross-kind promotion0 (sum + total before promotion0),
++    #  - enable promotion1 from two sum traces after promotion0,
++    #  - ensure after promo1 we have a sum (1 step) and a total (2 steps) attempt.
++    goals_specs = [
++        {"created_step": 0, "goal_kind": "v79_fmt_sum", "bindings": {"x": "0004", "y": "0008"}, "expected": "SUM=12"},
++        {"created_step": 1, "goal_kind": "v79_fmt_total", "bindings": {"x": "0010", "y": "0002"}, "expected": "TOTAL=12"},
++        {"created_step": 2, "goal_kind": "v79_fmt_sum", "bindings": {"x": "0007", "y": "0005"}, "expected": "SUM=12"},
++        {"created_step": 3, "goal_kind": "v79_fmt_sum", "bindings": {"x": "0006", "y": "0006"}, "expected": "SUM=12"},
++        {"created_step": 4, "goal_kind": "v79_fmt_sum", "bindings": {"x": "0001", "y": "0011"}, "expected": "SUM=12"},
++        {"created_step": 5, "goal_kind": "v79_fmt_total", "bindings": {"x": "0009", "y": "0003"}, "expected": "TOTAL=12"},
++    ]
++    for gs in goals_specs:
++        ga = make_goal_act_v75(
++            goal_kind=str(gs["goal_kind"]),
++            bindings=dict(gs["bindings"]),
++            output_key="out",
++            expected=gs["expected"],
++            validator_id="text_exact",
++            created_step=int(gs["created_step"]),
++        )
++        store.add(ga)
++
++    loop_res = run_goals_v79(
++        store=store,
++        seed=int(seed),
++        out_dir=out_dir,
++        max_rounds=10,
++        max_goals_per_round=1,
++        enable_promotion=True,
++        promotion_budget_bits=2048,
++        promotion_min_traces=2,
++        promotion_top_k=8,
++        max_promotions_per_run=2,
++        promotion_kind_diversity_min=2,
++    )
++
++    if int(loop_res.get("goals_total", 0) or 0) != 6:
++        _fail(f"ERROR: expected goals_total == 6, got={loop_res.get('goals_total')}")
++    if int(loop_res.get("goals_satisfied", 0) or 0) != 6:
++        _fail(f"ERROR: expected goals_satisfied == 6, got={loop_res.get('goals_satisfied')}")
++    if int(loop_res.get("promoted_total", 0) or 0) != 2:
++        _fail(f"ERROR: expected promoted_total == 2, got={loop_res.get('promoted_total')}")
++
++    budget_bits = int(loop_res.get("budget_bits", 0) or 0)
++    used_bits = int(loop_res.get("used_bits", 0) or 0)
++    if used_bits > budget_bits:
++        _fail(f"ERROR: used_bits exceeds budget: used={used_bits} budget={budget_bits}")
++    if used_bits != 2048:
++        _fail(f"ERROR: expected used_bits == 2048, got={used_bits}")
++
++    events_path = os.path.join(out_dir, "goals_v79_events.jsonl")
++    traces_path = os.path.join(out_dir, "traces_v79.json")
++    mined_path = os.path.join(out_dir, "mined_candidates_v79.json")
++    promos_path = os.path.join(out_dir, "promotion", "v79_promotions.jsonl")
++    curve_path = os.path.join(out_dir, "compression_curve.json")
++    cand0_act = os.path.join(out_dir, "candidates", "candidate_000_act.json")
++    cand0_cert = os.path.join(out_dir, "candidates", "candidate_000_certificate_v2.json")
++    cand1_act = os.path.join(out_dir, "candidates", "candidate_001_act.json")
++    cand1_cert = os.path.join(out_dir, "candidates", "candidate_001_certificate_v2.json")
++
++    for p in (events_path, traces_path, mined_path, promos_path, curve_path, cand0_act, cand0_cert, cand1_act, cand1_cert):
++        if not os.path.exists(p):
++            _fail(f"ERROR: missing required artifact: {p}")
++
++    events = _read_jsonl(events_path)
++    promo_events = [
++        r
++        for r in events
++        if isinstance(r, dict) and str(r.get("event_kind") or "") == "promotion_attempt" and str(r.get("decision") or "") == "promoted"
++    ]
++    if len(promo_events) != 2:
++        _fail(f"ERROR: expected 2 promoted promotion_attempt events, got={len(promo_events)}")
++
++    # Curve from events should match compression_curve.json.
++    points = _points_from_events(events)
++    if len(points) != 2:
++        _fail(f"ERROR: expected 2 curve points, got={len(points)}")
++    if not (int(points[0]["steps_before"]) == 4 and int(points[0]["steps_after"]) == 2):
++        _fail(f"ERROR: expected promo0 curve == 4->2, got={points[0]}")
++    if not (int(points[1]["steps_before"]) == 2 and int(points[1]["steps_after"]) == 1):
++        _fail(f"ERROR: expected promo1 curve == 2->1, got={points[1]}")
++
++    curve = json.load(open(curve_path, "r", encoding="utf-8"))
++    curve_points = curve.get("points") if isinstance(curve, dict) else None
++    if not isinstance(curve_points, list) or len(curve_points) != 2:
++        _fail("ERROR: compression_curve.json missing/invalid points")
++    if curve_points != points:
++        _fail("ERROR: compression_curve.json points mismatch vs derived points")
++
++    # Candidate output schemas.
++    cand0 = json.load(open(cand0_act, "r", encoding="utf-8"))
++    cand1 = json.load(open(cand1_act, "r", encoding="utf-8"))
++    out_keys0 = _iface_output_keys_from_act_json(cand0 if isinstance(cand0, dict) else {})
++    out_keys1 = _iface_output_keys_from_act_json(cand1 if isinstance(cand1, dict) else {})
++    if "sum" not in out_keys0 or "out" in out_keys0:
++        _fail(f"ERROR: candidate_000_act output_schema must contain 'sum' and NOT 'out', got={out_keys0}")
++    if "out" not in out_keys1:
++        _fail(f"ERROR: candidate_001_act output_schema must contain 'out', got={out_keys1}")
++
++    # New asserts: match-only routing proofs.
++    promo_idxs: List[int] = []
++    for i, r in enumerate(events):
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("event_kind") or "") == "promotion_attempt" and str(r.get("decision") or "") == "promoted":
++            promo_idxs.append(int(i))
++    if len(promo_idxs) != 2:
++        _fail("ERROR: could not locate 2 promotion indices in events")
++    promo1_idx = promo_idxs[1]
++
++    traces_json = json.load(open(traces_path, "r", encoding="utf-8"))
++    by_sig = _trace_by_sig(traces_json if isinstance(traces_json, dict) else {})
++    cand1_id = str(cand1.get("id") or "")
++    if not cand1_id:
++        _fail("ERROR: candidate_001 id missing")
++
++    # Assert A: for a v79_fmt_total goal attempt after promo1, last step must be fmt_total and must not include fmt_sum.
++    total_after_promo1_trace_sig = None
++    for r in events[promo1_idx + 1 :]:
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("event_kind") or "") != "goal_attempt":
++            continue
++        if str(r.get("goal_kind") or "") != "v79_fmt_total":
++            continue
++        total_after_promo1_trace_sig = str(r.get("trace_sig") or "")
++        break
++    if not total_after_promo1_trace_sig:
++        _fail("ERROR: expected a v79_fmt_total goal_attempt after promo1")
++
++    tr_total = by_sig.get(total_after_promo1_trace_sig)
++    if not isinstance(tr_total, dict):
++        _fail("ERROR: missing trace for v79_fmt_total after promo1")
++    ap_total = _acts_path_from_trace(tr_total)
++    if not ap_total or ap_total[-1] != fmt_total_id:
++        _fail(f"ERROR: expected v79_fmt_total trace final concept == {fmt_total_id}, got={ap_total}")
++    if fmt_sum_id in set(ap_total):
++        _fail(f"ERROR: v79_fmt_total trace must NOT include {fmt_sum_id}, got={ap_total}")
++
++    # Assert B1: candidate_001 must not appear in v79_fmt_total after promo1.
++    if cand1_id in set(ap_total):
++        _fail(f"ERROR: candidate_001 leaked into v79_fmt_total trace after promo1: {cand1_id}")
++
++    # Assert B2: for a v79_fmt_sum goal attempt after promo1, steps_total==1 and concept_id == candidate_001 id.
++    sum_after_promo1_event = None
++    for r in events[promo1_idx + 1 :]:
++        if not isinstance(r, dict):
++            continue
++        if str(r.get("event_kind") or "") != "goal_attempt":
++            continue
++        if str(r.get("goal_kind") or "") != "v79_fmt_sum":
++            continue
++        sum_after_promo1_event = dict(r)
++        break
++    if not isinstance(sum_after_promo1_event, dict):
++        _fail("ERROR: expected a v79_fmt_sum goal_attempt after promo1")
++    if int(sum_after_promo1_event.get("steps_total", 0) or 0) != 1:
++        _fail(f"ERROR: expected v79_fmt_sum steps_total==1 after promo1, got={sum_after_promo1_event.get('steps_total')}")
++
++    sum_trace_sig = str(sum_after_promo1_event.get("trace_sig") or "")
++    tr_sum = by_sig.get(sum_trace_sig)
++    if not isinstance(tr_sum, dict):
++        _fail("ERROR: missing trace for v79_fmt_sum after promo1")
++    ap_sum = _acts_path_from_trace(tr_sum)
++    if ap_sum != [cand1_id]:
++        _fail(f"ERROR: expected v79_fmt_sum after promo1 acts_path == [candidate_001], got={ap_sum} want={[cand1_id]}")
++
++    cert_sigs: List[str] = [str(r.get("certificate_sig") or "") for r in promo_events]
++    if len(cert_sigs) != 2 or any(not s for s in cert_sigs):
++        _fail("ERROR: missing certificate_sig(s) in promotion events")
++
++    artifacts = {
++        "goals_v79_events_jsonl_sha256": sha256_file(events_path),
++        "traces_v79_json_sha256": sha256_file(traces_path),
++        "mined_candidates_v79_json_sha256": sha256_file(mined_path),
++        "v79_promotions_jsonl_sha256": sha256_file(promos_path),
++        "compression_curve_json_sha256": sha256_file(curve_path),
++        "candidate_000_act_json_sha256": sha256_file(cand0_act),
++        "candidate_000_certificate_v2_json_sha256": sha256_file(cand0_cert),
++        "candidate_001_act_json_sha256": sha256_file(cand1_act),
++        "candidate_001_certificate_v2_json_sha256": sha256_file(cand1_cert),
++    }
++
++    return {
++        "schema_version": 1,
++        "seed": int(seed),
++        "goals_total": int(loop_res.get("goals_total", 0) or 0),
++        "goals_satisfied": int(loop_res.get("goals_satisfied", 0) or 0),
++        "promoted_total": int(loop_res.get("promoted_total", 0) or 0),
++        "budget_bits": int(budget_bits),
++        "used_bits": int(used_bits),
++        "certificate_sigs": list(cert_sigs),
++        "compression_curve_points": list(points),
++        "artifacts": dict(artifacts),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_goal_act_agent_loop_v79_match_aware_planner")
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    results: Dict[str, Any] = {"seed": seed, "tries": {}}
++    sigs: List[Tuple[Tuple[str, ...], Tuple[int, ...], int, str]] = []
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++
++        ev = smoke_try(out_dir=out_dir, seed=seed)
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        points = ev.get("compression_curve_points") if isinstance(ev.get("compression_curve_points"), list) else []
++        pts_sig = tuple(int(p.get("steps_after", 0) or 0) for p in points if isinstance(p, dict))
++        certs = tuple(str(x) for x in (ev.get("certificate_sigs") or []) if str(x))
++
++        core = {
++            "seed": int(seed),
++            "promoted_total": int(ev.get("promoted_total", 0) or 0),
++            "budget_bits": int(ev.get("budget_bits", 0) or 0),
++            "used_bits": int(ev.get("used_bits", 0) or 0),
++            "certificate_sigs": list(certs),
++            "compression_curve_points": list(points),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": str(summary_sha)}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++
++        sigs.append((certs, pts_sig, int(ev.get("promoted_total", 0) or 0), str(eval_sha)))
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(len(sigs) == 2 and sigs[0] == sigs[1] and len(summary_shas) == 2 and summary_shas[0] == summary_shas[1])
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: sigs={sigs} summary_shas={summary_shas}")
++    results["determinism"] = {
++        "ok": True,
++        "summary_sha256": summary_shas[0],
++        "certificate_sigs": list(sigs[0][0]),
++        "curve_steps_after": list(sigs[0][1]),
++        "promoted_total": sigs[0][2],
++        "sha256_eval_json": sigs[0][3],
++    }
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

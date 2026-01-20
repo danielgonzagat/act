@@ -1,0 +1,2006 @@
+--- /dev/null	2026-01-13 09:21:50
++++ atos_core/conversation_loop_v91.py	2026-01-13 09:20:23
+@@ -0,0 +1,789 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .conversation_actions_v90 import action_concepts_for_dsl_v90
++from .conversation_objectives_v90 import COMM_OBJECTIVES_V90, comm_objective_ids_v90, make_comm_objective_eq_text_v90
++from .conversation_v91 import (
++    ConversationStateV91,
++    TurnV91,
++    append_chained_jsonl_v91,
++    compute_parse_chain_hash_v91,
++    compute_state_chain_hash_v91,
++    compute_transcript_hash_v91,
++    normalize_text_v91,
++    text_sig_v91,
++    verify_chained_jsonl_v91,
++    verify_conversation_chain_v91,
++)
++from .engine_v80 import EngineV80
++from .goal_supports_v89 import SupportClaimV89, fold_support_stats_v89, list_supporting_concepts_for_goal_v89, make_goal_support_evidence_event_v89
++from .intent_grammar_v91 import (
++    INTENT_ADD_V91,
++    INTENT_END_V91,
++    INTENT_GET_V91,
++    INTENT_SET_V91,
++    INTENT_SUMMARY_V91,
++    INTENT_UNKNOWN_V91,
++    default_intent_rule_acts_v91,
++    default_intent_rules_v91,
++    grammar_hash_v91,
++    intent_grammar_snapshot_v91,
++    parse_intent_v91,
++    tokenize_user_text_v91,
++)
++from .objective_v88 import execute_objective_csv_v88
++from .store import ActStore
++
++
++def _fail(msg: str) -> None:
++    raise ValueError(msg)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"path_exists:{path}")
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _rank_action_candidates_v91(
++    *,
++    candidates: Sequence[Tuple[str, SupportClaimV89]],
++    events: Sequence[Dict[str, Any]],
++    goal_id: str,
++) -> List[Tuple[str, SupportClaimV89, float, float]]:
++    scored: List[Tuple[str, SupportClaimV89, float, float]] = []
++    for act_id, claim in candidates:
++        stats = fold_support_stats_v89(events=events, goal_id=str(goal_id), concept_key=str(act_id), claim=claim)
++        scored.append((str(act_id), claim, float(stats.expected_success), float(stats.expected_cost)))
++    scored.sort(key=lambda t: (-float(t[2]), float(t[3]), str(t[0])))
++    return scored
++
++
++def _is_int_literal(s: str) -> bool:
++    ss = str(s or "")
++    return bool(ss) and ss.isdigit()
++
++
++def _parse_int_or_var(*, vars_map: Dict[str, Any], tok: str, last_answer: Any) -> Tuple[Optional[int], str]:
++    t = str(tok or "")
++    if _is_int_literal(t):
++        return int(t), "ok"
++    if t == "last_answer":
++        try:
++            return int(last_answer), "ok"
++        except Exception:
++            return None, "missing_last_answer"
++    if t in vars_map:
++        try:
++            return int(vars_map.get(t)), "ok"
++        except Exception:
++            return None, "bad_var_type"
++    return None, "missing_key"
++
++
++def _summarize_bindings_v91(*, vars_map: Dict[str, Any], last_answer: Any) -> str:
++    parts: List[str] = []
++    for k in sorted(vars_map.keys(), key=str):
++        parts.append(f"{str(k)}={str(vars_map.get(k))}")
++    if last_answer not in ("", None):
++        parts.append(f"last_answer={str(last_answer)}")
++    return "Resumo: " + "; ".join(parts)
++
++
++def _choose_comm_objective_v91(
++    *,
++    parse: Dict[str, Any],
++    vars_map: Dict[str, Any],
++    last_answer: Any,
++) -> Tuple[str, Dict[str, Any]]:
++    """
++    Deterministic communicative objective selection.
++    Returns (objective_kind, ctx).
++    """
++    if not bool(parse.get("parse_ok", False)):
++        if str(parse.get("reason") or "") == "ambiguous":
++            return "COMM_CONFIRM", {"ambiguous": list(parse.get("ambiguous_intents") or [])}
++        # missing slots -> ask for the first missing slot deterministically
++        missing = parse.get("missing_slots")
++        missing_list = missing if isinstance(missing, list) else []
++        missing_list2 = [str(x) for x in missing_list if isinstance(x, str) and x]
++        missing_list2.sort()
++        return "COMM_ASK_CLARIFY", {"missing_slot": missing_list2[0] if missing_list2 else "", "parse_reason": str(parse.get("reason") or "")}
++
++    intent_id = str(parse.get("intent_id") or "")
++    slots = parse.get("slots") if isinstance(parse.get("slots"), dict) else {}
++    if intent_id == INTENT_SUMMARY_V91:
++        return "COMM_SUMMARIZE", {}
++    if intent_id == INTENT_END_V91:
++        return "COMM_END", {}
++    if intent_id == INTENT_GET_V91:
++        k = str(slots.get("k") or "")
++        if not k or k not in vars_map:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(k or "")}
++        return "COMM_RESPOND", {}
++    if intent_id == INTENT_SET_V91:
++        return "COMM_RESPOND", {}
++    if intent_id == INTENT_ADD_V91:
++        a = str(slots.get("a") or "")
++        b = str(slots.get("b") or "")
++        va, ra = _parse_int_or_var(vars_map=vars_map, tok=a, last_answer=last_answer)
++        if va is None:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(a), "reason": str(ra)}
++        vb, rb = _parse_int_or_var(vars_map=vars_map, tok=b, last_answer=last_answer)
++        if vb is None:
++            return "COMM_ASK_CLARIFY", {"missing_key": str(b), "reason": str(rb)}
++        return "COMM_RESPOND", {}
++    if intent_id == INTENT_UNKNOWN_V91:
++        return "COMM_CORRECT", {"reason": "intent_unknown"}
++    return "COMM_ADMIT_UNKNOWN", {"reason": "no_rule"}
++
++
++def _build_expected_and_action_inputs_v91(
++    *,
++    objective_kind: str,
++    parse: Dict[str, Any],
++    vars_map: Dict[str, Any],
++    last_answer: Any,
++    ctx: Dict[str, Any],
++    user_text: str,
++) -> Tuple[str, Dict[str, Any], str]:
++    """
++    Returns (expected_text, action_inputs, hint_action_id).
++    """
++    intent_id = str(parse.get("intent_id") or "")
++    slots = parse.get("slots") if isinstance(parse.get("slots"), dict) else {}
++
++    if objective_kind == "COMM_END":
++        return "Encerrado.", {}, "concept_v90_end_conversation_v0"
++    if objective_kind == "COMM_ADMIT_UNKNOWN":
++        return "Não sei.", {}, "concept_v90_admit_unknown_v0"
++    if objective_kind == "COMM_CORRECT":
++        msg = normalize_text_v91(str(user_text))
++        return f"Comando inválido: {msg}", {"msg": msg}, "concept_v90_correct_user_v0"
++    if objective_kind == "COMM_CONFIRM":
++        amb = ctx.get("ambiguous")
++        amb_list = amb if isinstance(amb, list) else []
++        opts = []
++        for x in amb_list:
++            if not isinstance(x, dict):
++                continue
++            rid = str(x.get("rule_id") or "")
++            iid = str(x.get("intent_id") or "")
++            if rid and iid:
++                opts.append(f"{rid}:{iid}")
++        opts = sorted(set(opts))
++        text = "Confirme: " + "; ".join(opts) if opts else "Confirme."
++        return text, {"text": text}, "concept_v90_emit_text_v0"
++    if objective_kind == "COMM_SUMMARIZE":
++        summ = _summarize_bindings_v91(vars_map=vars_map, last_answer=last_answer)
++        return summ, {"text": summ}, "concept_v90_emit_text_v0"
++    if objective_kind == "COMM_ASK_CLARIFY":
++        missing_key = str(ctx.get("missing_key") or "")
++        missing_slot = str(ctx.get("missing_slot") or "")
++        # Prefer asking for a concrete key when present.
++        if missing_key:
++            return f"Qual é o valor de {missing_key}?", {"k": missing_key}, "concept_v90_ask_clarify_v0"
++        # Missing value for SET: ask value of the known key.
++        if missing_slot == "v":
++            k = str(slots.get("k") or "")
++            if k:
++                return f"Qual é o valor de {k}?", {"k": k}, "concept_v90_ask_clarify_v0"
++        # Generic slot clarification.
++        q = f"Faltando: {missing_slot}" if missing_slot else "Faltando: dados"
++        return q, {"text": q}, "concept_v90_emit_text_v0"
++
++    # COMM_RESPOND
++    if intent_id == INTENT_SET_V91:
++        k = str(slots.get("k") or "")
++        v = str(slots.get("v") or "")
++        return f"OK: {k}={v}", {"k": k, "v": v}, "concept_v90_confirm_set_v0"
++    if intent_id == INTENT_GET_V91:
++        k = str(slots.get("k") or "")
++        v = vars_map.get(k)
++        text = f"{k}={v}"
++        return text, {"text": text}, "concept_v90_emit_text_v0"
++    if intent_id == INTENT_ADD_V91:
++        a = str(slots.get("a") or "")
++        b = str(slots.get("b") or "")
++        va, _ = _parse_int_or_var(vars_map=vars_map, tok=a, last_answer=last_answer)
++        vb, _ = _parse_int_or_var(vars_map=vars_map, tok=b, last_answer=last_answer)
++        s = int(va or 0) + int(vb or 0)
++        return f"SUM={s}", {"sum": str(s)}, "concept_v90_emit_sum_v0"
++    if intent_id == INTENT_SUMMARY_V91:
++        summ = _summarize_bindings_v91(vars_map=vars_map, last_answer=last_answer)
++        return summ, {"text": summ}, "concept_v90_emit_text_v0"
++    return "Não sei.", {}, "concept_v90_admit_unknown_v0"
++
++
++def run_conversation_v91(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++) -> Dict[str, Any]:
++    ensure_absent(str(out_dir))
++    os.makedirs(str(out_dir), exist_ok=False)
++
++    store_path = os.path.join(str(out_dir), "store.jsonl")
++    grammar_snapshot_path = os.path.join(str(out_dir), "intent_grammar_snapshot.json")
++    turns_path = os.path.join(str(out_dir), "conversation_turns.jsonl")
++    parses_path = os.path.join(str(out_dir), "intent_parses.jsonl")
++    states_path = os.path.join(str(out_dir), "conversation_states.jsonl")
++    trials_path = os.path.join(str(out_dir), "dialogue_trials.jsonl")
++    evals_path = os.path.join(str(out_dir), "objective_evals.jsonl")
++    transcript_path = os.path.join(str(out_dir), "transcript.jsonl")
++    verify_path = os.path.join(str(out_dir), "verify_chain_v91.json")
++    manifest_path = os.path.join(str(out_dir), "freeze_manifest_v91.json")
++    summary_path = os.path.join(str(out_dir), "summary.json")
++
++    store = ActStore()
++
++    # Communicative objectives (Objective CSV, V88 kind).
++    obj_ids = comm_objective_ids_v90()
++    for okind, oid in sorted(obj_ids.items(), key=lambda kv: str(kv[0])):
++        store.add(make_comm_objective_eq_text_v90(objective_id=str(oid), objective_kind=str(okind), created_step=0))
++
++    # Language actions (concept_csv).
++    goal_ids = {k: str(k) for k in COMM_OBJECTIVES_V90}
++    for act in action_concepts_for_dsl_v90(goal_ids=goal_ids):
++        store.add(act)
++
++    # Intent grammar as explicit acts (non-executable).
++    rules = default_intent_rules_v91()
++    for act in default_intent_rule_acts_v91(created_step=0):
++        store.add(act)
++
++    if os.path.exists(store_path):
++        _fail(f"store_path_exists:{store_path}")
++    store.save_jsonl(store_path)
++    store_hash = store.content_hash()
++
++    # Snapshot grammar for audit (WORM write-once).
++    if os.path.exists(grammar_snapshot_path):
++        _fail(f"grammar_snapshot_exists:{grammar_snapshot_path}")
++    grammar_snapshot = intent_grammar_snapshot_v91(rules)
++    tmpg = grammar_snapshot_path + ".tmp"
++    with open(tmpg, "w", encoding="utf-8") as f:
++        f.write(json.dumps(grammar_snapshot, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmpg, grammar_snapshot_path)
++
++    engine = EngineV80(store, seed=int(seed))
++
++    # Deterministic conversation id binds user turns + grammar hash.
++    conv_body = {"turns": list(user_turn_texts), "grammar_hash": str(grammar_hash_v91(rules))}
++    conversation_id = f"conv_v91_{sha256_hex(canonical_json_dumps(conv_body).encode('utf-8'))}"
++
++    # Runtime explicit bindings.
++    vars_map: Dict[str, Any] = {}
++    last_answer: Any = ""
++
++    turns: List[Dict[str, Any]] = []
++    states: List[Dict[str, Any]] = []
++    transcript: List[Dict[str, Any]] = []
++    parse_events: List[Dict[str, Any]] = []
++    trials: List[Dict[str, Any]] = []
++
++    prev_turns_hash: Optional[str] = None
++    prev_parses_hash: Optional[str] = None
++    prev_states_hash: Optional[str] = None
++    prev_trials_hash: Optional[str] = None
++    prev_evals_hash: Optional[str] = None
++    prev_transcript_hash: Optional[str] = None
++
++    support_events: List[Dict[str, Any]] = []
++
++    prev_state_id = ""
++    state_index = 0
++    turn_index = 0
++    step = 0
++
++    def _objective_act_id(okind: str) -> str:
++        return str(obj_ids.get(okind) or "")
++
++    def _execute_action(act_id: str, *, goal_kind: str, inputs: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], float]:
++        concept_act = store.get_concept_act(str(act_id))
++        if concept_act is None:
++            return False, "", {"ok": False, "reason": "action_not_found"}, 0.0
++        iface = concept_act.evidence.get("interface") if isinstance(concept_act.evidence, dict) else {}
++        in_schema = iface.get("input_schema") if isinstance(iface, dict) else {}
++        in_schema = in_schema if isinstance(in_schema, dict) else {}
++        inps: Dict[str, Any] = {}
++        for k in sorted(in_schema.keys(), key=str):
++            ks = str(k)
++            val = inputs.get(ks)
++            if isinstance(in_schema.get(k), str) and str(in_schema.get(k)) == "str":
++                inps[ks] = "" if val is None else str(val)
++            else:
++                inps[ks] = val
++        exec_res = engine.execute_concept_csv(
++            concept_act_id=str(act_id),
++            inputs=dict(inps),
++            goal_kind=str(goal_kind),
++            expected=None,
++            step=int(step),
++            max_depth=6,
++            max_events=256,
++            validate_output=False,
++        )
++        meta = exec_res.get("meta") if isinstance(exec_res.get("meta"), dict) else {}
++        if not bool(meta.get("ok", False)):
++            return False, "", dict(meta), 0.0
++        out_text = str(meta.get("output_text") or exec_res.get("output") or "")
++        trace = exec_res.get("trace") if isinstance(exec_res.get("trace"), dict) else {}
++        calls = trace.get("concept_calls") if isinstance(trace.get("concept_calls"), list) else []
++        cost_used = 0.0
++        for c in calls:
++            if not isinstance(c, dict):
++                continue
++            try:
++                cost_used += float(c.get("cost", 0.0) or 0.0)
++            except Exception:
++                pass
++        return True, str(out_text), dict(meta), float(cost_used)
++
++    for user_text in list(user_turn_texts):
++        # Parse user intent deterministically.
++        parse = parse_intent_v91(user_text=str(user_text), rules=list(rules))
++        tokens = parse.get("tokens")
++        tokens = tokens if isinstance(tokens, list) else tokenize_user_text_v91(str(user_text))
++
++        # Create user turn.
++        ut = TurnV91(
++            conversation_id=str(conversation_id),
++            turn_index=int(turn_index),
++            role="user",
++            text=str(user_text),
++            created_step=int(step),
++            offset_us=0,
++            parse_sig=str(parse.get("parse_sig") or ""),
++            intent_id=str(parse.get("intent_id") or ""),
++            matched_rule_id=str(parse.get("matched_rule_id") or ""),
++        ).to_dict()
++        turn_index += 1
++        step += 1
++        turns.append(dict(ut))
++        prev_turns_hash = append_chained_jsonl_v91(
++            turns_path,
++            {"time": deterministic_iso(step=int(ut["created_step"])), "step": int(ut["created_step"]), "event": "TURN", "payload": dict(ut)},
++            prev_hash=prev_turns_hash,
++        )
++        transcript.append({"role": "user", "text": str(ut.get("text") or ""), "turn_id": str(ut.get("turn_id") or "")})
++        prev_transcript_hash = append_chained_jsonl_v91(
++            transcript_path,
++            {"time": deterministic_iso(step=int(ut["created_step"])), "step": int(ut["created_step"]), "event": "UTTERANCE", "payload": dict(transcript[-1])},
++            prev_hash=prev_transcript_hash,
++        )
++
++        # Log parse (WORM, hash-chained).
++        parse_event = {
++            "kind": "intent_parse_v91",
++            "time": deterministic_iso(step=int(step)),
++            "step": int(step),
++            "turn_id": str(ut.get("turn_id") or ""),
++            "turn_index": int(ut.get("turn_index") or 0),
++            "payload": dict(parse),
++        }
++        prev_parses_hash = append_chained_jsonl_v91(parses_path, dict(parse_event), prev_hash=prev_parses_hash)
++        parse_events.append({"turn_id": str(parse_event["turn_id"]), "turn_index": int(parse_event["turn_index"]), "payload": dict(parse)})
++
++        # Determine objective kind.
++        objective_kind, ctx = _choose_comm_objective_v91(parse=parse, vars_map=dict(vars_map), last_answer=last_answer)
++
++        # Apply state updates only when safe.
++        slots = parse.get("slots") if isinstance(parse.get("slots"), dict) else {}
++        if bool(parse.get("parse_ok", False)) and not (parse.get("missing_slots") or []):
++            if str(parse.get("intent_id") or "") == INTENT_SET_V91:
++                k = str(slots.get("k") or "")
++                v = str(slots.get("v") or "")
++                if k and v:
++                    vars_map[k] = int(v) if _is_int_literal(v) else v
++            if str(parse.get("intent_id") or "") == INTENT_ADD_V91 and objective_kind == "COMM_RESPOND":
++                a = str(slots.get("a") or "")
++                b = str(slots.get("b") or "")
++                va, _ = _parse_int_or_var(vars_map=vars_map, tok=a, last_answer=last_answer)
++                vb, _ = _parse_int_or_var(vars_map=vars_map, tok=b, last_answer=last_answer)
++                if va is not None and vb is not None:
++                    last_answer = int(va) + int(vb)
++
++        # Build expected output and action inputs.
++        expected_text, action_inputs, hint_action_id = _build_expected_and_action_inputs_v91(
++            objective_kind=str(objective_kind),
++            parse=dict(parse),
++            vars_map=dict(vars_map),
++            last_answer=last_answer,
++            ctx=dict(ctx),
++            user_text=str(user_text),
++        )
++        expected_sig = text_sig_v91(expected_text)
++
++        # Pick supporting actions.
++        candidates = list_supporting_concepts_for_goal_v89(store=store, goal_id=str(objective_kind))
++        ranked = _rank_action_candidates_v91(candidates=candidates, events=support_events, goal_id=str(objective_kind))
++        ordered_action_ids: List[str] = []
++        if hint_action_id:
++            ordered_action_ids.append(str(hint_action_id))
++        for aid, _cl, _es, _ec in ranked:
++            if str(aid) not in set(ordered_action_ids):
++                ordered_action_ids.append(str(aid))
++
++        # Fallback objective cascade (deterministic).
++        fallback_objectives = ["COMM_ASK_CLARIFY", "COMM_ADMIT_UNKNOWN", "COMM_END"]
++        tried_objectives: List[str] = []
++
++        assistant_text = ""
++        chosen_action_id = ""
++        chosen_objective_id = _objective_act_id(str(objective_kind))
++        chosen_eval_id = ""
++        chosen_ok = False
++        chosen_cost = 0.0
++
++        def _try_objective(okind: str, *, ctx2: Dict[str, Any]) -> bool:
++            nonlocal assistant_text, chosen_action_id, chosen_objective_id, chosen_eval_id, chosen_ok, chosen_cost, objective_kind, expected_text, expected_sig, action_inputs, hint_action_id
++            objective_kind = str(okind)
++            chosen_objective_id = _objective_act_id(str(okind))
++            expected_text, action_inputs, hint_action_id = _build_expected_and_action_inputs_v91(
++                objective_kind=str(okind),
++                parse=dict(parse),
++                vars_map=dict(vars_map),
++                last_answer=last_answer,
++                ctx=dict(ctx2),
++                user_text=str(user_text),
++            )
++            expected_sig = text_sig_v91(expected_text)
++
++            cand2 = list_supporting_concepts_for_goal_v89(store=store, goal_id=str(okind))
++            ranked2 = _rank_action_candidates_v91(candidates=cand2, events=support_events, goal_id=str(okind))
++            ordered2: List[str] = []
++            if hint_action_id:
++                ordered2.append(str(hint_action_id))
++            for aid, _cl, _es, _ec in ranked2:
++                if str(aid) not in set(ordered2):
++                    ordered2.append(str(aid))
++
++            for act_id in ordered2:
++                ok_exec, out_text, meta, cost_used = _execute_action(act_id=str(act_id), goal_kind=str(okind), inputs=dict(action_inputs))
++                output_sig = text_sig_v91(out_text)
++                eval_id = _stable_hash_obj(
++                    {
++                        "conversation_id": str(conversation_id),
++                        "turn_id": str(ut.get("turn_id") or ""),
++                        "objective_kind": str(okind),
++                        "objective_id": str(chosen_objective_id),
++                        "act_id": str(act_id),
++                        "expected_sig": str(expected_sig),
++                        "output_sig": str(output_sig),
++                    }
++                )
++
++                if not ok_exec:
++                    verdict_ok = False
++                    verdict = {"ok": False, "score": 0, "reason": f"action_exec_failed:{str(meta.get('reason') or '')}", "details": {"meta": dict(meta)}}
++                else:
++                    verdict_obj = execute_objective_csv_v88(
++                        store=store,
++                        seed=int(seed),
++                        objective_act_id=str(chosen_objective_id),
++                        inputs={"__output": str(out_text), "expected": str(expected_text)},
++                        step=int(step),
++                        goal_kind=str(okind),
++                    )
++                    verdict = verdict_obj.to_dict()
++                    verdict_ok = bool(verdict_obj.ok)
++
++                # Record eval + trial (WORM hash-chained).
++                eval_row = {
++                    "kind": "objective_eval_v91",
++                    "time": deterministic_iso(step=int(step)),
++                    "step": int(step),
++                    "eval_id": str(eval_id),
++                    "objective_kind": str(okind),
++                    "objective_id": str(chosen_objective_id),
++                    "expected_text_sig": str(expected_sig),
++                    "output_text_sig": str(output_sig),
++                    "verdict": dict(verdict),
++                }
++                nonlocal prev_evals_hash
++                prev_evals_hash = append_chained_jsonl_v91(evals_path, dict(eval_row), prev_hash=prev_evals_hash)
++
++                trial_id = _stable_hash_obj(
++                    {
++                        "conversation_id": str(conversation_id),
++                        "turn_id": str(ut.get("turn_id") or ""),
++                        "step": int(step),
++                        "objective_kind": str(okind),
++                        "objective_id": str(chosen_objective_id),
++                        "act_id": str(act_id),
++                        "eval_id": str(eval_id),
++                    }
++                )
++                trial_row = {
++                    "kind": "dialogue_trial_v91",
++                    "time": deterministic_iso(step=int(step)),
++                    "step": int(step),
++                    "trial_id": str(trial_id),
++                    "conversation_id": str(conversation_id),
++                    "turn_id": str(ut.get("turn_id") or ""),
++                    "user_turn_id": str(ut.get("turn_id") or ""),
++                    "objective_kind": str(okind),
++                    "objective_id": str(chosen_objective_id),
++                    "action_concept_id": str(act_id),
++                    "expected_text": str(expected_text),
++                    "expected_text_sig": str(expected_sig),
++                    "assistant_text": str(out_text),
++                    "assistant_text_sig": str(output_sig),
++                    "ok": bool(verdict_ok),
++                    "cost_used": float(cost_used),
++                }
++                nonlocal prev_trials_hash
++                prev_trials_hash = append_chained_jsonl_v91(trials_path, dict(trial_row), prev_hash=prev_trials_hash)
++
++                support_ev = make_goal_support_evidence_event_v89(
++                    step=int(step),
++                    goal_id=str(okind),
++                    concept_key=str(act_id),
++                    attempt_id=str(trial_id),
++                    ok=bool(verdict_ok),
++                    cost_used=float(cost_used),
++                    note=str(verdict.get("reason") or ""),
++                )
++                support_events.append(dict(support_ev))
++
++                if verdict_ok and ok_exec:
++                    assistant_text = str(out_text)
++                    chosen_action_id = str(act_id)
++                    chosen_eval_id = str(eval_id)
++                    chosen_ok = True
++                    chosen_cost = float(cost_used)
++                    return True
++            return False
++
++        ok_done = _try_objective(str(objective_kind), ctx2=dict(ctx))
++        tried_objectives.append(str(objective_kind))
++        if not ok_done:
++            for fb in fallback_objectives:
++                if fb in set(tried_objectives):
++                    continue
++                ok_done = _try_objective(str(fb), ctx2={})
++                tried_objectives.append(str(fb))
++                if ok_done:
++                    break
++        if not ok_done:
++            _try_objective("COMM_END", ctx2={})
++
++        # Create assistant turn.
++        at = TurnV91(
++            conversation_id=str(conversation_id),
++            turn_index=int(turn_index),
++            role="assistant",
++            text=str(assistant_text),
++            created_step=int(step),
++            offset_us=1,
++            objective_id=str(chosen_objective_id),
++            objective_kind=str(objective_kind),
++            action_concept_id=str(chosen_action_id),
++            eval_id=str(chosen_eval_id),
++        ).to_dict()
++        turn_index += 1
++        step += 1
++        turns.append(dict(at))
++        prev_turns_hash = append_chained_jsonl_v91(
++            turns_path,
++            {"time": deterministic_iso(step=int(at["created_step"])), "step": int(at["created_step"]), "event": "TURN", "payload": dict(at)},
++            prev_hash=prev_turns_hash,
++        )
++        transcript.append({"role": "assistant", "text": str(at.get("text") or ""), "turn_id": str(at.get("turn_id") or "")})
++        prev_transcript_hash = append_chained_jsonl_v91(
++            transcript_path,
++            {"time": deterministic_iso(step=int(at["created_step"])), "step": int(at["created_step"]), "event": "UTTERANCE", "payload": dict(transcript[-1])},
++            prev_hash=prev_transcript_hash,
++        )
++
++        # Save trial meta for verifier (objective kind + turn ids).
++        trials.append(
++            {
++                "objective_kind": str(objective_kind),
++                "user_turn_id": str(ut.get("turn_id") or ""),
++                "assistant_turn_id": str(at.get("turn_id") or ""),
++                "ok": bool(chosen_ok),
++                "cost_used": float(chosen_cost),
++            }
++        )
++
++        # Create new state only when not a clarification/confirmation.
++        if str(objective_kind) not in {"COMM_ASK_CLARIFY", "COMM_CONFIRM"}:
++            end_idx = int(turn_index) - 1
++            start_idx = max(0, end_idx - (6 - 1))
++            tail_turn_ids = [str(turns[i]["turn_id"]) for i in range(start_idx, end_idx + 1)]
++            st = ConversationStateV91(
++                conversation_id=str(conversation_id),
++                state_index=int(state_index),
++                prev_state_id=str(prev_state_id),
++                active_goals=[],
++                bindings={
++                    "vars": {str(k): vars_map.get(k) for k in sorted(vars_map.keys(), key=str)},
++                    "last_answer": last_answer,
++                    "last_intent": str(parse.get("intent_id") or ""),
++                    "last_rule_id": str(parse.get("matched_rule_id") or ""),
++                    "last_user_text": normalize_text_v91(str(user_text)),
++                    "last_assistant_text": str(assistant_text),
++                },
++                tail_turn_ids=list(tail_turn_ids),
++                last_user_turn_id=str(ut.get("turn_id") or ""),
++                last_assistant_turn_id=str(at.get("turn_id") or ""),
++                created_step=int(step),
++                last_step=int(step),
++            ).to_dict()
++            state_index += 1
++            step += 1
++            prev_state_id = str(st.get("state_id") or "")
++            states.append(dict(st))
++            prev_states_hash = append_chained_jsonl_v91(
++                states_path,
++                {"time": deterministic_iso(step=int(st["created_step"])), "step": int(st["created_step"]), "event": "STATE", "payload": dict(st)},
++                prev_hash=prev_states_hash,
++            )
++
++        # End condition.
++        if str(parse.get("intent_id") or "") == INTENT_END_V91:
++            break
++
++    # Verify hash-chains and invariants.
++    chains = {
++        "turns_chain_ok": bool(verify_chained_jsonl_v91(turns_path)),
++        "parses_chain_ok": bool(verify_chained_jsonl_v91(parses_path)),
++        "states_chain_ok": bool(verify_chained_jsonl_v91(states_path)) if os.path.exists(states_path) else True,
++        "trials_chain_ok": bool(verify_chained_jsonl_v91(trials_path)),
++        "evals_chain_ok": bool(verify_chained_jsonl_v91(evals_path)),
++        "transcript_chain_ok": bool(verify_chained_jsonl_v91(transcript_path)),
++    }
++    ok_chain, chain_reason, chain_details = verify_conversation_chain_v91(
++        turns=list(turns),
++        states=list(states),
++        parse_events=list(parse_events),
++        trials=list(trials),
++        tail_k=6,
++    )
++
++    transcript_hash = compute_transcript_hash_v91(turns)
++    state_chain_hash = compute_state_chain_hash_v91(states)
++    parse_chain_hash = compute_parse_chain_hash_v91(parse_events)
++
++    verify_obj = {
++        "ok": bool(all(chains.values())) and bool(ok_chain),
++        "chains": dict(chains),
++        "chain_invariants": {"ok": bool(ok_chain), "reason": str(chain_reason), "details": dict(chain_details)},
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "parse_chain_hash": str(parse_chain_hash),
++    }
++    tmpv = verify_path + ".tmp"
++    with open(tmpv, "w", encoding="utf-8") as f:
++        f.write(json.dumps(verify_obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmpv, verify_path)
++
++    # Freeze manifest per try (used for determinism checks).
++    manifest_core = {
++        "schema_version": 1,
++        "conversation_id": str(conversation_id),
++        "seed": int(seed),
++        "store_hash": str(store_hash),
++        "grammar_hash": str(grammar_snapshot.get("grammar_hash") or ""),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "parse_chain_hash": str(parse_chain_hash),
++        "verify_ok": bool(verify_obj.get("ok", False)),
++        "sha256": {
++            "store_jsonl": str(sha256_file(store_path)),
++            "intent_grammar_snapshot_json": str(sha256_file(grammar_snapshot_path)),
++            "conversation_turns_jsonl": str(sha256_file(turns_path)),
++            "intent_parses_jsonl": str(sha256_file(parses_path)),
++            "conversation_states_jsonl": str(sha256_file(states_path)) if os.path.exists(states_path) else "",
++            "dialogue_trials_jsonl": str(sha256_file(trials_path)),
++            "objective_evals_jsonl": str(sha256_file(evals_path)),
++            "transcript_jsonl": str(sha256_file(transcript_path)),
++            "verify_chain_v91_json": str(sha256_file(verify_path)),
++        },
++    }
++    tmpm = manifest_path + ".tmp"
++    with open(tmpm, "w", encoding="utf-8") as f:
++        f.write(json.dumps(manifest_core, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmpm, manifest_path)
++    ledger_hash = sha256_file(manifest_path)
++
++    # Summary (deterministic, no paths).
++    user_turns_total = (len(turns) + 1) // 2 if turns else 0
++    parses_ok = sum(1 for p in parse_events if isinstance(p, dict) and isinstance(p.get("payload"), dict) and bool(p["payload"].get("parse_ok", False)))
++    clarifications = sum(1 for tr in trials if isinstance(tr, dict) and str(tr.get("objective_kind") or "") == "COMM_ASK_CLARIFY")
++    unknowns = sum(1 for p in parse_events if isinstance(p, dict) and isinstance(p.get("payload"), dict) and str(p["payload"].get("intent_id") or "") == INTENT_UNKNOWN_V91)
++    core = {
++        "schema_version": 1,
++        "seed": int(seed),
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "parse_chain_hash": str(parse_chain_hash),
++        "ledger_hash": str(ledger_hash),
++        "turns_total": int(len(turns)),
++        "user_turns_total": int(user_turns_total),
++        "states_total": int(len(states)),
++        "parses_total": int(len(parse_events)),
++        "parses_ok": int(parses_ok),
++        "clarifications": int(clarifications),
++        "unknowns": int(unknowns),
++        "verify_ok": bool(verify_obj.get("ok", False)),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    summary = dict(core, summary_sha256=str(summary_sha256))
++    tmps = summary_path + ".tmp"
++    with open(tmps, "w", encoding="utf-8") as f:
++        f.write(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmps, summary_path)
++
++    return {
++        "schema_version": 1,
++        "out_dir": str(out_dir),
++        "conversation_id": str(conversation_id),
++        "store_hash": str(store_hash),
++        "transcript_hash": str(transcript_hash),
++        "state_chain_hash": str(state_chain_hash),
++        "parse_chain_hash": str(parse_chain_hash),
++        "ledger_hash": str(ledger_hash),
++        "summary_sha256": str(summary_sha256),
++        "paths": {
++            "store_jsonl": str(store_path),
++            "intent_grammar_snapshot_json": str(grammar_snapshot_path),
++            "turns_jsonl": str(turns_path),
++            "parses_jsonl": str(parses_path),
++            "states_jsonl": str(states_path),
++            "trials_jsonl": str(trials_path),
++            "evals_jsonl": str(evals_path),
++            "transcript_jsonl": str(transcript_path),
++            "verify_json": str(verify_path),
++            "manifest_json": str(manifest_path),
++            "summary_json": str(summary_path),
++        },
++    }
+--- /dev/null	2026-01-13 09:21:50
++++ atos_core/conversation_v91.py	2026-01-13 09:16:23
+@@ -0,0 +1,431 @@
++from __future__ import annotations
++
++import copy
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _safe_deepcopy(obj: Any) -> Any:
++    try:
++        return copy.deepcopy(obj)
++    except Exception:
++        if isinstance(obj, dict):
++            return dict(obj)
++        if isinstance(obj, list):
++            return list(obj)
++        return obj
++
++
++def normalize_text_v91(text: str) -> str:
++    # Deterministic normalization without changing meaning for logs.
++    return str(text or "").replace("\r\n", "\n").strip()
++
++
++def text_sig_v91(text: str) -> str:
++    return sha256_hex(normalize_text_v91(text).encode("utf-8"))
++
++
++def turn_id_v91(*, conversation_id: str, turn_index: int, role: str, text_sig: str) -> str:
++    body = {
++        "conversation_id": str(conversation_id),
++        "turn_index": int(turn_index),
++        "role": str(role),
++        "text_sig": str(text_sig),
++    }
++    return f"turn_v91_{_stable_hash_obj(body)}"
++
++
++@dataclass(frozen=True)
++class TurnV91:
++    conversation_id: str
++    turn_index: int
++    role: str  # "user" | "assistant"
++    text: str
++    created_step: int
++    offset_us: int = 0
++    objective_id: str = ""
++    objective_kind: str = ""
++    action_concept_id: str = ""
++    eval_id: str = ""
++    parse_sig: str = ""
++    intent_id: str = ""
++    matched_rule_id: str = ""
++
++    def to_dict(self) -> Dict[str, Any]:
++        text_norm = normalize_text_v91(self.text)
++        sig = text_sig_v91(text_norm)
++        tid = turn_id_v91(
++            conversation_id=str(self.conversation_id),
++            turn_index=int(self.turn_index),
++            role=str(self.role),
++            text_sig=str(sig),
++        )
++        return {
++            "kind": "turn_v91",
++            "turn_id": str(tid),
++            "conversation_id": str(self.conversation_id),
++            "turn_index": int(self.turn_index),
++            "role": str(self.role),
++            "text": str(text_norm),
++            "text_sig": str(sig),
++            "created_step": int(self.created_step),
++            "created_at": deterministic_iso(step=int(self.created_step), offset_us=int(self.offset_us)),
++            "refs": {
++                "objective_id": str(self.objective_id or ""),
++                "objective_kind": str(self.objective_kind or ""),
++                "action_concept_id": str(self.action_concept_id or ""),
++                "eval_id": str(self.eval_id or ""),
++                "parse_sig": str(self.parse_sig or ""),
++                "intent_id": str(self.intent_id or ""),
++                "matched_rule_id": str(self.matched_rule_id or ""),
++            },
++        }
++
++
++def _canon_bindings(bindings: Any) -> Dict[str, Any]:
++    if not isinstance(bindings, dict):
++        return {}
++    out: Dict[str, Any] = {}
++    for k in sorted(bindings.keys(), key=str):
++        out[str(k)] = _safe_deepcopy(bindings.get(k))
++    return out
++
++
++def _canon_str_list(items: Any) -> List[str]:
++    if not isinstance(items, list):
++        return []
++    out: List[str] = []
++    for x in items:
++        if isinstance(x, str) and x:
++            out.append(x)
++    return sorted(set(out))
++
++
++def state_sig_v91(state_sem_sig: Dict[str, Any]) -> str:
++    return sha256_hex(canonical_json_dumps(state_sem_sig).encode("utf-8"))
++
++
++def state_id_v91(state_sig: str) -> str:
++    return f"conversation_state_v91_{str(state_sig)}"
++
++
++@dataclass(frozen=True)
++class ConversationStateV91:
++    conversation_id: str
++    state_index: int
++    prev_state_id: str
++    active_goals: List[str]
++    bindings: Dict[str, Any]
++    tail_turn_ids: List[str]
++    last_user_turn_id: str
++    last_assistant_turn_id: str
++    created_step: int
++    last_step: int
++
++    def to_dict(self) -> Dict[str, Any]:
++        sem = {
++            "schema_version": 1,
++            "kind": "conversation_state_v91",
++            "conversation_id": str(self.conversation_id),
++            "state_index": int(self.state_index),
++            "prev_state_id": str(self.prev_state_id or ""),
++            "active_goals": _canon_str_list(self.active_goals),
++            "bindings": _canon_bindings(self.bindings),
++            "tail_turn_ids": [str(x) for x in self.tail_turn_ids if isinstance(x, str) and x],
++            "last_user_turn_id": str(self.last_user_turn_id or ""),
++            "last_assistant_turn_id": str(self.last_assistant_turn_id or ""),
++            "created_step": int(self.created_step),
++            "last_step": int(self.last_step),
++            "invariants": {"schema_version": 1, "tail_k_fixed": True},
++        }
++        sig = state_sig_v91(sem)
++        sid = state_id_v91(sig)
++        return dict(sem, state_sig=str(sig), state_id=str(sid))
++
++
++def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
++    if not os.path.exists(path):
++        return iter(())
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            yield json.loads(line)
++
++
++def append_chained_jsonl_v91(path: str, entry: Dict[str, Any], *, prev_hash: Optional[str]) -> str:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    body = dict(entry)
++    body["prev_hash"] = prev_hash
++    entry_hash = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    body["entry_hash"] = entry_hash
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(body))
++        f.write("\n")
++    return entry_hash
++
++
++def verify_chained_jsonl_v91(path: str) -> bool:
++    prev: Optional[str] = None
++    for row in _read_jsonl(path):
++        row = dict(row)
++        entry_hash = row.pop("entry_hash", None)
++        if row.get("prev_hash") != prev:
++            return False
++        expected = sha256_hex(canonical_json_dumps(row).encode("utf-8"))
++        if expected != entry_hash:
++            return False
++        prev = str(entry_hash)
++    return True
++
++
++def compute_transcript_hash_v91(turns: Sequence[Dict[str, Any]]) -> str:
++    items: List[Dict[str, Any]] = []
++    for t in turns:
++        if not isinstance(t, dict):
++            continue
++        items.append(
++            {
++                "turn_index": int(t.get("turn_index", 0) or 0),
++                "role": str(t.get("role") or ""),
++                "text": str(t.get("text") or ""),
++            }
++        )
++    items.sort(key=lambda r: int(r.get("turn_index", 0) or 0))
++    view = [{"role": str(r.get("role") or ""), "text": str(r.get("text") or "")} for r in items]
++    return sha256_hex(canonical_json_dumps(view).encode("utf-8"))
++
++
++def compute_state_chain_hash_v91(states: Sequence[Dict[str, Any]]) -> str:
++    sigs: List[str] = []
++    for s in states:
++        if not isinstance(s, dict):
++            continue
++        sigs.append(str(s.get("state_sig") or ""))
++    return sha256_hex(canonical_json_dumps(sigs).encode("utf-8"))
++
++
++def compute_parse_chain_hash_v91(parse_events: Sequence[Dict[str, Any]]) -> str:
++    sigs: List[str] = []
++    for e in parse_events:
++        if not isinstance(e, dict):
++            continue
++        payload = e.get("payload")
++        if isinstance(payload, dict):
++            sigs.append(str(payload.get("parse_sig") or ""))
++    return sha256_hex(canonical_json_dumps(sigs).encode("utf-8"))
++
++
++def verify_conversation_chain_v91(
++    *,
++    turns: Sequence[Dict[str, Any]],
++    states: Sequence[Dict[str, Any]],
++    parse_events: Sequence[Dict[str, Any]],
++    trials: Sequence[Dict[str, Any]],
++    tail_k: int,
++) -> Tuple[bool, str, Dict[str, Any]]:
++    """
++    Verify V91 invariants (fail-closed, deterministic):
++      - turns turn_index contiguous 0..N-1; roles alternate user/assistant
++      - every user turn has parse_sig/intent_id refs matching parse_events
++      - states are hash-consistent, chained by prev_state_id, and tail_turn_ids are the last K turns
++      - for COMM_ASK_CLARIFY / COMM_CONFIRM trials: no state update is created for that turn
++    """
++    # Turns.
++    by_index: Dict[int, Dict[str, Any]] = {}
++    by_id: Dict[str, Dict[str, Any]] = {}
++    max_idx = -1
++    for t in turns:
++        if not isinstance(t, dict):
++            return False, "turn_not_dict", {}
++        tid = str(t.get("turn_id") or "")
++        if not tid:
++            return False, "missing_turn_id", {}
++        try:
++            idx = int(t.get("turn_index", -1))
++        except Exception:
++            idx = -1
++        if idx < 0:
++            return False, "bad_turn_index", {"turn_id": tid}
++        if idx in by_index:
++            return False, "duplicate_turn_index", {"turn_index": int(idx)}
++        by_index[int(idx)] = dict(t)
++        by_id[tid] = dict(t)
++        max_idx = max(max_idx, int(idx))
++    for i in range(0, max_idx + 1):
++        if i not in by_index:
++            return False, "missing_turn_index", {"missing_turn_index": int(i)}
++    for i in range(0, max_idx + 1):
++        role = str(by_index[i].get("role") or "")
++        want_role = "user" if (i % 2 == 0) else "assistant"
++        if role != want_role:
++            return False, "turn_role_mismatch", {"turn_index": int(i), "want": want_role, "got": role}
++
++    # Parse events: map by turn_id.
++    parses_by_turn_id: Dict[str, Dict[str, Any]] = {}
++    parse_order: List[Tuple[int, str]] = []
++    for pe in parse_events:
++        if not isinstance(pe, dict):
++            return False, "parse_event_not_dict", {}
++        tid = str(pe.get("turn_id") or "")
++        if not tid:
++            return False, "parse_event_missing_turn_id", {}
++        try:
++            tix = int(pe.get("turn_index", -1))
++        except Exception:
++            tix = -1
++        if tix < 0:
++            return False, "parse_event_bad_turn_index", {"turn_id": tid}
++        payload = pe.get("payload")
++        if not isinstance(payload, dict):
++            return False, "parse_event_missing_payload", {"turn_id": tid}
++        if tid in parses_by_turn_id:
++            return False, "duplicate_parse_event_turn_id", {"turn_id": tid}
++        parses_by_turn_id[tid] = dict(payload)
++        parse_order.append((int(tix), tid))
++
++        # Verify parse_sig matches payload hash (excluding parse_sig itself).
++        payload2 = dict(payload)
++        got_sig = str(payload2.pop("parse_sig", "") or "")
++        if not got_sig:
++            return False, "missing_parse_sig", {"turn_id": tid}
++        want_sig = sha256_hex(canonical_json_dumps(payload2).encode("utf-8"))
++        if want_sig != got_sig:
++            return False, "parse_sig_mismatch", {"turn_id": tid, "want": want_sig, "got": got_sig}
++
++    parse_order.sort(key=lambda x: (int(x[0]), str(x[1])))
++    # Parse events must exist for every user turn (even indices).
++    for i in range(0, max_idx + 1, 2):
++        t = by_index[i]
++        tid = str(t.get("turn_id") or "")
++        if tid not in parses_by_turn_id:
++            return False, "missing_parse_for_user_turn", {"turn_index": int(i), "turn_id": tid}
++        pref = t.get("refs") if isinstance(t.get("refs"), dict) else {}
++        want_parse_sig = str(pref.get("parse_sig") or "")
++        want_intent_id = str(pref.get("intent_id") or "")
++        want_rule_id = str(pref.get("matched_rule_id") or "")
++        payload = parses_by_turn_id[tid]
++        if want_parse_sig != str(payload.get("parse_sig") or ""):
++            return False, "turn_parse_sig_mismatch", {"turn_index": int(i)}
++        if want_intent_id != str(payload.get("intent_id") or ""):
++            return False, "turn_intent_id_mismatch", {"turn_index": int(i)}
++        if want_rule_id != str(payload.get("matched_rule_id") or ""):
++            return False, "turn_matched_rule_id_mismatch", {"turn_index": int(i)}
++
++    # Ensure parse_events are in increasing order by turn_index (user turns only).
++    parse_turn_indices = [int(ix) for ix, _tid in parse_order]
++    if parse_turn_indices != sorted(parse_turn_indices):
++        return False, "parse_events_not_sorted", {}
++    for ix in parse_turn_indices:
++        if ix % 2 != 0:
++            return False, "parse_event_on_non_user_turn", {"turn_index": int(ix)}
++
++    # States: chain + tail correctness.
++    if states:
++        prev_state_id = ""
++        prev_created_step = -1
++        for i, s in enumerate(states):
++            if not isinstance(s, dict):
++                return False, "state_not_dict", {"index": int(i)}
++            raw_state_index = s.get("state_index", None)
++            try:
++                got_state_index = int(raw_state_index) if raw_state_index is not None else -1
++            except Exception:
++                got_state_index = -1
++            if got_state_index != int(i):
++                return False, "state_index_not_incrementing", {"index": int(i), "got": s.get("state_index")}
++            if i == 0:
++                if str(s.get("prev_state_id") or "") not in ("", "None"):
++                    return False, "genesis_prev_state_not_empty", {"got": s.get("prev_state_id")}
++            else:
++                if str(s.get("prev_state_id") or "") != str(prev_state_id):
++                    return False, "prev_state_id_mismatch", {"index": int(i)}
++
++            raw_created_step = s.get("created_step", None)
++            raw_last_step = s.get("last_step", None)
++            try:
++                created_step = int(raw_created_step) if raw_created_step is not None else -1
++            except Exception:
++                created_step = -1
++            try:
++                last_step = int(raw_last_step) if raw_last_step is not None else -1
++            except Exception:
++                last_step = -1
++            if created_step < 0 or last_step < 0:
++                return False, "bad_step_fields", {"index": int(i)}
++            if created_step < prev_created_step:
++                return False, "created_step_not_monotonic", {"index": int(i)}
++            if last_step < created_step:
++                return False, "last_step_before_created_step", {"index": int(i)}
++
++            # Verify state_sig.
++            s2 = dict(s)
++            got_sig = str(s2.pop("state_sig", "") or "")
++            got_state_id = str(s2.pop("state_id", "") or "")
++            if not got_sig:
++                return False, "missing_state_sig", {"index": int(i)}
++            if got_state_id != state_id_v91(got_sig):
++                return False, "state_id_mismatch", {"index": int(i)}
++            want_sig = state_sig_v91(s2)
++            if want_sig != got_sig:
++                return False, "state_sig_mismatch", {"index": int(i)}
++
++            last_user_tid = str(s.get("last_user_turn_id") or "")
++            last_asst_tid = str(s.get("last_assistant_turn_id") or "")
++            if last_user_tid not in by_id or last_asst_tid not in by_id:
++                return False, "missing_last_turn_refs", {"index": int(i)}
++            tu = by_id[last_user_tid]
++            ta = by_id[last_asst_tid]
++            if str(tu.get("role") or "") != "user" or str(ta.get("role") or "") != "assistant":
++                return False, "last_turn_roles_wrong", {"index": int(i)}
++            try:
++                tu_idx = int(tu.get("turn_index", -1))
++            except Exception:
++                tu_idx = -1
++            try:
++                ta_idx = int(ta.get("turn_index", -1))
++            except Exception:
++                ta_idx = -1
++            if tu_idx < 0 or ta_idx < 0 or (ta_idx != tu_idx + 1) or (tu_idx % 2 != 0):
++                return False, "last_turn_index_pair_invalid", {"index": int(i)}
++
++            tail = s.get("tail_turn_ids")
++            tail = tail if isinstance(tail, list) else []
++            tail2 = [str(x) for x in tail if isinstance(x, str) and x]
++            if len(tail2) > int(tail_k):
++                return False, "tail_too_long", {"index": int(i)}
++            end_idx = int(ta_idx)
++            start_idx = max(0, end_idx - (int(tail_k) - 1))
++            expected_tail: List[str] = []
++            for j in range(start_idx, end_idx + 1):
++                expected_tail.append(str(by_index[int(j)].get("turn_id") or ""))
++            if tail2 != expected_tail:
++                return False, "tail_mismatch", {"index": int(i)}
++
++            prev_state_id = str(got_state_id)
++            prev_created_step = int(created_step)
++
++    # State update suppression for clarifications/confirmations.
++    clarifying = {"COMM_ASK_CLARIFY", "COMM_CONFIRM"}
++    state_turn_ids = {str(s.get("last_user_turn_id") or "") for s in states if isinstance(s, dict)}
++    for tr in trials:
++        if not isinstance(tr, dict):
++            continue
++        okind = str(tr.get("objective_kind") or "")
++        if okind not in clarifying:
++            continue
++        utid = str(tr.get("user_turn_id") or "")
++        if utid and utid in state_turn_ids:
++            return False, "state_updated_on_clarification", {"user_turn_id": utid, "objective_kind": okind}
++
++    return True, "ok", {"turns_total": int(max_idx + 1), "states_total": int(len(states)), "parses_total": int(len(parse_events))}
++
+--- /dev/null	2026-01-13 09:21:50
++++ atos_core/intent_grammar_v91.py	2026-01-13 09:14:09
+@@ -0,0 +1,488 @@
++from __future__ import annotations
++
++import unicodedata
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import Act, canonical_json_dumps, deterministic_iso, sha256_hex
++
++
++INTENT_SET_V91 = "INTENT_SET"
++INTENT_GET_V91 = "INTENT_GET"
++INTENT_ADD_V91 = "INTENT_ADD"
++INTENT_SUMMARY_V91 = "INTENT_SUMMARY"
++INTENT_END_V91 = "INTENT_END"
++INTENT_UNKNOWN_V91 = "INTENT_UNKNOWN"
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _strip_accents(text: str) -> str:
++    # Deterministic accent-folding (stdlib only).
++    s = unicodedata.normalize("NFD", str(text))
++    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
++
++
++_NUM_WORDS: Dict[str, str] = {
++    # English
++    "zero": "0",
++    "one": "1",
++    "two": "2",
++    "three": "3",
++    "four": "4",
++    "five": "5",
++    "six": "6",
++    "seven": "7",
++    "eight": "8",
++    "nine": "9",
++    "ten": "10",
++    "eleven": "11",
++    "twelve": "12",
++    "thirteen": "13",
++    "fourteen": "14",
++    "fifteen": "15",
++    "sixteen": "16",
++    "seventeen": "17",
++    "eighteen": "18",
++    "nineteen": "19",
++    "twenty": "20",
++    # Portuguese (accentless canonical)
++    "um": "1",
++    "uma": "1",
++    "dois": "2",
++    "duas": "2",
++    "tres": "3",
++    "quatro": "4",
++    "cinco": "5",
++    "seis": "6",
++    "sete": "7",
++    "oito": "8",
++    "nove": "9",
++    "dez": "10",
++    "onze": "11",
++    "doze": "12",
++    "treze": "13",
++    "catorze": "14",
++    "quatorze": "14",
++    "quinze": "15",
++    "dezesseis": "16",
++    "dezessete": "17",
++    "dezoito": "18",
++    "dezenove": "19",
++    "vinte": "20",
++    # Common polite tokens we intentionally ignore are NOT removed (fail-closed).
++}
++
++
++def normalize_user_text_v91(text: str) -> str:
++    """
++    Deterministic normalization for intent parsing:
++      - lowercase
++      - accent fold
++      - keep '=' and '+' as explicit tokens (surrounded by spaces)
++      - remove simple punctuation by turning it into whitespace
++    """
++    s = _strip_accents(str(text or "")).lower()
++    s = s.replace("=", " = ")
++    s = s.replace("+", " + ")
++    for ch in [".", ",", ";", ":", "!", "?", "(", ")", "[", "]", "{", "}", "\"", "'"]:
++        s = s.replace(ch, " ")
++    s = " ".join(x for x in s.split(" ") if x)
++    return s.strip()
++
++
++def tokenize_user_text_v91(text: str) -> List[str]:
++    toks = [t for t in normalize_user_text_v91(text).split(" ") if t]
++    out: List[str] = []
++    for t in toks:
++        tt = str(t)
++        out.append(_NUM_WORDS.get(tt, tt))
++    return out
++
++
++def lit(tok: str) -> Dict[str, str]:
++    return {"t": "lit", "v": str(tok)}
++
++
++def slot(name: str) -> Dict[str, str]:
++    return {"t": "slot", "n": str(name)}
++
++
++@dataclass(frozen=True)
++class IntentRuleV91:
++    rule_id: str
++    intent_id: str
++    pattern: List[Dict[str, str]]
++    required_slots: List[str]
++    examples: List[str]
++    rule_sig: str
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "schema_version": 1,
++            "rule_id": str(self.rule_id),
++            "intent_id": str(self.intent_id),
++            "pattern": [dict(p) for p in self.pattern],
++            "required_slots": [str(x) for x in self.required_slots],
++            "examples": [str(x) for x in self.examples],
++            "rule_sig": str(self.rule_sig),
++        }
++
++
++def make_intent_rule_v91(
++    *,
++    rule_id: str,
++    intent_id: str,
++    pattern: Sequence[Dict[str, str]],
++    required_slots: Sequence[str],
++    examples: Sequence[str],
++) -> IntentRuleV91:
++    body = {
++        "schema_version": 1,
++        "rule_id": str(rule_id),
++        "intent_id": str(intent_id),
++        "pattern": [dict(p) for p in pattern],
++        "required_slots": [str(x) for x in required_slots],
++        "examples": [str(x) for x in examples],
++    }
++    sig = _stable_hash_obj(body)
++    return IntentRuleV91(
++        rule_id=str(rule_id),
++        intent_id=str(intent_id),
++        pattern=[dict(p) for p in pattern],
++        required_slots=[str(x) for x in required_slots],
++        examples=[str(x) for x in examples],
++        rule_sig=str(sig),
++    )
++
++
++def default_intent_rules_v91() -> List[IntentRuleV91]:
++    """
++    Deterministic, minimal intent grammar (EN+PT) with stable rule_ids.
++    """
++    rules: List[IntentRuleV91] = []
++
++    # SET
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_SET_TO",
++            intent_id=INTENT_SET_V91,
++            pattern=[lit("set"), slot("k"), lit("to"), slot("v")],
++            required_slots=["k", "v"],
++            examples=["set x to 4", "set y to four"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_SET",
++            intent_id=INTENT_SET_V91,
++            pattern=[lit("set"), slot("k"), slot("v")],
++            required_slots=["k", "v"],
++            examples=["set x 4", "set y 8"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_ASSIGN",
++            intent_id=INTENT_SET_V91,
++            pattern=[slot("k"), lit("="), slot("v")],
++            required_slots=["k", "v"],
++            examples=["x = 4", "y=8"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_DEFINE_AS",
++            intent_id=INTENT_SET_V91,
++            pattern=[lit("define"), slot("k"), lit("as"), slot("v")],
++            required_slots=["k", "v"],
++            examples=["define x as 4", "define y as 8"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_DEFINA_COMO",
++            intent_id=INTENT_SET_V91,
++            pattern=[lit("defina"), slot("k"), lit("como"), slot("v")],
++            required_slots=["k", "v"],
++            examples=["defina x como 4", "defina y como 8"],
++        )
++    )
++    # Incomplete SET (missing value) -> ask clarify.
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SET_SET_MISSING_V",
++            intent_id=INTENT_SET_V91,
++            pattern=[lit("set"), slot("k")],
++            required_slots=["k", "v"],
++            examples=["set x", "set y"],
++        )
++    )
++
++    # GET
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_GET_GET",
++            intent_id=INTENT_GET_V91,
++            pattern=[lit("get"), slot("k")],
++            required_slots=["k"],
++            examples=["get x", "get y"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_GET_WHAT_IS",
++            intent_id=INTENT_GET_V91,
++            pattern=[lit("what"), lit("is"), slot("k")],
++            required_slots=["k"],
++            examples=["what is x", "what is y"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_GET_QUAL_E_O",
++            intent_id=INTENT_GET_V91,
++            pattern=[lit("qual"), lit("e"), lit("o"), slot("k")],
++            required_slots=["k"],
++            examples=["qual e o x", "qual e o y"],
++        )
++    )
++    # Incomplete GET.
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_GET_GET_MISSING_K",
++            intent_id=INTENT_GET_V91,
++            pattern=[lit("get")],
++            required_slots=["k"],
++            examples=["get", "get ?"],
++        )
++    )
++
++    # ADD
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_ADD_ADD_AND",
++            intent_id=INTENT_ADD_V91,
++            pattern=[lit("add"), slot("a"), lit("and"), slot("b")],
++            required_slots=["a", "b"],
++            examples=["add x and 10", "add 4 and 8"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_ADD_SUM_PLUS",
++            intent_id=INTENT_ADD_V91,
++            pattern=[lit("sum"), slot("a"), lit("+"), slot("b")],
++            required_slots=["a", "b"],
++            examples=["sum x + 10", "sum 4 + 8"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_ADD_SOME_E",
++            intent_id=INTENT_ADD_V91,
++            pattern=[lit("some"), slot("a"), lit("e"), slot("b")],
++            required_slots=["a", "b"],
++            examples=["some x e 10", "some 4 e 8"],
++        )
++    )
++    # Incomplete ADD.
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_ADD_ADD_MISSING_B",
++            intent_id=INTENT_ADD_V91,
++            pattern=[lit("add"), slot("a")],
++            required_slots=["a", "b"],
++            examples=["add x", "add 4"],
++        )
++    )
++
++    # SUMMARY
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SUMMARY_SUMMARY",
++            intent_id=INTENT_SUMMARY_V91,
++            pattern=[lit("summary")],
++            required_slots=[],
++            examples=["summary", "summary please"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SUMMARY_RESUMO",
++            intent_id=INTENT_SUMMARY_V91,
++            pattern=[lit("resumo")],
++            required_slots=[],
++            examples=["resumo", "resumo por favor"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_SUMMARY_SHOW_VARIABLES",
++            intent_id=INTENT_SUMMARY_V91,
++            pattern=[lit("show"), lit("variables")],
++            required_slots=[],
++            examples=["show variables", "show vars"],
++        )
++    )
++
++    # END
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_END_END",
++            intent_id=INTENT_END_V91,
++            pattern=[lit("end")],
++            required_slots=[],
++            examples=["end", "end now"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_END_QUIT",
++            intent_id=INTENT_END_V91,
++            pattern=[lit("quit")],
++            required_slots=[],
++            examples=["quit", "quit now"],
++        )
++    )
++    rules.append(
++        make_intent_rule_v91(
++            rule_id="INTENT_RULE_V91_END_FIM",
++            intent_id=INTENT_END_V91,
++            pattern=[lit("fim")],
++            required_slots=[],
++            examples=["fim", "fim."],
++        )
++    )
++
++    rules.sort(key=lambda r: str(r.rule_id))
++    return rules
++
++
++def grammar_hash_v91(rules: Sequence[IntentRuleV91]) -> str:
++    rows = [r.to_dict() for r in rules]
++    rows.sort(key=lambda d: str(d.get("rule_id") or ""))
++    return sha256_hex(canonical_json_dumps(rows).encode("utf-8"))
++
++
++def make_intent_rule_act_v91(*, rule: IntentRuleV91, created_step: int = 0) -> Act:
++    return Act(
++        id=str(rule.rule_id),
++        version=1,
++        created_at=deterministic_iso(step=int(created_step)),
++        kind="intent_rule_v91",  # type: ignore[assignment]
++        match={},
++        program=[],
++        evidence={"intent_rule_v91": rule.to_dict()},
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def default_intent_rule_acts_v91(*, created_step: int = 0) -> List[Act]:
++    return [make_intent_rule_act_v91(rule=r, created_step=int(created_step)) for r in default_intent_rules_v91()]
++
++
++def _match_pattern(pattern: Sequence[Dict[str, str]], tokens: Sequence[str]) -> Tuple[bool, Dict[str, str]]:
++    if len(pattern) != len(tokens):
++        return False, {}
++    slots: Dict[str, str] = {}
++    for p, t in zip(pattern, tokens):
++        pt = str(p.get("t") or "")
++        if pt == "lit":
++            if str(p.get("v") or "") != str(t):
++                return False, {}
++        elif pt == "slot":
++            name = str(p.get("n") or "")
++            if not name:
++                return False, {}
++            slots[name] = str(t)
++        else:
++            return False, {}
++    return True, slots
++
++
++def parse_intent_v91(*, user_text: str, rules: Sequence[IntentRuleV91]) -> Dict[str, Any]:
++    tokens = tokenize_user_text_v91(user_text)
++    matches: List[Dict[str, Any]] = []
++    for r in rules:
++        ok, slots = _match_pattern(r.pattern, tokens)
++        if not ok:
++            continue
++        missing = sorted({str(x) for x in r.required_slots if str(x) and str(x) not in slots})
++        lit_count = sum(1 for p in r.pattern if str(p.get("t") or "") == "lit")
++        match_len = int(len(r.pattern))
++        matches.append(
++            {
++                "rule": r,
++                "slots": dict(slots),
++                "missing_slots": list(missing),
++                "lit_count": int(lit_count),
++                "match_len": int(match_len),
++            }
++        )
++
++    # Deterministic best-match selection with explicit ambiguity detection.
++    if not matches:
++        sem = {
++            "schema_version": 1,
++            "intent_id": INTENT_UNKNOWN_V91,
++            "slots": {},
++            "missing_slots": [],
++            "matched_rule_id": "",
++            "parse_ok": False,
++            "reason": "no_match",
++            "tokens": list(tokens),
++        }
++        sig = _stable_hash_obj(sem)
++        return dict(sem, parse_sig=str(sig))
++
++    matches.sort(key=lambda m: (-int(m["lit_count"]), -int(m["match_len"]), str(m["rule"].rule_id)))
++    best = matches[0]
++    best_key = (int(best["lit_count"]), int(best["match_len"]))
++    tied = [m for m in matches if (int(m["lit_count"]), int(m["match_len"])) == best_key]
++
++    ambiguous_rule_ids = sorted({str(m["rule"].rule_id) for m in tied})
++    ambiguous = len(ambiguous_rule_ids) > 1
++    rbest: IntentRuleV91 = best["rule"]
++    slots_best = dict(best["slots"])
++    missing_best = list(best["missing_slots"])
++    reason = "ok"
++    parse_ok = (not ambiguous) and (not missing_best)
++    if ambiguous:
++        reason = "ambiguous"
++        parse_ok = False
++    elif missing_best:
++        reason = "missing_slots"
++        parse_ok = False
++
++    sem = {
++        "schema_version": 1,
++        "intent_id": str(rbest.intent_id) if not ambiguous else INTENT_UNKNOWN_V91,
++        "slots": dict(slots_best),
++        "missing_slots": list(missing_best),
++        "matched_rule_id": str(rbest.rule_id) if not ambiguous else "",
++        "parse_ok": bool(parse_ok),
++        "reason": str(reason),
++        "tokens": list(tokens),
++        "ambiguous_rule_ids": list(ambiguous_rule_ids) if ambiguous else [],
++        "ambiguous_intents": [
++            {"rule_id": str(m["rule"].rule_id), "intent_id": str(m["rule"].intent_id)}
++            for m in sorted(tied, key=lambda mm: str(mm["rule"].rule_id))
++        ]
++        if ambiguous
++        else [],
++    }
++    sig = _stable_hash_obj(sem)
++    return dict(sem, parse_sig=str(sig))
++
++
++def intent_grammar_snapshot_v91(rules: Sequence[IntentRuleV91]) -> Dict[str, Any]:
++    rows = [r.to_dict() for r in rules]
++    rows.sort(key=lambda d: str(d.get("rule_id") or ""))
++    ghash = sha256_hex(canonical_json_dumps(rows).encode("utf-8"))
++    return {"schema_version": 1, "grammar_hash": str(ghash), "rules": list(rows)}
++
+--- /dev/null	2026-01-13 09:21:50
++++ scripts/smoke_v91_intent_grammar_dialogue_csv.py	2026-01-13 09:19:54
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.conversation_loop_v91 import run_conversation_v91
++from atos_core.conversation_v91 import verify_conversation_chain_v91
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists (WORM): {path}")
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            rows.append(json.loads(line))
++    return rows
++
++
++def _extract_payloads(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    for r in _read_jsonl(path):
++        payload = r.get("payload")
++        if isinstance(payload, dict):
++            out.append(dict(payload))
++    return out
++
++
++def _extract_parse_events(path: str) -> List[Dict[str, Any]]:
++    events: List[Dict[str, Any]] = []
++    for r in _read_jsonl(path):
++        if not isinstance(r, dict):
++            continue
++        events.append(
++            {
++                "turn_id": str(r.get("turn_id") or ""),
++                "turn_index": int(r.get("turn_index") or 0),
++                "payload": dict(r.get("payload") or {}) if isinstance(r.get("payload"), dict) else {},
++            }
++        )
++    return events
++
++
++def _extract_trials_for_verify(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    for r in _read_jsonl(path):
++        if not isinstance(r, dict):
++            continue
++        out.append(
++            {
++                "objective_kind": str(r.get("objective_kind") or ""),
++                "user_turn_id": str(r.get("user_turn_id") or r.get("turn_id") or ""),
++            }
++        )
++    return out
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    # Fixed deterministic conversation with EN+PT paraphrases.
++    user_turns = [
++        "Set x to four",
++        "defina y como 8",
++        "sum x + 10",
++        "add last_answer and three",
++        "what is z?",
++        "set z 10",
++        "some x e z",
++        "show variables",
++        "set w",
++        "w = 2",
++        "blorp",
++        "fim",
++    ]
++    res = run_conversation_v91(user_turn_texts=list(user_turns), out_dir=str(out_dir), seed=int(seed))
++
++    turns = _extract_payloads(res["paths"]["turns_jsonl"])  # type: ignore[index]
++    states = _extract_payloads(res["paths"]["states_jsonl"])  # type: ignore[index]
++    parse_events = _extract_parse_events(res["paths"]["parses_jsonl"])  # type: ignore[index]
++    trials = _extract_trials_for_verify(res["paths"]["trials_jsonl"])  # type: ignore[index]
++
++    # Negative test: corrupt a user-turn parse_sig and ensure verify fails (fail-closed).
++    if not turns:
++        _fail("ERROR: missing turns payloads for negative test")
++    bad_turns = [dict(t) for t in turns]
++    # First user turn is turn_index 0.
++    bad_turns[0] = dict(bad_turns[0])
++    refs = bad_turns[0].get("refs")
++    refs = dict(refs) if isinstance(refs, dict) else {}
++    refs["parse_sig"] = "0" * 64
++    bad_turns[0]["refs"] = refs
++    ok_bad, reason_bad, _details_bad = verify_conversation_chain_v91(
++        turns=bad_turns, states=states, parse_events=parse_events, trials=trials, tail_k=6
++    )
++    if ok_bad:
++        _fail("ERROR: expected verify_conversation_chain_v91 to fail on corrupted turn.refs.parse_sig")
++
++    core = {
++        "store_hash": str(res.get("store_hash") or ""),
++        "transcript_hash": str(res.get("transcript_hash") or ""),
++        "state_chain_hash": str(res.get("state_chain_hash") or ""),
++        "parse_chain_hash": str(res.get("parse_chain_hash") or ""),
++        "ledger_hash": str(res.get("ledger_hash") or ""),
++        "summary_sha256": str(res.get("summary_sha256") or ""),
++        "negative_test": {"ok": True, "reason": str(reason_bad)},
++        "sha256_summary_json": sha256_file(res["paths"]["summary_json"]),  # type: ignore[index]
++    }
++    return dict(res, core=core)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    out1 = f"{out_base}_try1"
++    out2 = f"{out_base}_try2"
++    ensure_absent(out1)
++    ensure_absent(out2)
++
++    r1 = smoke_try(out_dir=out1, seed=seed)
++    r2 = smoke_try(out_dir=out2, seed=seed)
++
++    keys = ["store_hash", "transcript_hash", "state_chain_hash", "parse_chain_hash", "ledger_hash", "summary_sha256"]
++    for k in keys:
++        if str(r1.get(k) or "") != str(r2.get(k) or ""):
++            _fail(f"ERROR: determinism mismatch for {k}: try1={r1.get(k)} try2={r2.get(k)}")
++
++    out = {
++        "ok": True,
++        "seed": int(seed),
++        "determinism_ok": True,
++        "determinism": {k: str(r1.get(k) or "") for k in keys},
++        "negative_test": dict(r1.get("core", {}).get("negative_test", {})),
++        "try1": {"out_dir": str(out1), "summary_sha256": str(r1.get("summary_sha256") or "")},
++        "try2": {"out_dir": str(out2), "summary_sha256": str(r2.get("summary_sha256") or "")},
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-13 09:21:50
++++ scripts/verify_conversation_chain_v91.py	2026-01-13 09:19:19
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.conversation_v91 import verify_chained_jsonl_v91, verify_conversation_chain_v91
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _extract_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    for r in rows:
++        if not isinstance(r, dict):
++            continue
++        payload = r.get("payload")
++        if isinstance(payload, dict):
++            out.append(dict(payload))
++    return out
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run_dir", required=True)
++    args = ap.parse_args()
++
++    run_dir = str(args.run_dir)
++    turns_path = os.path.join(run_dir, "conversation_turns.jsonl")
++    parses_path = os.path.join(run_dir, "intent_parses.jsonl")
++    states_path = os.path.join(run_dir, "conversation_states.jsonl")
++    trials_path = os.path.join(run_dir, "dialogue_trials.jsonl")
++
++    rows_turns = _read_jsonl(turns_path)
++    rows_parses = _read_jsonl(parses_path)
++    rows_states = _read_jsonl(states_path) if os.path.exists(states_path) else []
++    rows_trials = _read_jsonl(trials_path)
++
++    turns = _extract_payloads(rows_turns)
++    states = _extract_payloads(rows_states)
++
++    parse_events: List[Dict[str, Any]] = []
++    for r in rows_parses:
++        if not isinstance(r, dict):
++            continue
++        parse_events.append(
++            {
++                "turn_id": str(r.get("turn_id") or ""),
++                "turn_index": int(r.get("turn_index") or 0),
++                "payload": dict(r.get("payload") or {}) if isinstance(r.get("payload"), dict) else {},
++            }
++        )
++
++    trials: List[Dict[str, Any]] = []
++    for r in rows_trials:
++        if not isinstance(r, dict):
++            continue
++        trials.append(
++            {
++                "objective_kind": str(r.get("objective_kind") or ""),
++                "user_turn_id": str(r.get("user_turn_id") or r.get("turn_id") or ""),
++            }
++        )
++
++    chains = {
++        "turns_chain_ok": bool(verify_chained_jsonl_v91(turns_path)),
++        "parses_chain_ok": bool(verify_chained_jsonl_v91(parses_path)),
++        "states_chain_ok": bool(verify_chained_jsonl_v91(states_path)) if os.path.exists(states_path) else True,
++        "trials_chain_ok": bool(verify_chained_jsonl_v91(trials_path)),
++    }
++
++    ok_inv, reason, details = verify_conversation_chain_v91(
++        turns=turns, states=states, parse_events=parse_events, trials=trials, tail_k=6
++    )
++
++    out = {
++        "ok": bool(all(chains.values())) and bool(ok_inv),
++        "chains": dict(chains),
++        "invariants": {"ok": bool(ok_inv), "reason": str(reason), "details": dict(details)},
++        "counts": {
++            "turns_total": int(len(turns)),
++            "states_total": int(len(states)),
++            "parses_total": int(len(parse_events)),
++            "trials_total": int(len(trials)),
++        },
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

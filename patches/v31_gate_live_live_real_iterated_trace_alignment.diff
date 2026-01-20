@@ -1,0 +1,1031 @@
+# 2026-01-10T18:40:43.468Z call_ebGzdxouSSbgHYQ6dlDrvMfh
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         vocab = self.vocab()
+         penalties = penalties or {}
+         merged: Dict[str, Candidate] = {}
++        predictor_iterated = 0
+         predictor_matched = 0
+         predictor_emitted = 0
+         executed_predictor_ids: List[str] = []
+         pred_list: Sequence[Act] = predictors if predictors is not None else self._predictors
+         for act in pred_list:
++            predictor_iterated += 1
+             if not self.match_act(act, context=context):
+                 continue
+             predictor_matched += 1
+@@
+         if isinstance(trace, dict):
++            trace["predictor_iterated"] = int(predictor_iterated)
+             trace["predictor_matched"] = int(predictor_matched)
+             trace["predictor_emitted"] = int(predictor_emitted)
+             trace["candidates_pre_rewrite"] = int(len(merged))
+             trace["executed_predictor_ids"] = list(executed_predictor_ids)
+         return merged
+*** End Patch
+
+# 2026-01-10T18:40:53.613Z call_17KIZuSFY2glXSn8Ougy43eL
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         trace_selected_act_ids: List[str] = []
+         trace_selected_tokens: List[str] = []
+         trace_candidates_pre: List[int] = []
+         trace_candidates_post: List[int] = []
++        trace_predictor_iterated: List[int] = []
+         trace_predictor_matched: List[int] = []
+         trace_predictor_emitted: List[int] = []
+         trace_executed_predictor_ids: List[List[str]] = []
+         trace_context_keys: List[str] = []
+*** End Patch
+
+# 2026-01-10T18:41:02.818Z call_4Lgn7xFw2MtKpJdHYnfCVBeP
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+                 "selected_act_ids": trace_selected_act_ids,
+                 "candidates_pre_rewrite": trace_candidates_pre,
+                 "candidates_post_rewrite": trace_candidates_post,
++                "predictor_iterated": trace_predictor_iterated,
+                 "predictor_matched": trace_predictor_matched,
+                 "predictor_emitted": trace_predictor_emitted,
+                 "router_live_used": trace_router_live_used,
+                 "router_live_fallback": trace_router_live_fallback,
+                 "router_live_fallback_reason": trace_router_live_fallback_reason,
+*** End Patch
+
+# 2026-01-10T18:41:35.076Z call_7eRJ30B4OZQaXfLIOAVyQ3Zg
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         trace_router_live_used: List[int] = []
+         trace_router_live_fallback: List[int] = []
+         trace_router_live_fallback_reason: List[str] = []
+         trace_router_live_allowed_predictor_ids: List[List[str]] = []
+-        trace_router_live_predictors_evaluated: List[int] = []
+-        trace_baseline_predictors_evaluated: List[int] = []
++        trace_router_live_predictors_iterated: List[int] = []
++        trace_router_live_predictors_matched: List[int] = []
++        trace_router_live_predictors_emitted: List[int] = []
++        trace_baseline_predictors_iterated: List[int] = []
++        trace_baseline_predictors_matched: List[int] = []
++        trace_baseline_predictors_emitted: List[int] = []
+         trace_router_live_mismatch: List[int] = []
+         trace_router_live_debug_baseline_token: List[str] = []
+         trace_router_live_debug_gate_token: List[str] = []
+*** End Patch
+
+# 2026-01-10T18:41:47.260Z call_sdeSxb6nHI44D7LyTAn98p5U
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+         def _apply_rewrite_rules(
+             cands: Dict[str, Candidate],
+             *,
+-            record_trace: bool,
+             context: Sequence[str],
+             penalties: Dict[str, Any],
+-        ) -> Dict[str, Candidate]:
++        ) -> Tuple[Dict[str, Candidate], List[str]]:
+             rr_hits: List[str] = []
+             top_tok = _top1_token(cands)
+             for rr in self._rewrite_rules:
+@@
+                     rr_hits.append(str(rr.id))
+                 top_tok = after_tok
+-            if record_trace:
+-                trace_rewrite_rule_hit_ids.append(rr_hits)
+-                trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
+-            return cands
++            return cands, rr_hits
+*** End Patch
+
+# 2026-01-10T18:45:36.430Z call_6ofYz6tZQJmQ1gkjgbIF2G9z
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+-        for i in range(int(max_new_tokens)):
+-            ck = ctx_key(context)
+-            trace_context_keys.append(ck)
+-            penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+-
+-            router_live_enabled = bool(self.config.router_live_enabled)
+-            router_debug = bool(self.config.router_live_debug_compare)
+-
+-            router_used = False
+-            router_fallback = False
+-            router_fallback_reason = ""
+-            allowed_predictor_ids: List[str] = []
+-            gated_predictors: Optional[List[Act]] = None
+-
+-            if router_live_enabled:
+-                table = self._macro_router_table
+-                if table is None or not isinstance(table, dict):
+-                    router_fallback = True
+-                    router_fallback_reason = "router_missing"
+-                else:
+-                    ctx_sig = f"{mode_state}{SEP}{ck}"
+-                    entry = table.get(ctx_sig)
+-                    if isinstance(entry, dict):
+-                        preds = entry.get("predictors") or []
+-                        if isinstance(preds, list):
+-                            allowed_predictor_ids = [
+-                                str(x) for x in preds if isinstance(x, str) and x
+-                            ]
+-                    if allowed_predictor_ids:
+-                        present = [
+-                            pid for pid in allowed_predictor_ids if pid in self._predictor_by_id
+-                        ]
+-                        if present:
+-                            present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
+-                            gated_predictors = [self._predictor_by_id[pid] for pid in present]
+-                        else:
+-                            router_fallback = True
+-                            router_fallback_reason = "allowed_missing"
+-                    else:
+-                        router_fallback = True
+-                        router_fallback_reason = "missing_ctx"
+-
+-            emit_gate: Optional[Dict[str, Any]] = None
+-            cand_gate: Optional[Dict[str, Candidate]] = None
+-            if gated_predictors is not None:
+-                emit_gate = {}
+-                cand_gate = self._emit_candidates(
+-                    context=context, penalties=penalties, predictors=gated_predictors, trace=emit_gate
+-                )
+-                if int(emit_gate.get("predictor_emitted", 0) or 0) <= 0:
+-                    router_fallback = True
+-                    router_fallback_reason = "gate_empty_emit"
+-                    emit_gate = None
+-                    cand_gate = None
+-
+-            emit_base: Optional[Dict[str, Any]] = None
+-            cand_base: Optional[Dict[str, Candidate]] = None
+-            if router_debug or (router_live_enabled and cand_gate is None):
+-                emit_base = {}
+-                cand_base = self._emit_candidates(context=context, penalties=penalties, trace=emit_base)
+-
+-            mismatch = False
+-            baseline_tok = ""
+-            gate_tok = ""
+-            if router_debug and cand_gate is not None and cand_base is not None:
+-                base_after = _apply_rewrite_rules(
+-                    cand_base, record_trace=False, context=context, penalties=penalties
+-                )
+-                gate_after = _apply_rewrite_rules(
+-                    cand_gate, record_trace=False, context=context, penalties=penalties
+-                )
+-                b_nxt = _select_next(base_after, context=context, penalties=penalties)
+-                g_nxt = _select_next(gate_after, context=context, penalties=penalties)
+-                baseline_tok = str(b_nxt or "")
+-                gate_tok = str(g_nxt or "")
+-                mismatch = bool(b_nxt != g_nxt)
+-                if mismatch:
+-                    router_fallback = True
+-                    router_fallback_reason = "mismatch"
+-                    emit_gate = None
+-                    cand_gate = None
+-
+-            emit_trace: Dict[str, Any] = {}
+-            candidates: Dict[str, Candidate] = {}
+-            if cand_gate is not None and emit_gate is not None and not router_fallback:
+-                router_used = True
+-                emit_trace = emit_gate
+-                candidates = cand_gate
+-            else:
+-                router_used = False
+-                if router_live_enabled and not router_fallback:
+-                    router_fallback = True
+-                    router_fallback_reason = "no_gate"
+-                if cand_base is None or emit_base is None:
+-                    emit_base = {}
+-                    cand_base = self._emit_candidates(
+-                        context=context, penalties=penalties, trace=emit_base
+-                    )
+-                emit_trace = emit_base
+-                candidates = cand_base
+-
+-            exec_pred = emit_trace.get("executed_predictor_ids") or []
+-            if isinstance(exec_pred, list):
+-                trace_executed_predictor_ids.append([str(x) for x in exec_pred if isinstance(x, str)])
+-            else:
+-                trace_executed_predictor_ids.append([])
+-
+-            candidates = _apply_rewrite_rules(
+-                candidates, record_trace=True, context=context, penalties=penalties
+-            )
+-
+-            # EOS guardrail
+-            if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
+-                candidates["<EOS>"].score -= 1e6
+-
+-            if not candidates:
+-                break
+-
+-            trace_predictor_matched.append(int(emit_trace.get("predictor_matched", 0) or 0))
+-            trace_predictor_emitted.append(int(emit_trace.get("predictor_emitted", 0) or 0))
+-            trace_candidates_pre.append(int(emit_trace.get("candidates_pre_rewrite", len(candidates)) or 0))
+-            trace_candidates_post.append(int(len(candidates)))
+-
+-            trace_router_live_used.append(1 if router_used else 0)
+-            trace_router_live_fallback.append(1 if router_fallback else 0)
+-            trace_router_live_fallback_reason.append(str(router_fallback_reason))
+-            trace_router_live_allowed_predictor_ids.append(list(allowed_predictor_ids))
+-            trace_router_live_predictors_evaluated.append(int(emit_trace.get("predictor_matched", 0) or 0))
+-            trace_baseline_predictors_evaluated.append(
+-                int((emit_base or {}).get("predictor_matched", 0) or 0) if router_debug else 0
+-            )
+-            trace_router_live_mismatch.append(1 if mismatch else 0)
+-            trace_router_live_debug_baseline_token.append(baseline_tok)
+-            trace_router_live_debug_gate_token.append(gate_tok)
+-
+-            nxt = _select_next(candidates, context=context, penalties=penalties)
+-
+-            if nxt == "<EOS>":
+-                break
+-
+-            src_act = candidates.get(nxt).source_act if nxt in candidates else "__unknown__"
+-            trace_selected_act_ids.append(str(src_act))
+-            trace_selected_tokens.append(str(nxt))
+-
+-            gen_tokens.append(nxt)
++        for i in range(int(max_new_tokens)):
++            ck = ctx_key(context)
++            penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
++
++            router_live_enabled = bool(self.config.router_live_enabled)
++            router_debug = bool(self.config.router_live_debug_compare)
++
++            router_used = False
++            router_fallback = False
++            router_fallback_reason = ""
++            allowed_predictor_ids: List[str] = []
++            gated_predictors: Optional[List[Act]] = None
++
++            if router_live_enabled:
++                table = self._macro_router_table
++                if table is None or not isinstance(table, dict):
++                    router_fallback = True
++                    router_fallback_reason = "router_missing"
++                else:
++                    ctx_sig = f"{mode_state}{SEP}{ck}"
++                    entry = table.get(ctx_sig)
++                    if isinstance(entry, dict):
++                        preds = entry.get("predictors") or []
++                        if isinstance(preds, list):
++                            allowed_predictor_ids = [
++                                str(x) for x in preds if isinstance(x, str) and x
++                            ]
++                    if allowed_predictor_ids:
++                        present = [
++                            pid for pid in allowed_predictor_ids if pid in self._predictor_by_id
++                        ]
++                        if present:
++                            present.sort(key=lambda pid: self._predictor_order.get(pid, 0))
++                            gated_predictors = [self._predictor_by_id[pid] for pid in present]
++                        else:
++                            router_fallback = True
++                            router_fallback_reason = "allowed_missing"
++                    else:
++                        router_fallback = True
++                        router_fallback_reason = "missing_ctx"
++
++            emit_gate: Optional[Dict[str, Any]] = None
++            cand_gate: Optional[Dict[str, Candidate]] = None
++            if gated_predictors is not None:
++                emit_gate = {}
++                cand_gate = self._emit_candidates(
++                    context=context,
++                    penalties=penalties,
++                    predictors=gated_predictors,
++                    trace=emit_gate,
++                )
++                if int(emit_gate.get("predictor_emitted", 0) or 0) <= 0:
++                    router_fallback = True
++                    router_fallback_reason = "gate_empty_emit"
++                    emit_gate = None
++                    cand_gate = None
++
++            emit_base: Optional[Dict[str, Any]] = None
++            cand_base: Optional[Dict[str, Candidate]] = None
++            if router_debug or (router_live_enabled and cand_gate is None):
++                emit_base = {}
++                cand_base = self._emit_candidates(
++                    context=context, penalties=penalties, trace=emit_base
++                )
++
++            mismatch = False
++            baseline_tok = ""
++            gate_tok = ""
++            if router_debug and cand_gate is not None and cand_base is not None:
++                base_after, _ = _apply_rewrite_rules(
++                    cand_base, context=context, penalties=penalties
++                )
++                gate_after, _ = _apply_rewrite_rules(
++                    cand_gate, context=context, penalties=penalties
++                )
++                b_nxt = _select_next(base_after, context=context, penalties=penalties)
++                g_nxt = _select_next(gate_after, context=context, penalties=penalties)
++                baseline_tok = str(b_nxt or "")
++                gate_tok = str(g_nxt or "")
++                mismatch = bool(b_nxt != g_nxt)
++                if mismatch:
++                    router_fallback = True
++                    router_fallback_reason = "mismatch"
++                    emit_gate = None
++                    cand_gate = None
++
++            emit_trace: Dict[str, Any] = {}
++            candidates: Dict[str, Candidate] = {}
++            if cand_gate is not None and emit_gate is not None and not router_fallback:
++                router_used = True
++                emit_trace = emit_gate
++                candidates = cand_gate
++            else:
++                router_used = False
++                if router_live_enabled and not router_fallback:
++                    router_fallback = True
++                    router_fallback_reason = "no_gate"
++                if cand_base is None or emit_base is None:
++                    emit_base = {}
++                    cand_base = self._emit_candidates(
++                        context=context, penalties=penalties, trace=emit_base
++                    )
++                emit_trace = emit_base
++                candidates = cand_base
++
++            exec_pred = emit_trace.get("executed_predictor_ids") or []
++            exec_pred_ids: List[str] = []
++            if isinstance(exec_pred, list):
++                exec_pred_ids = [str(x) for x in exec_pred if isinstance(x, str)]
++
++            pred_iter = int(emit_trace.get("predictor_iterated", 0) or 0)
++            pred_mat = int(emit_trace.get("predictor_matched", 0) or 0)
++            pred_emit = int(emit_trace.get("predictor_emitted", 0) or 0)
++            cand_pre = int(emit_trace.get("candidates_pre_rewrite", len(candidates)) or 0)
++
++            base_iter = 0
++            base_mat = 0
++            base_emit = 0
++            if isinstance(emit_base, dict):
++                base_iter = int(emit_base.get("predictor_iterated", 0) or 0)
++                base_mat = int(emit_base.get("predictor_matched", 0) or 0)
++                base_emit = int(emit_base.get("predictor_emitted", 0) or 0)
++
++            candidates, rr_hits = _apply_rewrite_rules(
++                candidates, context=context, penalties=penalties
++            )
++
++            # EOS guardrail
++            if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
++                candidates["<EOS>"].score -= 1e6
++
++            if not candidates:
++                break
++
++            nxt = _select_next(candidates, context=context, penalties=penalties)
++            if nxt is None or nxt == "<EOS>":
++                break
++
++            src_act = candidates.get(nxt).source_act if nxt in candidates else "__unknown__"
++
++            # Align trace arrays exactly to emitted tokens (no EOS attempt row).
++            trace_context_keys.append(ck)
++            trace_executed_predictor_ids.append(exec_pred_ids)
++            trace_rewrite_rule_hit_ids.append(rr_hits)
++            trace_rewrite_rules_changed_count.append(int(len(rr_hits)))
++
++            trace_predictor_iterated.append(pred_iter)
++            trace_predictor_matched.append(pred_mat)
++            trace_predictor_emitted.append(pred_emit)
++            trace_candidates_pre.append(cand_pre)
++            trace_candidates_post.append(int(len(candidates)))
++
++            trace_router_live_used.append(1 if router_used else 0)
++            trace_router_live_fallback.append(1 if router_fallback else 0)
++            trace_router_live_fallback_reason.append(str(router_fallback_reason))
++            trace_router_live_allowed_predictor_ids.append(list(allowed_predictor_ids))
++            trace_router_live_predictors_iterated.append(pred_iter)
++            trace_router_live_predictors_matched.append(pred_mat)
++            trace_router_live_predictors_emitted.append(pred_emit)
++            trace_baseline_predictors_iterated.append(base_iter if router_debug else 0)
++            trace_baseline_predictors_matched.append(base_mat if router_debug else 0)
++            trace_baseline_predictors_emitted.append(base_emit if router_debug else 0)
++            trace_router_live_mismatch.append(1 if mismatch else 0)
++            trace_router_live_debug_baseline_token.append(baseline_tok)
++            trace_router_live_debug_gate_token.append(gate_tok)
++
++            trace_selected_act_ids.append(str(src_act))
++            trace_selected_tokens.append(str(nxt))
++
++            gen_tokens.append(nxt)
+             # Update history sets for cycle penalties (filtered, space-free).
+             filtered = [x for x in (out_tokens + gen_tokens) if x not in {"<BOS>"}]
+             n = self.config.cycle_ngram
+             if len(filtered) >= n:
+*** End Patch
+
+# 2026-01-10T18:45:53.307Z call_141HRahN9iBEobK2s0gxrXPo
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+                 "router_live_used": trace_router_live_used,
+                 "router_live_fallback": trace_router_live_fallback,
+                 "router_live_fallback_reason": trace_router_live_fallback_reason,
+                 "router_live_allowed_predictor_ids": trace_router_live_allowed_predictor_ids,
+-                "router_live_predictors_evaluated": trace_router_live_predictors_evaluated,
+-                "baseline_predictors_evaluated": trace_baseline_predictors_evaluated,
++                "router_live_predictors_iterated": trace_router_live_predictors_iterated,
++                "router_live_predictors_matched": trace_router_live_predictors_matched,
++                "router_live_predictors_emitted": trace_router_live_predictors_emitted,
++                "baseline_predictors_iterated": trace_baseline_predictors_iterated,
++                "baseline_predictors_matched": trace_baseline_predictors_matched,
++                "baseline_predictors_emitted": trace_baseline_predictors_emitted,
+                 "router_live_mismatch": trace_router_live_mismatch,
+                 "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
+                 "router_live_debug_gate_token": trace_router_live_debug_gate_token,
+             },
+*** End Patch
+
+# 2026-01-10T18:48:26.905Z call_p4MrT51X44Ed8gDImLmbexn5
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+ from atos_core.engine import Engine, EngineConfig
++from atos_core.metrics import tokenize_text
+ from atos_core.store import ActStore
+ from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
+*** End Patch
+
+# 2026-01-10T18:50:56.247Z call_MeW0POwYPt2bKfoN8WJnGxUa
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+ #!/usr/bin/env python3
+ from __future__ import annotations
+ 
+ import argparse
+ import hashlib
+ import json
+ import os
+ import sys
+-from typing import Any, Dict, List, Optional, Sequence, Tuple
++from collections import Counter
++from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from atos_core.engine import Engine, EngineConfig
+ from atos_core.metrics import tokenize_text
+ from atos_core.store import ActStore
+ from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
+@@
+ def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
+     return "\n".join(str(r.get("full_text", "")) for r in transcripts)
+ 
+ 
+ def _safe_int(x: Any) -> int:
+     try:
+         return int(x)
+     except Exception:
+         return 0
+ 
+ 
+-def sum_metric_over_selected_tokens(
+-    transcripts: Sequence[Dict[str, Any]], *, metric_key: str
+-) -> Tuple[int, int]:
+-    total = 0
+-    tokens = 0
+-    for rec in transcripts:
+-        turns = rec.get("turns", [])
+-        if not isinstance(turns, list):
+-            continue
+-        for t in turns:
+-            tr = (t.get("trace") or {}) if isinstance(t, dict) else {}
+-            if not isinstance(tr, dict):
+-                continue
+-            winners = tr.get("selected_source_act_ids") or []
+-            if not isinstance(winners, list):
+-                continue
+-            L = int(len(winners))
+-            vals = tr.get(metric_key) or []
+-            if not isinstance(vals, list):
+-                vals = []
+-            for i in range(min(L, len(vals))):
+-                total += _safe_int(vals[i])
+-            tokens += L
+-    return total, tokens
++def _require_aligned_list(
++    tr: Dict[str, Any], *, key: str, want_len: int, where: str
++) -> List[Any]:
++    v = tr.get(key)
++    if not isinstance(v, list):
++        raise ValueError(f"{where}: trace[{key}] is not a list")
++    if len(v) != int(want_len):
++        raise ValueError(f"{where}: len(trace[{key}])={len(v)} != {int(want_len)}")
++    return v
++
++
++def sum_trace_metric(transcripts: Sequence[Dict[str, Any]], *, metric_key: str) -> Tuple[int, int]:
++    total = 0
++    tokens = 0
++    for rec in transcripts:
++        pid = rec.get("prompt_id")
++        turns = rec.get("turns", [])
++        if not isinstance(turns, list):
++            continue
++        for turn_idx, t in enumerate(turns):
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            winners = tr.get("selected_source_act_ids") or []
++            if not isinstance(winners, list):
++                continue
++            L = int(len(winners))
++            where = f"prompt_id={pid} turn={turn_idx}"
++            vals = _require_aligned_list(tr, key=metric_key, want_len=L, where=where)
++            total += int(sum(_safe_int(x) for x in vals))
++            tokens += L
++    return total, tokens
++
++
++def first_token_diff(
++    baseline: Sequence[Dict[str, Any]], gate: Sequence[Dict[str, Any]]
++) -> Optional[Dict[str, Any]]:
++    base_by: Dict[int, Dict[str, Any]] = {}
++    gate_by: Dict[int, Dict[str, Any]] = {}
++    for rec in baseline:
++        try:
++            base_by[int(rec.get("prompt_id", -1))] = rec
++        except Exception:
++            continue
++    for rec in gate:
++        try:
++            gate_by[int(rec.get("prompt_id", -1))] = rec
++        except Exception:
++            continue
++
++    all_ids = sorted(set(base_by.keys()) | set(gate_by.keys()))
++    for pid in all_ids:
++        b = base_by.get(pid)
++        g = gate_by.get(pid)
++        if b is None or g is None:
++            return {
++                "prompt_id": int(pid),
++                "turn": 0,
++                "token_index": 0,
++                "baseline_token": "<MISSING_PROMPT>",
++                "gate_token": "<MISSING_PROMPT>",
++            }
++
++        b_turns = b.get("turns", [])
++        g_turns = g.get("turns", [])
++        if not isinstance(b_turns, list) or not isinstance(g_turns, list):
++            continue
++
++        n_turns = max(len(b_turns), len(g_turns))
++        for turn_idx in range(n_turns):
++            bt = b_turns[turn_idx] if turn_idx < len(b_turns) else {}
++            gt = g_turns[turn_idx] if turn_idx < len(g_turns) else {}
++            b_sys = str(bt.get("system", "")) if isinstance(bt, dict) else ""
++            g_sys = str(gt.get("system", "")) if isinstance(gt, dict) else ""
++            b_toks = tokenize_text(b_sys)
++            g_toks = tokenize_text(g_sys)
++            m = min(len(b_toks), len(g_toks))
++            for i in range(m):
++                if b_toks[i] != g_toks[i]:
++                    return {
++                        "prompt_id": int(pid),
++                        "turn": int(turn_idx),
++                        "token_index": int(i),
++                        "baseline_token": str(b_toks[i]),
++                        "gate_token": str(g_toks[i]),
++                    }
++            if len(b_toks) != len(g_toks):
++                b_tok = str(b_toks[m]) if m < len(b_toks) else "<END>"
++                g_tok = str(g_toks[m]) if m < len(g_toks) else "<END>"
++                return {
++                    "prompt_id": int(pid),
++                    "turn": int(turn_idx),
++                    "token_index": int(m),
++                    "baseline_token": b_tok,
++                    "gate_token": g_tok,
++                }
++    return None
+@@
+ def collect_gate_live_metrics(
+     transcripts: Sequence[Dict[str, Any]]
+ ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+-    total_tokens = 0
+-    covered = 0
+-    winner_ok = 0
+-    fastpath = 0
+-    fallbacks = 0
+-    mismatches = 0
+-
+-    live_eval_sum = 0
+-    baseline_eval_sum_dbg = 0
+-
+-    examples: List[Dict[str, Any]] = []
++    total_tokens = 0
++    covered = 0
++    winner_ok = 0
++    fastpath = 0
++    fallbacks = 0
++    mismatches = 0
++
++    it_sum = 0
++    matched_sum = 0
++    emitted_sum = 0
++    dbg_base_it_sum = 0
++    dbg_base_mat_sum = 0
++    dbg_base_emit_sum = 0
++
++    reason_counts: Counter = Counter()
++    examples: List[Dict[str, Any]] = []
+ 
+     for rec in transcripts:
+         pid = rec.get("prompt_id")
+         turns = rec.get("turns", [])
+@@
+             winners = tr.get("selected_source_act_ids") or []
+             if not isinstance(winners, list):
+                 continue
+             L = int(len(winners))
+             if L <= 0:
+                 continue
+-
+-            allowed = tr.get("router_live_allowed_predictor_ids") or []
+-            used = tr.get("router_live_used") or []
+-            fallback = tr.get("router_live_fallback") or []
+-            mismatch = tr.get("router_live_mismatch") or []
+-            live_eval = tr.get("router_live_predictors_evaluated") or tr.get("predictor_matched") or []
+-            base_eval_dbg = tr.get("baseline_predictors_evaluated") or []
+-            ctx_keys = tr.get("context_keys") or []
+-            dbg_base_tok = tr.get("router_live_debug_baseline_token") or []
+-            dbg_gate_tok = tr.get("router_live_debug_gate_token") or []
+-
+-            if not isinstance(allowed, list):
+-                allowed = []
+-            if not isinstance(used, list):
+-                used = []
+-            if not isinstance(fallback, list):
+-                fallback = []
+-            if not isinstance(mismatch, list):
+-                mismatch = []
+-            if not isinstance(live_eval, list):
+-                live_eval = []
+-            if not isinstance(base_eval_dbg, list):
+-                base_eval_dbg = []
+-            if not isinstance(ctx_keys, list):
+-                ctx_keys = []
+-            if not isinstance(dbg_base_tok, list):
+-                dbg_base_tok = []
+-            if not isinstance(dbg_gate_tok, list):
+-                dbg_gate_tok = []
+-
+-            for i in range(L):
+-                total_tokens += 1
+-
+-                # Coverage/winner-in-allowed (ctx_sig exists => allowed list non-empty)
+-                a: List[str] = []
+-                if i < len(allowed) and isinstance(allowed[i], list):
+-                    a = [str(x) for x in allowed[i] if isinstance(x, str) and x]
+-                if a:
+-                    covered += 1
+-                    if isinstance(winners[i], str) and winners[i] in set(a):
+-                        winner_ok += 1
+-
+-                if i < len(used) and _safe_int(used[i]) == 1:
+-                    fastpath += 1
+-                if i < len(fallback) and _safe_int(fallback[i]) == 1:
+-                    fallbacks += 1
+-                if i < len(live_eval):
+-                    live_eval_sum += _safe_int(live_eval[i])
+-                if i < len(base_eval_dbg):
+-                    baseline_eval_sum_dbg += _safe_int(base_eval_dbg[i])
+-
+-                is_mm = i < len(mismatch) and _safe_int(mismatch[i]) == 1
+-                if is_mm:
+-                    mismatches += 1
+-                    if len(examples) < 3:
+-                        examples.append(
+-                            {
+-                                "prompt_id": pid,
+-                                "turn": int(turn_idx),
+-                                "token_index": int(i),
+-                                "mode": str(t.get("mode") or "default"),
+-                                "ctx_key": str(ctx_keys[i]) if i < len(ctx_keys) else "",
+-                                "baseline_token": str(dbg_base_tok[i]) if i < len(dbg_base_tok) else "",
+-                                "gate_token": str(dbg_gate_tok[i]) if i < len(dbg_gate_tok) else "",
+-                                "fallback_reason": str(
+-                                    (tr.get("router_live_fallback_reason") or [""])[i]
+-                                    if isinstance(tr.get("router_live_fallback_reason"), list)
+-                                    and i < len(tr.get("router_live_fallback_reason") or [])
+-                                    else ""
+-                                ),
+-                            }
+-                        )
++
++            where = f"prompt_id={pid} turn={turn_idx}"
++            allowed = _require_aligned_list(
++                tr, key="router_live_allowed_predictor_ids", want_len=L, where=where
++            )
++            used = _require_aligned_list(tr, key="router_live_used", want_len=L, where=where)
++            fallback = _require_aligned_list(tr, key="router_live_fallback", want_len=L, where=where)
++            reasons = _require_aligned_list(
++                tr, key="router_live_fallback_reason", want_len=L, where=where
++            )
++            mismatch = _require_aligned_list(tr, key="router_live_mismatch", want_len=L, where=where)
++            it = _require_aligned_list(tr, key="predictor_iterated", want_len=L, where=where)
++            matched = _require_aligned_list(tr, key="predictor_matched", want_len=L, where=where)
++            emitted = _require_aligned_list(tr, key="predictor_emitted", want_len=L, where=where)
++            ctx_keys = _require_aligned_list(tr, key="context_keys", want_len=L, where=where)
++            dbg_base_tok = _require_aligned_list(
++                tr, key="router_live_debug_baseline_token", want_len=L, where=where
++            )
++            dbg_gate_tok = _require_aligned_list(
++                tr, key="router_live_debug_gate_token", want_len=L, where=where
++            )
++            dbg_base_it = _require_aligned_list(
++                tr, key="baseline_predictors_iterated", want_len=L, where=where
++            )
++            dbg_base_mat = _require_aligned_list(
++                tr, key="baseline_predictors_matched", want_len=L, where=where
++            )
++            dbg_base_emit = _require_aligned_list(
++                tr, key="baseline_predictors_emitted", want_len=L, where=where
++            )
++
++            for i in range(L):
++                total_tokens += 1
++
++                it_sum += _safe_int(it[i])
++                matched_sum += _safe_int(matched[i])
++                emitted_sum += _safe_int(emitted[i])
++                dbg_base_it_sum += _safe_int(dbg_base_it[i])
++                dbg_base_mat_sum += _safe_int(dbg_base_mat[i])
++                dbg_base_emit_sum += _safe_int(dbg_base_emit[i])
++
++                a: List[str] = []
++                if isinstance(allowed[i], list):
++                    a = [str(x) for x in allowed[i] if isinstance(x, str) and x]
++                if a:
++                    covered += 1
++                    if isinstance(winners[i], str) and winners[i] in set(a):
++                        winner_ok += 1
++
++                if _safe_int(used[i]) == 1:
++                    fastpath += 1
++                if _safe_int(fallback[i]) == 1:
++                    fallbacks += 1
++                    r = str(reasons[i] or "")
++                    reason_counts[r] += 1
++
++                is_mm = _safe_int(mismatch[i]) == 1
++                if is_mm:
++                    mismatches += 1
++                    if len(examples) < 3:
++                        examples.append(
++                            {
++                                "prompt_id": pid,
++                                "turn": int(turn_idx),
++                                "token_index": int(i),
++                                "mode": str(t.get("mode") or "default"),
++                                "ctx_key": str(ctx_keys[i]),
++                                "baseline_token": str(dbg_base_tok[i]),
++                                "gate_token": str(dbg_gate_tok[i]),
++                                "fallback_reason": str(reasons[i] or ""),
++                            }
++                        )
+ 
+     metrics: Dict[str, Any] = {
+         "tokens": int(total_tokens),
+         "coverage_rate": float(covered / max(1, total_tokens)),
+         "winner_in_allowed_rate": float(winner_ok / max(1, total_tokens)),
+         "live_fastpath_rate": float(fastpath / max(1, total_tokens)),
+         "live_fallback_rate": float(fallbacks / max(1, total_tokens)),
+         "live_mismatch_rate": float(mismatches / max(1, total_tokens)),
+         "mismatch_count": int(mismatches),
+-        "live_predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, total_tokens)),
+-        "debug_baseline_predictors_evaluated_per_token_mean": float(
+-            baseline_eval_sum_dbg / max(1, total_tokens)
+-        ),
++        "fallback_reason_counts": {k: int(v) for k, v in sorted(reason_counts.items()) if k},
++        "predictors_iterated_sum": int(it_sum),
++        "predictors_iterated_per_token_mean": float(it_sum / max(1, total_tokens)),
++        "predictors_matched_sum": int(matched_sum),
++        "predictors_matched_per_token_mean": float(matched_sum / max(1, total_tokens)),
++        "predictors_emitted_sum": int(emitted_sum),
++        "predictors_emitted_per_token_mean": float(emitted_sum / max(1, total_tokens)),
++        "debug_baseline_predictors_iterated_sum": int(dbg_base_it_sum),
++        "debug_baseline_predictors_iterated_per_token_mean": float(
++            dbg_base_it_sum / max(1, total_tokens)
++        ),
++        "debug_baseline_predictors_matched_sum": int(dbg_base_mat_sum),
++        "debug_baseline_predictors_matched_per_token_mean": float(
++            dbg_base_mat_sum / max(1, total_tokens)
++        ),
++        "debug_baseline_predictors_emitted_sum": int(dbg_base_emit_sum),
++        "debug_baseline_predictors_emitted_per_token_mean": float(
++            dbg_base_emit_sum / max(1, total_tokens)
++        ),
+     }
+     return metrics, examples
+@@
+     acts_path = os.path.join(args.run, "acts.jsonl")
+     store = ActStore.load_jsonl(acts_path)
+ 
+     base_engine = Engine(store, seed=args.seed, config=EngineConfig())
+-    gate_engine = Engine(
+-        store,
+-        seed=args.seed,
+-        config=EngineConfig(router_live_enabled=True, router_live_debug_compare=True),
+-    )
++    gate_proof_engine = Engine(
++        store, seed=args.seed, config=EngineConfig(router_live_enabled=True, router_live_debug_compare=True)
++    )
++    gate_live_engine = Engine(
++        store, seed=args.seed, config=EngineConfig(router_live_enabled=True, router_live_debug_compare=False)
++    )
+@@
+     base_transcripts, _ = run_chat_suite(
+         base_engine,
+         dialogues=CHAT_DIALOGUES_20X3,
+         max_new_tokens=args.max_new_tokens,
+@@
+         template_ngram_n=6,
+         template_prefix_window=32,
+     )
+-    gate_transcripts, _ = run_chat_suite(
+-        gate_engine,
++    gate_proof_transcripts, _ = run_chat_suite(
++        gate_proof_engine,
++        dialogues=CHAT_DIALOGUES_20X3,
++        max_new_tokens=args.max_new_tokens,
++        prefix_k=8,
++        template_ngram_n=6,
++        template_prefix_window=32,
++    )
++    gate_live_transcripts, _ = run_chat_suite(
++        gate_live_engine,
+         dialogues=CHAT_DIALOGUES_20X3,
+         max_new_tokens=args.max_new_tokens,
+         prefix_k=8,
+         template_ngram_n=6,
+@@
+ 
+     base_txt = transcripts_text(base_transcripts)
+-    gate_txt = transcripts_text(gate_transcripts)
++    gate_proof_txt = transcripts_text(gate_proof_transcripts)
++    gate_live_txt = transcripts_text(gate_live_transcripts)
+ 
+     base_sha = sha256_text(base_txt)
+-    gate_sha = sha256_text(gate_txt)
++    gate_proof_sha = sha256_text(gate_proof_txt)
++    gate_live_sha = sha256_text(gate_live_txt)
+ 
+-    base_eval_sum, base_tokens = sum_metric_over_selected_tokens(
+-        base_transcripts, metric_key="predictor_matched"
++    if gate_proof_sha != base_sha:
++        diff = first_token_diff(base_transcripts, gate_proof_transcripts)
++        print(
++            json.dumps(
++                {
++                    "error": "sha_mismatch_gate_proof",
++                    "sha256_baseline": base_sha,
++                    "sha256_gate_proof": gate_proof_sha,
++                    "first_diff": diff,
++                },
++                ensure_ascii=False,
++                indent=2,
++            )
++        )
++        raise SystemExit(1)
++
++    if gate_live_sha != base_sha:
++        diff = first_token_diff(base_transcripts, gate_live_transcripts)
++        print(
++            json.dumps(
++                {
++                    "error": "sha_mismatch_gate_live",
++                    "sha256_baseline": base_sha,
++                    "sha256_gate_live": gate_live_sha,
++                    "first_diff": diff,
++                },
++                ensure_ascii=False,
++                indent=2,
++            )
++        )
++        raise SystemExit(1)
++
++    base_it_sum, base_tokens = sum_trace_metric(base_transcripts, metric_key="predictor_iterated")
++    base_mat_sum, _ = sum_trace_metric(base_transcripts, metric_key="predictor_matched")
++    base_emit_sum, _ = sum_trace_metric(base_transcripts, metric_key="predictor_emitted")
++
++    proof_metrics, proof_examples = collect_gate_live_metrics(gate_proof_transcripts)
++    live_metrics, live_examples = collect_gate_live_metrics(gate_live_transcripts)
++
++    def _skip_rate(base: int, cur: int) -> float:
++        if base <= 0:
++            return 0.0
++        return float((base - cur) / base)
++
++    proof_it_sum = int(proof_metrics.get("predictors_iterated_sum", 0) or 0)
++    proof_mat_sum = int(proof_metrics.get("predictors_matched_sum", 0) or 0)
++    proof_emit_sum = int(proof_metrics.get("predictors_emitted_sum", 0) or 0)
++
++    live_it_sum = int(live_metrics.get("predictors_iterated_sum", 0) or 0)
++    live_mat_sum = int(live_metrics.get("predictors_matched_sum", 0) or 0)
++    live_emit_sum = int(live_metrics.get("predictors_emitted_sum", 0) or 0)
++
++    out: Dict[str, Any] = {
++        "run": str(args.run),
++        "seed": int(args.seed),
++        "max_new_tokens": int(args.max_new_tokens),
++        "sha256_transcript_text": {
++            "baseline": str(base_sha),
++            "gate_proof": str(gate_proof_sha),
++            "gate_live": str(gate_live_sha),
++        },
++        "baseline": {
++            "tokens": int(base_tokens),
++            "predictors_iterated_sum": int(base_it_sum),
++            "predictors_iterated_per_token_mean": float(base_it_sum / max(1, base_tokens)),
++            "predictors_matched_sum": int(base_mat_sum),
++            "predictors_matched_per_token_mean": float(base_mat_sum / max(1, base_tokens)),
++            "predictors_emitted_sum": int(base_emit_sum),
++            "predictors_emitted_per_token_mean": float(base_emit_sum / max(1, base_tokens)),
++        },
++        "gate_proof": {
++            **proof_metrics,
++            "mismatch_examples": proof_examples,
++            "live_would_skip_rate_iterated": float(_skip_rate(int(base_it_sum), int(proof_it_sum))),
++            "live_would_skip_rate_matched": float(_skip_rate(int(base_mat_sum), int(proof_mat_sum))),
++            "live_would_skip_rate_emitted": float(_skip_rate(int(base_emit_sum), int(proof_emit_sum))),
++        },
++        "gate_live": {
++            **live_metrics,
++            "mismatch_examples": live_examples,
++            "live_would_skip_rate_iterated": float(_skip_rate(int(base_it_sum), int(live_it_sum))),
++            "live_would_skip_rate_matched": float(_skip_rate(int(base_mat_sum), int(live_mat_sum))),
++            "live_would_skip_rate_emitted": float(_skip_rate(int(base_emit_sum), int(live_emit_sum))),
++        },
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+*** End Patch
+
+# 2026-01-10T18:51:45.496Z call_5zlR1j9RAbC4FVs9bX9c7okZ
+*** Begin Patch
+*** Update File: act/scripts/eval_gate_compare.py
+@@
+-if __name__ == "__main__":
+-    main()
+-    )
+-    live_eval_sum, live_tokens = sum_metric_over_selected_tokens(
+-        gate_transcripts, metric_key="router_live_predictors_evaluated"
+-    )
+-
+-    gate_metrics, examples = collect_gate_live_metrics(gate_transcripts)
+-
+-    # Compute skip rate from counts (simulated live cost).
+-    would_skip_rate = 0.0
+-    if base_eval_sum > 0:
+-        would_skip_rate = float((base_eval_sum - live_eval_sum) / base_eval_sum)
+-
+-    out: Dict[str, Any] = {
+-        "run": str(args.run),
+-        "seed": int(args.seed),
+-        "max_new_tokens": int(args.max_new_tokens),
+-        "sha256_transcript_text_baseline": str(base_sha),
+-        "sha256_transcript_text_gate": str(gate_sha),
+-        "mismatch_count": int(gate_metrics.get("mismatch_count", 0) or 0),
+-        "mismatch_examples": examples,
+-        "baseline": {
+-            "tokens": int(base_tokens),
+-            "predictors_evaluated_sum": int(base_eval_sum),
+-            "predictors_evaluated_per_token_mean": float(base_eval_sum / max(1, base_tokens)),
+-        },
+-        "gate_live": {
+-            **gate_metrics,
+-            "predictors_evaluated_sum": int(live_eval_sum),
+-            "predictors_evaluated_per_token_mean": float(live_eval_sum / max(1, live_tokens)),
+-            "live_would_skip_rate": float(would_skip_rate),
+-        },
+-    }
+-    print(json.dumps(out, ensure_ascii=False, indent=2))
+-
+-
+-if __name__ == "__main__":
+-    main()
++if __name__ == "__main__":
++    main()
+*** End Patch
+

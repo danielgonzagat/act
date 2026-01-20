@@ -1,0 +1,1616 @@
+--- /dev/null	2026-01-15 14:01:06
++++ atos_core/conversation_loop_v116.py	2026-01-15 13:52:27
+@@ -0,0 +1,456 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import shutil
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .ato_v71 import ATOv71, stable_hash_obj
++from .conversation_loop_v115 import run_conversation_v115
++from .dialogue_survival_gate_v116 import DialogueSurvivalDecisionV116, compute_dialogue_survival_summary_v116
++from .goal_persistence_v115 import goal_id_v115, render_fail_response_v115
++from .mind_graph_v71 import append_chained_jsonl, verify_chained_jsonl
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_json(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.loads(f.read())
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _copy_file_worm(src: str, dst: str) -> None:
++    _ensure_absent(dst)
++    with open(src, "rb") as fsrc:
++        data = fsrc.read()
++    tmp = dst + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "wb") as fdst:
++        fdst.write(data)
++    os.replace(tmp, dst)
++
++
++def _last_entry_hash(path: str) -> str:
++    last = ""
++    if not os.path.exists(path):
++        return last
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if isinstance(obj, dict):
++                last = str(obj.get("entry_hash") or last)
++    return str(last)
++
++
++def _sorted_dict_list(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    pairs: List[Tuple[str, Dict[str, Any]]] = []
++    for it in items:
++        if not isinstance(it, dict):
++            continue
++        try:
++            k = canonical_json_dumps(it)
++        except Exception:
++            k = str(it)
++        pairs.append((k, dict(it)))
++    pairs.sort(key=lambda kv: str(kv[0]))
++    return [v for _, v in pairs]
++
++
++def _extract_last_user_turn_payload(run_dir: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "conversation_turns.jsonl"))
++    users: List[Dict[str, Any]] = []
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        payload = row.get("payload")
++        if not isinstance(payload, dict):
++            continue
++        if str(payload.get("role") or "") == "user":
++            users.append(dict(payload))
++    if not users:
++        return {}
++    users.sort(key=lambda p: (int(p.get("turn_index", 0) or 0), int(p.get("created_step", 0) or 0), str(p.get("turn_id") or "")))
++    return dict(users[-1])
++
++
++def _plan_row_for_user_turn(run_dir: str, user_turn_id: str) -> Dict[str, Any]:
++    rows = _read_jsonl(os.path.join(str(run_dir), "action_plans.jsonl"))
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        if str(row.get("user_turn_id") or "") == str(user_turn_id):
++            return dict(row)
++    return {}
++
++
++def _make_fail_event_ato_v116(
++    *,
++    conversation_id: str,
++    user_turn_id: str,
++    goal_ato_id: str,
++    plan_ato_id: str,
++    reason_code: str,
++    step: int,
++    evidence: Dict[str, Any],
++) -> ATOv71:
++    body = {
++        "schema_version": 116,
++        "conversation_id": str(conversation_id),
++        "user_turn_id": str(user_turn_id),
++        "goal_ato_id": str(goal_ato_id),
++        "plan_ato_id": str(plan_ato_id),
++        "reason_code": str(reason_code),
++        "evidence": dict(evidence) if isinstance(evidence, dict) else {},
++    }
++    fail_id = "fail_event_v116_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return ATOv71(
++        ato_id=str(fail_id),
++        ato_type="EVAL",
++        subgraph=dict(body, satisfies=False),
++        slots={},
++        bindings={},
++        cost=0.0,
++        evidence_refs=[{"kind": "turn", "turn_id": str(user_turn_id)}] if user_turn_id else [],
++        invariants={"schema_version": 116, "eval_kind": "FAIL_EVENT_V116"},
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _append_fail_event_to_copied_mind_graph_v116(
++    *,
++    run_dir: str,
++    mind_graph_v116_dir: str,
++    decision: DialogueSurvivalDecisionV116,
++    reason_code: str,
++) -> Dict[str, Any]:
++    """
++    Append a FAIL_EVENT_V116 node + edges into the *copied* mind_graph_v116 JSONLs, keeping chains valid.
++    """
++    rd = str(run_dir)
++    mg_dir = str(mind_graph_v116_dir)
++    nodes_path = os.path.join(mg_dir, "mind_nodes.jsonl")
++    edges_path = os.path.join(mg_dir, "mind_edges.jsonl")
++    if not os.path.exists(nodes_path) or not os.path.exists(edges_path):
++        raise ValueError("missing_mind_graph_files_v116")
++
++    last_user = _extract_last_user_turn_payload(rd)
++    user_turn_id = str(last_user.get("turn_id") or "")
++    if not user_turn_id:
++        raise ValueError("missing_last_user_turn_id")
++    conversation_id = str(last_user.get("conversation_id") or "")
++    user_turn_index = int(last_user.get("turn_index", 0) or 0)
++    user_text = str(last_user.get("text") or "")
++    refs = last_user.get("refs") if isinstance(last_user.get("refs"), dict) else {}
++    parse_sig = str(refs.get("parse_sig") or "")
++    goal_ato_id = goal_id_v115(
++        conversation_id=str(conversation_id),
++        user_turn_id=str(user_turn_id),
++        user_turn_index=int(user_turn_index),
++        parse_sig=str(parse_sig),
++        user_text=str(user_text),
++    )
++    plan_row = _plan_row_for_user_turn(rd, user_turn_id)
++    plan_ato_id = str(plan_row.get("plan_id") or plan_row.get("plan_sig") or "")
++    step = int(plan_row.get("created_step", last_user.get("created_step", 0) or 0) or 0)
++
++    summary_path = os.path.join(rd, "dialogue_survival_summary_v116.json")
++    summary_sig = ""
++    if os.path.exists(summary_path):
++        summary_obj = _read_json(summary_path)
++        if isinstance(summary_obj, dict):
++            summary_sig = str(summary_obj.get("summary_sig") or "")
++    evidence = {
++        "dialogue_survival_reason_code": str(reason_code),
++        "dialogue_survival_summary_sig": str(summary_sig),
++        "dialogue_survival_summary_file": os.path.basename(str(summary_path)),
++        "dialogue_survival_details": dict(decision.details),
++    }
++
++    fail_ato = _make_fail_event_ato_v116(
++        conversation_id=str(conversation_id),
++        user_turn_id=str(user_turn_id),
++        goal_ato_id=str(goal_ato_id),
++        plan_ato_id=str(plan_ato_id),
++        reason_code=str(reason_code),
++        step=int(step),
++        evidence=dict(evidence),
++    )
++    fail_ato_dict = fail_ato.to_dict(include_sig=True)
++
++    prev_nodes_hash = _last_entry_hash(nodes_path) or None
++    nodes_entry = {
++        "time": deterministic_iso(step=int(step)),
++        "step": int(step),
++        "event": "NODE",
++        "payload": {"reason": "fail_event_v116", "ato": dict(fail_ato_dict)},
++    }
++    new_nodes_hash = append_chained_jsonl(nodes_path, dict(nodes_entry), prev_hash=prev_nodes_hash)
++
++    # Edges: FAIL -> GOAL, FAIL -> PLAN (if present), FAIL -> TURN.
++    prev_edges_hash = _last_entry_hash(edges_path) or None
++    edge_rows: List[Tuple[Dict[str, Any], str]] = []
++    ev_refs = _sorted_dict_list(
++        [
++            {"kind": "turn", "turn_id": str(user_turn_id)},
++            {"kind": "dialogue_survival", "summary_sig": str(summary_sig), "reason_code": str(reason_code)},
++        ]
++    )
++
++    def _mk_edge(*, dst: str) -> Dict[str, Any]:
++        edge_sem_sig = {"src": str(fail_ato.ato_id), "dst": str(dst), "edge_type": "DERIVED_FROM", "evidence_refs": list(ev_refs)}
++        edge_sig = stable_hash_obj(edge_sem_sig)
++        return dict(edge_sem_sig, edge_sig=str(edge_sig))
++
++    dsts = [str(goal_ato_id)]
++    if plan_ato_id:
++        dsts.append(str(plan_ato_id))
++    dsts.append(str(user_turn_id))
++
++    # Deterministic order: dst id lex.
++    for dst in sorted(set([d for d in dsts if d]), key=lambda s: str(s)):
++        edge = _mk_edge(dst=str(dst))
++        edge_entry = {
++            "time": deterministic_iso(step=int(step)),
++            "step": int(step),
++            "event": "EDGE",
++            "payload": {"reason": "fail_edges_v116", "edge": dict(edge)},
++        }
++        prev_edges_hash = append_chained_jsonl(edges_path, dict(edge_entry), prev_hash=prev_edges_hash)
++        edge_rows.append((edge, str(prev_edges_hash or "")))
++
++    return {
++        "fail_ato_id": str(fail_ato.ato_id),
++        "fail_ato_sig": str(fail_ato_dict.get("ato_sig") or ""),
++        "new_nodes_entry_hash": str(new_nodes_hash),
++        "edges_appended_total": int(len(edge_rows)),
++    }
++
++
++def _compute_mind_graph_sig_from_files(*, mind_graph_dir: str) -> str:
++    mg_dir = str(mind_graph_dir)
++    nodes_path = os.path.join(mg_dir, "mind_nodes.jsonl")
++    edges_path = os.path.join(mg_dir, "mind_edges.jsonl")
++    nodes: Dict[str, Dict[str, Any]] = {}
++    edges_by_sig: Dict[str, Dict[str, Any]] = {}
++    for row in _read_jsonl(nodes_path):
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        ato = payload.get("ato")
++        if not isinstance(ato, dict):
++            continue
++        ato_id = str(ato.get("ato_id") or "")
++        if not ato_id:
++            continue
++        nodes[ato_id] = dict(ato)
++    for row in _read_jsonl(edges_path):
++        payload = row.get("payload") if isinstance(row, dict) else None
++        if not isinstance(payload, dict):
++            continue
++        edge = payload.get("edge")
++        if not isinstance(edge, dict):
++            continue
++        edge_sig = str(edge.get("edge_sig") or "")
++        if not edge_sig:
++            continue
++        edges_by_sig[edge_sig] = dict(edge)
++    nodes_list = [nodes[k] for k in sorted(nodes.keys())]
++    edges_list = list(edges_by_sig.values())
++    edges_list.sort(
++        key=lambda e: (
++            str(e.get("src") or ""),
++            str(e.get("dst") or ""),
++            str(e.get("edge_type") or ""),
++            str(e.get("edge_sig") or ""),
++        )
++    )
++    snap = {"schema_version": 1, "nodes": list(nodes_list), "edges": list(edges_list)}
++    return sha256_hex(canonical_json_dumps(snap).encode("utf-8"))
++
++
++@dataclass(frozen=True)
++class ApplyResultV116:
++    final_ok: bool
++    reason: str
++    dialogue_survival_ok: bool
++    dialogue_survival_reason: str
++    details: Dict[str, Any]
++
++
++def apply_dialogue_survival_as_law_v116(
++    *,
++    run_dir: str,
++    write_mind_graph: bool = True,
++) -> ApplyResultV116:
++    """
++    Apply V116 "dialogue survival as law" on top of an existing V115 run_dir.
++    Writes (WORM):
++      - dialogue_survival_summary_v116.json
++      - mind_graph_v116/ (copied from mind_graph_v115 + optional FAIL_EVENT_V116)
++      - goal_plan_eval_summary_v116.json
++      - final_response_v116.json
++    """
++    rd = str(run_dir)
++    # 1) Compute and persist dialogue survival summary (WORM).
++    decision = compute_dialogue_survival_summary_v116(run_dir=rd, write_summary=True)
++
++    # 2) Read V115 final response (must exist in a V115 run_dir).
++    fr115_path = os.path.join(rd, "final_response_v115.json")
++    if not os.path.exists(fr115_path):
++        raise ValueError("missing_final_response_v115")
++    fr115 = _read_json(fr115_path)
++    gate_ok = bool(fr115.get("ok", False)) if isinstance(fr115, dict) else False
++    gate_reason = str(fr115.get("reason") or "") if isinstance(fr115, dict) else "missing_final_response_v115"
++
++    # 3) Prepare mind_graph_v116 (copy) and optionally append FAIL_EVENT_V116.
++    mg115_dir = os.path.join(rd, "mind_graph_v115")
++    mg116_dir = os.path.join(rd, "mind_graph_v116")
++    if write_mind_graph:
++        if not os.path.isdir(mg115_dir):
++            raise ValueError("missing_mind_graph_v115")
++        _ensure_absent(mg116_dir)
++        os.makedirs(mg116_dir, exist_ok=False)
++        _copy_file_worm(os.path.join(mg115_dir, "mind_nodes.jsonl"), os.path.join(mg116_dir, "mind_nodes.jsonl"))
++        _copy_file_worm(os.path.join(mg115_dir, "mind_edges.jsonl"), os.path.join(mg116_dir, "mind_edges.jsonl"))
++
++    fail_append_info: Dict[str, Any] = {}
++    final_ok = bool(gate_ok) and bool(decision.ok)
++    final_reason = "ok"
++    if not bool(gate_ok):
++        final_ok = False
++        final_reason = str(gate_reason or "gate_v115_failed")
++    elif not bool(decision.ok):
++        final_ok = False
++        final_reason = str(decision.reason_code)
++        # Add a FAIL_EVENT only for dialogue-survival failures (law extension).
++        if write_mind_graph:
++            fail_append_info = _append_fail_event_to_copied_mind_graph_v116(
++                run_dir=rd,
++                mind_graph_v116_dir=str(mg116_dir),
++                decision=decision,
++                reason_code=str(final_reason),
++            )
++
++    # 4) Verify mind graph chains and compute sig (best-effort; fail-closed if chain broken).
++    mg_ok = {}
++    mg_sig = ""
++    if write_mind_graph:
++        nodes_ok = bool(verify_chained_jsonl(os.path.join(mg116_dir, "mind_nodes.jsonl")))
++        edges_ok = bool(verify_chained_jsonl(os.path.join(mg116_dir, "mind_edges.jsonl")))
++        mg_ok = {"mind_nodes_chain_ok": bool(nodes_ok), "mind_edges_chain_ok": bool(edges_ok)}
++        if not nodes_ok or not edges_ok:
++            raise ValueError("mind_graph_v116_chain_invalid")
++        mg_sig = _compute_mind_graph_sig_from_files(mind_graph_dir=str(mg116_dir))
++
++    # 5) Write goal_plan_eval_summary_v116.json (WORM).
++    gp115_path = os.path.join(rd, "goal_plan_eval_summary_v115.json")
++    gp115 = _read_json(gp115_path) if os.path.exists(gp115_path) else {}
++    gp116 = {
++        "schema_version": 116,
++        "kind": "goal_plan_eval_summary_v116",
++        "gate_v115": dict(gp115) if isinstance(gp115, dict) else {},
++        "dialogue_survival_v116": {
++            "ok": bool(decision.ok),
++            "reason_code": str(decision.reason_code),
++            "details": dict(decision.details),
++        },
++        "mind_graph_v116": dict(mg_ok, mind_graph_sig=str(mg_sig)) if write_mind_graph else {},
++        "fail_event_v116": dict(fail_append_info),
++    }
++    gp116["summary_sig"] = sha256_hex(canonical_json_dumps(gp116).encode("utf-8"))
++    _write_once_json(os.path.join(rd, "goal_plan_eval_summary_v116.json"), dict(gp116))
++
++    # 6) Write final_response_v116.json (WORM).
++    fail_text = ""
++    if not bool(final_ok):
++        fail_text = render_fail_response_v115(str(final_reason))
++    fr116 = {
++        "schema_version": 116,
++        "kind": "final_response_v116",
++        "ok": bool(final_ok),
++        "reason": str(final_reason if not final_ok else "ok"),
++        "fail_response_text": str(fail_text),
++        "gate_v115_ok": bool(gate_ok),
++        "gate_v115_reason": str(gate_reason),
++        "dialogue_survival_ok": bool(decision.ok),
++        "dialogue_survival_reason": str(decision.reason_code),
++    }
++    fr116["final_sig"] = sha256_hex(canonical_json_dumps(fr116).encode("utf-8"))
++    _write_once_json(os.path.join(rd, "final_response_v116.json"), dict(fr116))
++
++    return ApplyResultV116(
++        final_ok=bool(final_ok),
++        reason=str(final_reason),
++        dialogue_survival_ok=bool(decision.ok),
++        dialogue_survival_reason=str(decision.reason_code),
++        details={"final_response_v116": dict(fr116), "goal_plan_eval_summary_v116_sig": str(gp116.get("summary_sig") or "")},
++    )
++
++
++def run_conversation_v116(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++    max_replans_per_turn: int = 3,
++) -> Dict[str, Any]:
++    """
++    V116 wrapper: extends V115 runtime-gate by making dialogue survival a law.
++    Authoritative output for the run is final_response_v116.json.
++    """
++    res = run_conversation_v115(user_turn_texts=list(user_turn_texts), out_dir=str(out_dir), seed=int(seed), max_replans_per_turn=int(max_replans_per_turn))
++    applied = apply_dialogue_survival_as_law_v116(run_dir=str(out_dir), write_mind_graph=True)
++    out = dict(res)
++    out["final_response_v116_ok"] = bool(applied.final_ok)
++    out["final_response_v116_reason"] = str(applied.reason)
++    out["dialogue_survival_v116_ok"] = bool(applied.dialogue_survival_ok)
++    out["dialogue_survival_v116_reason"] = str(applied.dialogue_survival_reason)
++    out["final_response_v116"] = dict(applied.details.get("final_response_v116") or {})
++    return out
++
+--- /dev/null	2026-01-15 14:01:06
++++ atos_core/dialogue_survival_gate_v116.py	2026-01-15 13:36:42
+@@ -0,0 +1,217 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .fluency_survival_v112 import fluency_contract_v112
++
++DIALOGUE_SURVIVAL_REASON_OK_V116 = "ok"
++DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116 = "dialogue_survival_fluency_fail"
++DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116 = "dialogue_survival_unresolved_reference"
++DIALOGUE_SURVIVAL_REASON_CONTRADICTION_V116 = "dialogue_survival_contradiction_detected"
++DIALOGUE_SURVIVAL_REASON_MISSING_TRANSCRIPT_V116 = "dialogue_survival_missing_transcript"
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        raise ValueError(f"worm_exists:{path}")
++
++
++def _write_once_json(path: str, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path + ".tmp"
++    if os.path.exists(tmp):
++        raise ValueError(f"tmp_exists:{tmp}")
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++
++
++def _read_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _load_transcript_view_v116(transcript_jsonl: str) -> List[Dict[str, Any]]:
++    rows = _read_jsonl(str(transcript_jsonl))
++    out: List[Dict[str, Any]] = []
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        payload = row.get("payload")
++        if not isinstance(payload, dict):
++            continue
++        role = str(payload.get("role") or "")
++        text = str(payload.get("text") or "")
++        out.append({"role": str(role), "text": str(text)})
++    return out
++
++
++def _count_unresolved_reference_events_v116(binding_events: Sequence[Dict[str, Any]]) -> int:
++    bad = 0
++    for ev in list(binding_events):
++        if not isinstance(ev, dict):
++            continue
++        t = str(ev.get("type") or "")
++        if t in {"BIND_MISS", "BIND_AMBIGUOUS"}:
++            bad += 1
++    return int(bad)
++
++
++def _unresolved_reference_final_from_flow_v116(flow_events: Sequence[Dict[str, Any]]) -> int:
++    if not flow_events:
++        return 0
++    last = flow_events[-1] if isinstance(flow_events[-1], dict) else {}
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        return 0
++    return 1 if bool(flags.get("UNRESOLVED_REFERENCE")) else 0
++
++
++def _count_semantic_contradiction_flags_v116(semantic_events: Sequence[Dict[str, Any]]) -> int:
++    cnt = 0
++    for ev in list(semantic_events):
++        if not isinstance(ev, dict):
++            continue
++        flags = ev.get("flags_v109")
++        if not isinstance(flags, dict):
++            continue
++        if bool(flags.get("CONTRADICTION_UNREPAIRED")):
++            cnt += 1
++    return int(cnt)
++
++
++@dataclass(frozen=True)
++class DialogueSurvivalDecisionV116:
++    ok: bool
++    reason_code: str
++    details: Dict[str, Any]
++
++
++def decide_dialogue_survival_v116(
++    *,
++    fluency_ok: bool,
++    fluency_reason: str,
++    fluency_details: Optional[Dict[str, Any]],
++    unresolved_reference_final: int,
++    contradiction_flags_total: int,
++    extra: Optional[Dict[str, Any]] = None,
++) -> DialogueSurvivalDecisionV116:
++    """
++    Pure, deterministic decision function (unit-testable).
++    Priority of failure (deterministic): fluency -> unresolved_reference -> contradiction.
++    """
++    details: Dict[str, Any] = {
++        "fluency_ok": bool(fluency_ok),
++        "fluency_reason": str(fluency_reason or ""),
++        "fluency_details": dict(fluency_details) if isinstance(fluency_details, dict) else {},
++        "unresolved_reference_final": int(unresolved_reference_final),
++        "semantic_contradiction_flags_total": int(contradiction_flags_total),
++    }
++    if isinstance(extra, dict):
++        details.update(dict(extra))
++
++    if not bool(fluency_ok):
++        return DialogueSurvivalDecisionV116(ok=False, reason_code=DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116, details=dict(details))
++    if int(unresolved_reference_final) != 0:
++        return DialogueSurvivalDecisionV116(ok=False, reason_code=DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116, details=dict(details))
++    if int(contradiction_flags_total) != 0:
++        return DialogueSurvivalDecisionV116(ok=False, reason_code=DIALOGUE_SURVIVAL_REASON_CONTRADICTION_V116, details=dict(details))
++    return DialogueSurvivalDecisionV116(ok=True, reason_code=DIALOGUE_SURVIVAL_REASON_OK_V116, details=dict(details))
++
++
++def compute_dialogue_survival_summary_v116(
++    *,
++    run_dir: str,
++    write_summary: bool = True,
++) -> DialogueSurvivalDecisionV116:
++    rd = str(run_dir)
++    transcript_path = os.path.join(rd, "transcript.jsonl")
++    if not os.path.exists(transcript_path):
++        dec = DialogueSurvivalDecisionV116(
++            ok=False,
++            reason_code=DIALOGUE_SURVIVAL_REASON_MISSING_TRANSCRIPT_V116,
++            details={"missing_paths": ["transcript.jsonl"]},
++        )
++        if write_summary:
++            _write_once_json(os.path.join(rd, "dialogue_survival_summary_v116.json"), _summary_obj_v116(decision=dec, sha256_paths={}))
++        return dec
++
++    transcript_view = _load_transcript_view_v116(transcript_path)
++    ok_fc, reason_fc, details_fc = fluency_contract_v112(transcript_view=transcript_view)
++
++    binding_events = _read_jsonl(os.path.join(rd, "binding_events.jsonl"))
++    unresolved_total = _count_unresolved_reference_events_v116(binding_events)
++
++    flow_events = _read_jsonl(os.path.join(rd, "flow_events.jsonl"))
++    unresolved_final = _unresolved_reference_final_from_flow_v116(flow_events)
++
++    semantic_events = _read_jsonl(os.path.join(rd, "semantic_events.jsonl"))
++    contradiction_flags = _count_semantic_contradiction_flags_v116(semantic_events)
++
++    extra = {
++        "unresolved_reference_total": int(unresolved_total),
++        "flow_unresolved_reference_final": int(unresolved_final),
++        "transcript_sha256": _sha256_file(transcript_path),
++    }
++
++    dec = decide_dialogue_survival_v116(
++        fluency_ok=bool(ok_fc),
++        fluency_reason=str(reason_fc),
++        fluency_details=dict(details_fc),
++        unresolved_reference_final=int(unresolved_final),
++        contradiction_flags_total=int(contradiction_flags),
++        extra=dict(extra),
++    )
++
++    if write_summary:
++        sha256_paths: Dict[str, str] = {"transcript_jsonl": str(transcript_path)}
++        summary_obj = _summary_obj_v116(decision=dec, sha256_paths=sha256_paths)
++        _write_once_json(os.path.join(rd, "dialogue_survival_summary_v116.json"), summary_obj)
++
++    return dec
++
++
++def _summary_obj_v116(*, decision: DialogueSurvivalDecisionV116, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    sha256_rel: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        sha256_rel[str(k)] = str(os.path.basename(str(p)))
++        if os.path.exists(p):
++            sha256[str(k)] = _sha256_file(str(p))
++    body = {
++        "schema_version": 116,
++        "kind": "dialogue_survival_summary_v116",
++        "ok": bool(decision.ok),
++        "reason_code": str(decision.reason_code),
++        "details": dict(decision.details),
++        "sha256": dict(sha256),
++        "sha256_paths": dict(sha256_rel),
++    }
++    body["summary_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
+--- /dev/null	2026-01-15 14:01:06
++++ scripts/run_family7_dla_v116.py	2026-01-15 13:58:54
+@@ -0,0 +1,467 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v116 import run_conversation_v116
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import (
++    EXTERNAL_WORLD_ACTION_SEARCH_V111,
++    EXTERNAL_WORLD_REASON_CODES_V111,
++    compute_external_world_chain_hash_v111,
++    verify_external_world_event_sig_chain_v111,
++)
++from atos_core.fluency_survival_v112 import fluency_contract_v112, fluency_survival_plan_v112, summarize_fluency_fail_code_v112
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++ACK_TO_CHOICE_LABEL_V112 = {
++    "ok",
++    "okay",
++    "certo",
++    "beleza",
++    "blz",
++    "continua",
++    "continue",
++    "segue",
++    "vai",
++    "faz",
++    "pode",
++    "sim",
++}
++
++
++def _canon_ack_token_v112(s: str) -> str:
++    t = str(s or "").strip().lower()
++    t = " ".join([x for x in t.split() if x])
++    return t
++
++
++def _choiceify_minimal_ack_v112(user_turn_texts: Sequence[str]) -> List[str]:
++    out: List[str] = []
++    for s in user_turn_texts:
++        cs = _canon_ack_token_v112(str(s))
++        if cs in ACK_TO_CHOICE_LABEL_V112:
++            out.append("A")
++        else:
++            out.append(str(s))
++    return out
++
++
++def _load_jsonl_payload_view(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            obj = json.loads(line)
++            if not isinstance(obj, dict):
++                continue
++            payload = obj.get("payload")
++            if not isinstance(payload, dict):
++                continue
++            out.append(dict(payload))
++    return out
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _compute_external_world_access_once_v113(
++    *,
++    world_manifest: str,
++    reason_code: str,
++    query: str,
++    seed: int,
++) -> List[Dict[str, Any]]:
++    evs, _ = external_world_access_v113(
++        allowed=True,
++        world_manifest=str(world_manifest),
++        action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++        reason_code=str(reason_code),
++        args={"query": str(query), "limit": 3, "roles": ["user"]},
++        seed=int(seed),
++        turn_index=0,
++        prev_event_sig="",
++    )
++    return list(evs)
++
++
++def _count_unresolved_reference_events(binding_events: Sequence[Dict[str, Any]]) -> int:
++    bad = 0
++    for ev in binding_events:
++        if not isinstance(ev, dict):
++            continue
++        t = str(ev.get("type") or "")
++        if t in {"BIND_MISS", "BIND_AMBIGUOUS"}:
++            bad += 1
++    return int(bad)
++
++
++def _unresolved_reference_final_from_flow(flow_events: Sequence[Dict[str, Any]]) -> int:
++    if not flow_events:
++        return 0
++    last = flow_events[-1] if isinstance(flow_events[-1], dict) else {}
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        return 0
++    return 1 if bool(flags.get("UNRESOLVED_REFERENCE")) else 0
++
++
++def _count_semantic_contradiction_flags(semantic_events: Sequence[Dict[str, Any]]) -> int:
++    cnt = 0
++    for ev in semantic_events:
++        if not isinstance(ev, dict):
++            continue
++        flags = ev.get("flags_v109")
++        if not isinstance(flags, dict):
++            continue
++        if bool(flags.get("CONTRADICTION_UNREPAIRED")):
++            cnt += 1
++    return int(cnt)
++
++
++def _write_external_world_ledger(*, task_dir: Path, events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    events_path = task_dir / "external_world_events.jsonl"
++    _ensure_absent(events_path)
++    if events:
++        with open(events_path, "x", encoding="utf-8") as f:
++            for e in events:
++                f.write(canonical_json_dumps(e))
++                f.write("\n")
++    else:
++        events_path.write_text("", encoding="utf-8")
++
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v111(list(events))
++    if not ok_sig:
++        _fail(f"external_world_sig_chain_fail:{reason_sig}")
++    chain_hash = compute_external_world_chain_hash_v111(list(events))
++    snap = {
++        "schema_version": 111,
++        "kind": "external_world_registry_snapshot_v111",
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++    }
++    snap_path = task_dir / "external_world_registry_snapshot_v111.json"
++    _write_once_json(snap_path, snap)
++    return {
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++        "external_world_events_jsonl": str(events_path),
++        "external_world_registry_snapshot_v111_json": str(snap_path),
++    }
++
++
++def _compute_freeze_manifest_v116(*, task_dir: Path, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    sha256_rel: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        pp = str(p or "")
++        sha256_rel[str(k)] = str(os.path.basename(pp)) if pp else ""
++        if pp and os.path.exists(pp):
++            sha256[str(k)] = _sha256_file(Path(pp))
++    body = {
++        "schema_version": 116,
++        "kind": "freeze_manifest_v116",
++        "sha256": dict(sha256),
++        "sha256_paths": dict(sha256_rel),
++    }
++    body["manifest_sig"] = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return body
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", default="9999")
++    ap.add_argument("--max_rewrites", default="4")
++    ap.add_argument("--max_replans_per_turn", default="3")
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_dir = Path(str(args.out))
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(str(args.tasks), "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        _fail("empty_tasks")
++
++    max_tasks = int(args.max_tasks)
++    max_rewrites = int(args.max_rewrites)
++    max_replans = int(args.max_replans_per_turn)
++
++    results: List[Dict[str, Any]] = []
++    failures: List[Dict[str, Any]] = []
++
++    for i, task in enumerate(tasks[:max_tasks]):
++        if not isinstance(task, dict):
++            continue
++        task_id = str(task.get("task_id") or f"task_{i:03d}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        user_turn_texts = _choiceify_minimal_ack_v112(user_turn_texts)
++        require_fluency = bool(task.get("require_fluency", True))
++        allow_external = bool(task.get("allow_external_world_once", False))
++        world_manifest = str(task.get("world_manifest") or "")
++        probe_reason = str(task.get("external_world_probe_reason_code") or "validator_failed_fluency_contract")
++
++        task_dir = out_dir / "task_{i:03d}".format(i=i)
++        _ensure_absent(task_dir)
++        task_dir.mkdir(parents=True, exist_ok=False)
++
++        attempts: List[Dict[str, Any]] = []
++        chosen_attempt = -1
++
++        rewrite_seeds = fluency_survival_plan_v112(base_seed=int(seed), max_attempts=int(max_rewrites))
++        ext_used = False
++        ext_used_reason = ""
++        ext_events_final: List[Dict[str, Any]] = []
++
++        for a, seed_used in enumerate(rewrite_seeds):
++            attempt_dir = task_dir / "attempt_{a:03d}".format(a=a)
++            _ensure_absent(attempt_dir)
++            conv = run_conversation_v116(user_turn_texts=list(user_turn_texts), out_dir=str(attempt_dir), seed=int(seed_used), max_replans_per_turn=int(max_replans))
++
++            ok_gate = bool(conv.get("gate_v115_ok", False))
++            gate_reason = str(conv.get("gate_v115_reason") or "")
++            ok_dialogue = bool(conv.get("dialogue_survival_v116_ok", False))
++            reason_dialogue = str(conv.get("dialogue_survival_v116_reason") or "")
++
++            transcript_rows = _load_jsonl_payload_view(attempt_dir / "transcript.jsonl")
++            user_i = 0
++            transcript_view: List[Dict[str, Any]] = []
++            for r in transcript_rows:
++                role = str(r.get("role") or "")
++                text = str(r.get("text") or "")
++                if role == "user" and user_i < len(user_turn_texts):
++                    text = str(user_turn_texts[user_i])
++                    user_i += 1
++                transcript_view.append({"role": role, "text": text})
++
++            ok_fc, reason_fc, details_fc = fluency_contract_v112(transcript_view=transcript_view)
++            # Deterministic external world gating exercise: force probe on attempt 0 for the single allow_external task.
++            if allow_external and (not ext_used) and a == 0:
++                ok_fc = False
++                reason_fc = "forced_external_world_probe"
++
++            binding_events = _load_jsonl(attempt_dir / "binding_events.jsonl")
++            unresolved_refs_total = _count_unresolved_reference_events(binding_events)
++            flow_events = _load_jsonl(attempt_dir / "flow_events.jsonl")
++            unresolved_refs_final = _unresolved_reference_final_from_flow(flow_events)
++            semantic_events = _load_jsonl(attempt_dir / "semantic_events.jsonl")
++            contradiction_flags = _count_semantic_contradiction_flags(semantic_events)
++
++            ok_unresolved = unresolved_refs_final == 0
++            ok_semantic = contradiction_flags == 0
++
++            ok_attempt = bool(ok_gate) and bool(ok_unresolved) and bool(ok_semantic) and bool(ok_dialogue)
++            if require_fluency:
++                ok_attempt = bool(ok_attempt) and bool(ok_fc)
++
++            attempts.append(
++                {
++                    "attempt_index": int(a),
++                    "seed_used": int(seed_used),
++                    "ok_gate_v115": bool(ok_gate),
++                    "reason_gate_v115": str(gate_reason),
++                    "ok_dialogue_survival_v116": bool(ok_dialogue),
++                    "reason_dialogue_survival_v116": str(reason_dialogue),
++                    "ok_fluency": bool(ok_fc),
++                    "reason_fluency": str(summarize_fluency_fail_code_v112(str(reason_fc))),
++                    "unresolved_reference_events_total": int(unresolved_refs_total),
++                    "unresolved_reference_final": int(unresolved_refs_final),
++                    "semantic_contradiction_flags_total": int(contradiction_flags),
++                    "fluency_details": dict(details_fc),
++                }
++            )
++
++            if allow_external and (not ext_used) and (not ok_fc) and world_manifest and str(probe_reason) in set(EXTERNAL_WORLD_REASON_CODES_V111):
++                ext_events_final = _compute_external_world_access_once_v113(
++                    world_manifest=str(world_manifest),
++                    reason_code=str(probe_reason),
++                    query="não invente",
++                    seed=int(seed),
++                )
++                ext_used = True
++                ext_used_reason = str(probe_reason)
++
++            if ok_attempt:
++                chosen_attempt = int(a)
++                break
++
++        _write_once_json(
++            task_dir / "fluency_survival_v116.json",
++            {
++                "schema_version": 116,
++                "task_id": str(task_id),
++                "chosen_attempt_index": int(chosen_attempt),
++                "attempts": list(attempts),
++                "external_world_used": bool(ext_used),
++                "external_world_reason_code": str(ext_used_reason),
++            },
++        )
++
++        final_attempt_dir = task_dir / ("attempt_{a:03d}".format(a=chosen_attempt) if chosen_attempt >= 0 else "attempt_000")
++        ext_info = _write_external_world_ledger(task_dir=final_attempt_dir, events=ext_events_final if ext_used else [])
++
++        ok_task = bool(chosen_attempt >= 0)
++        attempt_rel = "task_{i:03d}/attempt_{a:03d}".format(i=i, a=(chosen_attempt if chosen_attempt >= 0 else 0))
++
++        attempt_row = next((x for x in attempts if isinstance(x, dict) and int(x.get("attempt_index", -1) or -1) == int(chosen_attempt)), None)
++        if not isinstance(attempt_row, dict):
++            attempt_row = attempts[-1] if attempts else {}
++
++        ok_gate_final = bool(attempt_row.get("ok_gate_v115", False))
++        gate_reason_final = str(attempt_row.get("reason_gate_v115") or "")
++        ok_dialogue_final = bool(attempt_row.get("ok_dialogue_survival_v116", False))
++        reason_dialogue_final = str(attempt_row.get("reason_dialogue_survival_v116") or "")
++        ok_fluency_final = bool(attempt_row.get("ok_fluency", False))
++        reason_fluency_final = str(attempt_row.get("reason_fluency") or "")
++        unresolved_final_final = int(attempt_row.get("unresolved_reference_final", 0) or 0)
++        contradiction_final = int(attempt_row.get("semantic_contradiction_flags_total", 0) or 0)
++
++        ok_all = bool(ok_task) and bool(ok_gate_final) and bool(ok_dialogue_final) and (unresolved_final_final == 0) and (contradiction_final == 0)
++        if require_fluency:
++            ok_all = bool(ok_all) and bool(ok_fluency_final)
++
++        results.append(
++            {
++                "task_id": str(task_id),
++                "attempt_rel": str(attempt_rel),
++                "seed_used": int(seed),
++                "chosen_attempt_index": int(chosen_attempt),
++                "ok_gate_v115": bool(ok_gate_final),
++                "reason_gate_v115": str(gate_reason_final),
++                "ok_dialogue_survival_v116": bool(ok_dialogue_final),
++                "reason_dialogue_survival_v116": str(reason_dialogue_final),
++                "ok_fluency": bool(ok_fluency_final),
++                "reason_fluency": str(reason_fluency_final),
++                "external_world_events_total": int(ext_info.get("events_total") or 0),
++                "external_world_chain_hash_v111": str(ext_info.get("external_world_chain_hash_v111") or ""),
++                "unresolved_reference_final": int(unresolved_final_final),
++                "semantic_contradiction_flags_total": int(contradiction_final),
++                "ok": bool(ok_all),
++            }
++        )
++
++        if not bool(ok_all):
++            reason = "unknown"
++            if not ok_task:
++                reason = "no_passing_attempt"
++            elif not bool(ok_gate_final):
++                reason = "gate_v115:" + str(gate_reason_final or "fail")
++            elif not bool(ok_dialogue_final):
++                reason = "dialogue_survival_v116:" + str(reason_dialogue_final or "fail")
++            elif require_fluency and (not bool(ok_fluency_final)):
++                reason = "fluency_v112:" + str(reason_fluency_final or "fail")
++            elif unresolved_final_final != 0:
++                reason = "unresolved_reference"
++            elif contradiction_final != 0:
++                reason = "semantic_contradiction"
++            failures.append({"task_id": str(task_id), "attempt_rel": str(attempt_rel), "reason": str(reason), "validator": "family7_v116"})
++
++        sha256_paths: Dict[str, str] = {
++            "summary_json": str(final_attempt_dir / "summary.json"),
++            "turns_jsonl": str(final_attempt_dir / "conversation_turns.jsonl"),
++            "plans_jsonl": str(final_attempt_dir / "action_plans.jsonl"),
++            "evals_jsonl": str(final_attempt_dir / "objective_evals.jsonl"),
++            "final_response_v115_json": str(final_attempt_dir / "final_response_v115.json"),
++            "final_response_v116_json": str(final_attempt_dir / "final_response_v116.json"),
++            "dialogue_survival_summary_v116_json": str(final_attempt_dir / "dialogue_survival_summary_v116.json"),
++            "goal_plan_eval_summary_v115_json": str(final_attempt_dir / "goal_plan_eval_summary_v115.json"),
++            "goal_plan_eval_summary_v116_json": str(final_attempt_dir / "goal_plan_eval_summary_v116.json"),
++            "goal_registry_snapshot_v115_json": str(final_attempt_dir / "goal_registry_snapshot_v115.json"),
++            "mind_graph_v115_nodes_jsonl": str(final_attempt_dir / "mind_graph_v115" / "mind_nodes.jsonl"),
++            "mind_graph_v115_edges_jsonl": str(final_attempt_dir / "mind_graph_v115" / "mind_edges.jsonl"),
++            "mind_graph_v116_nodes_jsonl": str(final_attempt_dir / "mind_graph_v116" / "mind_nodes.jsonl"),
++            "mind_graph_v116_edges_jsonl": str(final_attempt_dir / "mind_graph_v116" / "mind_edges.jsonl"),
++            "fluency_survival_v116_json": str(task_dir / "fluency_survival_v116.json"),
++            "external_world_events_jsonl": str(ext_info.get("external_world_events_jsonl") or ""),
++            "external_world_registry_snapshot_json": str(ext_info.get("external_world_registry_snapshot_v111_json") or ""),
++        }
++        manifest = _compute_freeze_manifest_v116(task_dir=final_attempt_dir, sha256_paths=dict(sha256_paths))
++        manifest_path = final_attempt_dir / "freeze_manifest_v116.json"
++        _write_once_json(manifest_path, manifest)
++
++    eval_obj = {
++        "schema_version": 116,
++        "kind": "family7_dla_eval_v116",
++        "tasks_total": int(len(results)),
++        "tasks_ok": int(sum(1 for r in results if isinstance(r, dict) and bool(r.get("ok", False)))),
++        "results": list(results),
++        "failures_total": int(len(failures)),
++        "failures": list(failures),
++    }
++    _write_once_json(out_dir / "eval.json", dict(eval_obj))
++    eval_sha256 = _sha256_file(out_dir / "eval.json")
++    summary = {"schema_version": 116, "kind": "family7_dla_summary_v116", "tasks_total": int(len(results)), "tasks_ok": int(eval_obj.get("tasks_ok") or 0), "eval_sha256": str(eval_sha256)}
++    _write_once_json(out_dir / "summary.json", dict(summary))
++    _write_once_json(out_dir / "fail_catalog_v116.json", {"schema_version": 116, "failures_total": int(len(failures)), "failures": list(failures)})
++
++    # Print final JSON for piping/tee (deterministic).
++    print(json.dumps({"ok": True, "eval_sha256": str(eval_sha256), "tasks_ok": int(eval_obj.get("tasks_ok") or 0), "tasks_total": int(len(results))}, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 14:01:06
++++ scripts/smoke_v116_dialogue_survival_render_gate.py	2026-01-15 13:54:06
+@@ -0,0 +1,219 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v115 import run_conversation_v115
++from atos_core.conversation_loop_v116 import apply_dialogue_survival_as_law_v116, run_conversation_v116
++from atos_core.dialogue_survival_gate_v116 import (
++    DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116,
++    DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116,
++)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
++    _ensure_absent(path)
++    with open(path, "x", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++
++
++def _case_positive(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    run_dir = base_dir / "case_00_positive"
++    _ensure_absent(run_dir)
++    out = run_conversation_v116(user_turn_texts=["set x to 4", "get x", "end now"], out_dir=str(run_dir), seed=int(seed))
++    fr = _load_json(run_dir / "final_response_v116.json")
++    if not bool(fr.get("ok", False)):
++        raise SystemExit("case_positive_final_response_not_ok")
++    if not bool(out.get("dialogue_survival_v116_ok", False)):
++        raise SystemExit("case_positive_dialogue_survival_not_ok")
++    return {"ok": True}
++
++
++def _tamper_transcript_to_force_fluency_fail(path: Path) -> None:
++    rows = _load_jsonl(path)
++    if not rows:
++        raise SystemExit("tamper_empty_transcript")
++    out_rows: List[Dict[str, Any]] = []
++    for r in rows:
++        if not isinstance(r, dict):
++            continue
++        payload = r.get("payload")
++        if isinstance(payload, dict) and str(payload.get("role") or "") == "assistant":
++            p2 = dict(payload)
++            p2["text"] = "OK"
++            out_rows.append({"payload": p2})
++        else:
++            out_rows.append(dict(r))
++    os.replace(str(path), str(path) + ".bak")
++    _write_jsonl(path, out_rows)
++
++
++def _tamper_flow_to_force_unresolved_final(path: Path) -> None:
++    rows = _load_jsonl(path)
++    if not rows:
++        raise SystemExit("tamper_empty_flow")
++    last = dict(rows[-1])
++    flags = last.get("flow_flags_v108")
++    if not isinstance(flags, dict):
++        flags = {}
++    flags2 = dict(flags)
++    flags2["UNRESOLVED_REFERENCE"] = True
++    last["flow_flags_v108"] = flags2
++    rows[-1] = last
++    os.replace(str(path), str(path) + ".bak")
++    _write_jsonl(path, [dict(r) for r in rows if isinstance(r, dict)])
++
++
++def _case_negative_fluency(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    run_dir = base_dir / "case_01_neg_fluency"
++    _ensure_absent(run_dir)
++    run_conversation_v115(user_turn_texts=["set x to 4", "get x", "end now"], out_dir=str(run_dir), seed=int(seed))
++    _tamper_transcript_to_force_fluency_fail(run_dir / "transcript.jsonl")
++    applied = apply_dialogue_survival_as_law_v116(run_dir=str(run_dir), write_mind_graph=True)
++    fr = _load_json(run_dir / "final_response_v116.json")
++    if bool(fr.get("ok", True)):
++        raise SystemExit("case_neg_fluency_unexpected_ok")
++    if str(fr.get("reason") or "") != DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116:
++        raise SystemExit("case_neg_fluency_wrong_reason")
++    if not (run_dir / "mind_graph_v116" / "mind_nodes.jsonl").exists():
++        raise SystemExit("case_neg_fluency_missing_mind_graph_v116")
++    nodes = _load_jsonl(run_dir / "mind_graph_v116" / "mind_nodes.jsonl")
++    fail_nodes = [
++        n
++        for n in nodes
++        if isinstance(n, dict)
++        and isinstance((n.get("payload") or {}).get("ato"), dict)
++        and isinstance((((n.get("payload") or {}).get("ato") or {}).get("invariants")), dict)
++        and str((((n.get("payload") or {}).get("ato") or {}).get("invariants") or {}).get("eval_kind") or "")
++        == "FAIL_EVENT_V116"
++    ]
++    if len(fail_nodes) < 1:
++        raise SystemExit("case_neg_fluency_missing_fail_event_node")
++    return {"ok": True, "reason": str(applied.reason)}
++
++
++def _case_negative_unresolved(*, base_dir: Path, seed: int) -> Dict[str, Any]:
++    run_dir = base_dir / "case_02_neg_unresolved"
++    _ensure_absent(run_dir)
++    run_conversation_v115(user_turn_texts=["set x to 4", "get x", "end now"], out_dir=str(run_dir), seed=int(seed))
++    _tamper_flow_to_force_unresolved_final(run_dir / "flow_events.jsonl")
++    applied = apply_dialogue_survival_as_law_v116(run_dir=str(run_dir), write_mind_graph=True)
++    fr = _load_json(run_dir / "final_response_v116.json")
++    if bool(fr.get("ok", True)):
++        raise SystemExit("case_neg_unresolved_unexpected_ok")
++    if str(fr.get("reason") or "") != DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116:
++        raise SystemExit("case_neg_unresolved_wrong_reason")
++    return {"ok": True, "reason": str(applied.reason)}
++
++
++def _run_try(*, out_dir: Path, seed: int) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++    cases = {
++        "positive": _case_positive(base_dir=out_dir, seed=seed),
++        "neg_fluency": _case_negative_fluency(base_dir=out_dir, seed=seed),
++        "neg_unresolved": _case_negative_unresolved(base_dir=out_dir, seed=seed),
++    }
++    eval_obj = {"schema_version": 116, "seed": int(seed), "cases": dict(cases)}
++    _write_once_json(out_dir / "eval.json", eval_obj)
++    eval_sha256 = _sha256_file(out_dir / "eval.json")
++    summary = {"schema_version": 116, "seed": int(seed), "eval_sha256": str(eval_sha256)}
++    _write_once_json(out_dir / "summary.json", summary)
++    fail_catalog = {"schema_version": 116, "failures_total": 0, "failures": []}
++    _write_once_json(out_dir / "fail_catalog_v116.json", fail_catalog)
++    return {"eval_sha256": str(eval_sha256), "eval_json": eval_obj}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_v116_dialogue_survival_render_gate")
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_base = Path(str(args.out_base))
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++
++    r1 = _run_try(out_dir=out1, seed=seed)
++    r2 = _run_try(out_dir=out2, seed=seed)
++
++    if canonical_json_dumps(r1["eval_json"]) != canonical_json_dumps(r2["eval_json"]):
++        raise SystemExit("determinism_failed:eval_json")
++    if r1["eval_sha256"] != r2["eval_sha256"]:
++        raise SystemExit("determinism_failed:eval_sha256")
++
++    core = {"schema_version": 116, "seed": int(seed), "eval_sha256": str(r1["eval_sha256"])}
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "determinism_ok": True,
++                "summary_sha256": str(summary_sha256),
++                "try1_dir": str(out1),
++                "try2_dir": str(out2),
++            },
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-15 14:01:06
++++ scripts/smoke_v116_family7_real_history_stress.py	2026-01-15 13:56:19
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.external_world_gating_v113 import external_world_access_v113
++from atos_core.external_world_ledger_v111 import EXTERNAL_WORLD_ACTION_SEARCH_V111
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    env = dict(os.environ)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v116.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(seed),
++        "--max_tasks",
++        "9999",
++        "--max_rewrites",
++        "4",
++        "--max_replans_per_turn",
++        "3",
++    ]
++    p = subprocess.run(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
++    if p.returncode != 0:
++        raise SystemExit("runner_failed:\nSTDOUT:\n{out}\nSTDERR:\n{err}".format(out=p.stdout, err=p.stderr))
++
++
++def _negative_tests(*, world_manifest: str) -> Dict[str, Any]:
++    ok1 = False
++    reason1 = ""
++    try:
++        external_world_access_v113(
++            allowed=False,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="validator_failed_fluency_contract",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok1 = True
++    except ValueError as e:
++        reason1 = str(e)
++
++    ok2 = False
++    reason2 = ""
++    try:
++        external_world_access_v113(
++            allowed=True,
++            world_manifest=str(world_manifest),
++            action=EXTERNAL_WORLD_ACTION_SEARCH_V111,
++            reason_code="invalid_reason_code_x",
++            args={"query": "x", "limit": 1, "roles": ["user"]},
++            seed=0,
++            turn_index=0,
++            prev_event_sig="",
++        )
++        ok2 = True
++    except ValueError as e:
++        reason2 = str(e)
++
++    return {
++        "access_not_allowed": {"ok": bool(ok1), "reason": str(reason1)},
++        "invalid_reason_code": {"ok": bool(ok2), "reason": str(reason2)},
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = str(args.tasks)
++    out_base = Path(str(args.out_base))
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        raise SystemExit("empty_tasks")
++    world_manifest = str(tasks[0].get("world_manifest") or "")
++
++    neg = _negative_tests(world_manifest=world_manifest)
++    if neg["access_not_allowed"]["reason"] != "external_world_access_not_allowed":
++        raise SystemExit("negative_failed:access_not_allowed")
++    if neg["invalid_reason_code"]["reason"] != "invalid_reason_code":
++        raise SystemExit("negative_failed:invalid_reason_code")
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    _run_runner(tasks=tasks_path, out_dir=out1, seed=seed)
++    _run_runner(tasks=tasks_path, out_dir=out2, seed=seed)
++
++    s1 = _load_json(out1 / "summary.json")
++    s2 = _load_json(out2 / "summary.json")
++    eval_sha1 = str(s1.get("eval_sha256") or "")
++    eval_sha2 = str(s2.get("eval_sha256") or "")
++    if eval_sha1 != eval_sha2:
++        raise SystemExit("determinism_failed:eval_sha")
++
++    ev1 = _load_json(out1 / "eval.json")
++    ev2 = _load_json(out2 / "eval.json")
++    if canonical_json_dumps(ev1) != canonical_json_dumps(ev2):
++        raise SystemExit("determinism_failed:eval_json")
++
++    if int(ev1.get("tasks_ok") or 0) != int(ev1.get("tasks_total") or 0):
++        raise SystemExit("tasks_not_all_ok")
++
++    res1 = ev1.get("results") if isinstance(ev1.get("results"), list) else []
++    ext_counts = [int(r.get("external_world_events_total") or 0) for r in res1 if isinstance(r, dict)]
++    if sum(1 for c in ext_counts if c == 1) != 1:
++        raise SystemExit("external_world_in_cycle_expected_one_call")
++
++    core = {
++        "schema_version": 116,
++        "seed": int(seed),
++        "try1": {"eval_sha256": eval_sha1, "tasks_ok": int(s1.get("tasks_ok") or 0)},
++        "try2": {"eval_sha256": eval_sha2, "tasks_ok": int(s2.get("tasks_ok") or 0)},
++        "negative_tests": dict(neg),
++    }
++    summary_sha256 = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++    out = {
++        "ok": True,
++        "determinism_ok": True,
++        "summary_sha256": str(summary_sha256),
++        "core": core,
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++        "sha256_eval_json": _sha256_file(out1 / "eval.json"),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-15 14:01:06
++++ tests/test_dialogue_survival_gate_v116.py	2026-01-15 13:53:01
+@@ -0,0 +1,58 @@
++from __future__ import annotations
++
++import unittest
++
++from atos_core.dialogue_survival_gate_v116 import (
++    DIALOGUE_SURVIVAL_REASON_CONTRADICTION_V116,
++    DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116,
++    DIALOGUE_SURVIVAL_REASON_OK_V116,
++    DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116,
++    decide_dialogue_survival_v116,
++)
++
++
++class TestDialogueSurvivalGateV116(unittest.TestCase):
++    def test_pass(self) -> None:
++        dec = decide_dialogue_survival_v116(
++            fluency_ok=True,
++            fluency_reason="ok",
++            fluency_details={},
++            unresolved_reference_final=0,
++            contradiction_flags_total=0,
++        )
++        self.assertTrue(dec.ok)
++        self.assertEqual(dec.reason_code, DIALOGUE_SURVIVAL_REASON_OK_V116)
++
++    def test_fail_fluency(self) -> None:
++        dec = decide_dialogue_survival_v116(
++            fluency_ok=False,
++            fluency_reason="most_common_reply_frac_too_high",
++            fluency_details={"x": 1},
++            unresolved_reference_final=0,
++            contradiction_flags_total=0,
++        )
++        self.assertFalse(dec.ok)
++        self.assertEqual(dec.reason_code, DIALOGUE_SURVIVAL_REASON_FLUENCY_FAIL_V116)
++
++    def test_fail_unresolved_reference(self) -> None:
++        dec = decide_dialogue_survival_v116(
++            fluency_ok=True,
++            fluency_reason="ok",
++            fluency_details={},
++            unresolved_reference_final=1,
++            contradiction_flags_total=0,
++        )
++        self.assertFalse(dec.ok)
++        self.assertEqual(dec.reason_code, DIALOGUE_SURVIVAL_REASON_UNRESOLVED_REFERENCE_V116)
++
++    def test_fail_contradiction(self) -> None:
++        dec = decide_dialogue_survival_v116(
++            fluency_ok=True,
++            fluency_reason="ok",
++            fluency_details={},
++            unresolved_reference_final=0,
++            contradiction_flags_total=2,
++        )
++        self.assertFalse(dec.ok)
++        self.assertEqual(dec.reason_code, DIALOGUE_SURVIVAL_REASON_CONTRADICTION_V116)
++

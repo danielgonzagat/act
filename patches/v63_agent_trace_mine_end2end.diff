@@ -1,0 +1,1685 @@
+--- patches/v63_base/verify_freeze.py	2026-01-11 18:17:36
++++ scripts/verify_freeze.py	2026-01-11 18:22:43
+@@ -109,7 +109,13 @@
+     sha = freeze.get("sha256")
+     sha = sha if isinstance(sha, dict) else {}
+ 
+-    derived = _derive_sha256_paths(freeze)
++    # Prefer explicit mapping when provided (stronger + future-proof); fallback to
++    # project conventions for legacy freezes.
++    explicit_paths = freeze.get("sha256_paths")
++    if isinstance(explicit_paths, dict):
++        derived = {str(k): str(v) for k, v in explicit_paths.items() if str(k) and str(v)}
++    else:
++        derived = _derive_sha256_paths(freeze)
+     missing_paths: List[Dict[str, Any]] = []
+     hash_mismatches: List[Dict[str, Any]] = []
+     invariant_failures: List[Dict[str, Any]] = []
+@@ -171,4 +177,3 @@
+ 
+ if __name__ == "__main__":
+     main()
+-
+--- /dev/null	2026-01-11 18:34:48
++++ atos_core/agent_v63.py	2026-01-11 18:26:57
+@@ -0,0 +1,433 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from .concepts import PRIMITIVE_OPS
++
++
++def stable_act_id(prefix: str, body: Dict[str, Any]) -> str:
++    return f"{prefix}{sha256_hex(canonical_json_dumps(body).encode('utf-8'))[:12]}"
++
++
++def make_concept_act(
++    *,
++    step: int,
++    store_hash_excl_semantic: str,
++    title: str,
++    program: Sequence[Instruction],
++    interface: Dict[str, Any],
++    overhead_bits: int = 1024,
++    meta: Optional[Dict[str, Any]] = None,
++) -> Act:
++    ev = {
++        "name": "concept_csv_v0",
++        "interface": dict(interface),
++        "meta": {
++            "title": str(title),
++            "trained_on_store_content_hash": str(store_hash_excl_semantic),
++            **(dict(meta or {})),
++        },
++    }
++    body = {
++        "kind": "concept_csv",
++        "version": 1,
++        "match": {},
++        "program": [ins.to_dict() for ins in program],
++        "evidence": ev,
++        "deps": [],
++        "active": True,
++    }
++    act_id = stable_act_id("act_concept_csv_", body)
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=int(step)),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence=ev,
++        cost={"overhead_bits": int(overhead_bits)},
++        deps=[],
++        active=True,
++    )
++
++
++def make_goal_act(
++    *,
++    step: int,
++    store_hash_excl_semantic: str,
++    title: str,
++    concept_id: str,
++    inputs: Dict[str, Any],
++    expected: Any,
++    priority: int = 10,
++    overhead_bits: int = 1024,
++) -> Act:
++    ev = {
++        "name": "goal_v0",
++        "meta": {
++            "title": str(title),
++            "trained_on_store_content_hash": str(store_hash_excl_semantic),
++        },
++        "goal": {
++            "priority": int(priority),
++            "concept_id": str(concept_id),
++            "inputs": dict(inputs),
++            "expected": expected,
++        },
++    }
++    body = {
++        "kind": "goal",
++        "version": 1,
++        "match": {},
++        "program": [],
++        "evidence": ev,
++        "deps": [],
++        "active": True,
++    }
++    act_id = stable_act_id("act_goal_", body)
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=int(step)),
++        kind="goal",
++        match={},
++        program=[],
++        evidence=ev,
++        cost={"overhead_bits": int(overhead_bits)},
++        deps=[],
++        active=True,
++    )
++
++
++def _op(op_id: str) -> Any:
++    spec_fn = PRIMITIVE_OPS.get(str(op_id))
++    if spec_fn is None:
++        raise KeyError(f"unknown_primitive:{op_id}")
++    return spec_fn[1]
++
++
++def extract_int(text: str, *, strip_one_zero: bool) -> int:
++    scan = _op("scan_digits")
++    strip0 = _op("strip_one_leading_zero")
++    d2i = _op("digits_to_int")
++    digits = scan(str(text))
++    if bool(strip_one_zero):
++        digits = strip0(digits)
++    return int(d2i(digits))
++
++
++def build_v63_toolbox(
++    *,
++    step: int,
++    store_hash_excl_semantic: str,
++    overhead_bits: int = 1024,
++) -> Dict[str, Act]:
++    """
++    Deterministic toolbox of small concept_csv programs used by v63 agent loop.
++    """
++    # extract_int: scan_digits -> digits_to_int
++    c_extract = make_concept_act(
++        step=step,
++        store_hash_excl_semantic=store_hash_excl_semantic,
++        title="v63_extract_int",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "text", "out": "t"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["t"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "n"}),
++            Instruction("CSV_RETURN", {"var": "n"}),
++        ],
++        interface={"input_schema": {"text": "str"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"},
++        overhead_bits=overhead_bits,
++        meta={"builder": "agent_v63_toolbox"},
++    )
++
++    # extract_int_strip0: scan_digits -> strip_one_leading_zero -> digits_to_int
++    c_extract_strip0 = make_concept_act(
++        step=step + 1,
++        store_hash_excl_semantic=store_hash_excl_semantic,
++        title="v63_extract_int_strip0",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "text", "out": "t"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["t"], "out": "d0"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "strip_one_leading_zero", "in": ["d0"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "n"}),
++            Instruction("CSV_RETURN", {"var": "n"}),
++        ],
++        interface={"input_schema": {"text": "str"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"},
++        overhead_bits=overhead_bits,
++        meta={"builder": "agent_v63_toolbox"},
++    )
++
++    # add_int: add_int(a,b) -> int
++    c_add = make_concept_act(
++        step=step + 2,
++        store_hash_excl_semantic=store_hash_excl_semantic,
++        title="v63_add_int",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "a", "out": "a0"}),
++            Instruction("CSV_GET_INPUT", {"name": "b", "out": "b0"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["a0", "b0"], "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++        interface={"input_schema": {"a": "int", "b": "int"}, "output_schema": {"value": "int"}, "validator_id": "int_value_exact"},
++        overhead_bits=overhead_bits,
++        meta={"builder": "agent_v63_toolbox"},
++    )
++
++    # json_ab: make_dict_ab(a,b) -> json_canonical(dict) -> str
++    c_json_ab = make_concept_act(
++        step=step + 3,
++        store_hash_excl_semantic=store_hash_excl_semantic,
++        title="v63_json_ab",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "a", "out": "a0"}),
++            Instruction("CSV_GET_INPUT", {"name": "b", "out": "b0"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "make_dict_ab", "in": ["a0", "b0"], "out": "obj"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "json_canonical", "in": ["obj"], "out": "s"}),
++            Instruction("CSV_RETURN", {"var": "s"}),
++        ],
++        interface={"input_schema": {"a": "int", "b": "int"}, "output_schema": {"value": "str"}, "validator_id": "json_ab_int_exact"},
++        overhead_bits=overhead_bits,
++        meta={"builder": "agent_v63_toolbox"},
++    )
++
++    return {
++        "extract_int": c_extract,
++        "extract_int_strip0": c_extract_strip0,
++        "add_int": c_add,
++        "json_ab": c_json_ab,
++    }
++
++
++@dataclass(frozen=True)
++class V63Task:
++    task_id: str
++    category: str
++    prompt_text: str
++    kind: str
++    args: Dict[str, Any]
++
++
++def build_v63_tasks() -> List[V63Task]:
++    tasks: List[V63Task] = []
++
++    # A) Parsing/extraction/normalization (10)
++    parse_texts = [
++        "abc0123",
++        "x9y7",
++        "id=42",
++        "ref0005Z",
++        "A=0000",
++        "user_77_end",
++        "n=100",
++        "t0099",
++        "k=5",
++        "zzz123zzz",
++    ]
++    for i, text in enumerate(parse_texts):
++        strip0 = bool(i % 2 == 0)
++        tasks.append(
++            V63Task(
++                task_id=f"v63_parse_{i:02d}",
++                category="parse",
++                prompt_text=f'Extraia o primeiro inteiro da string "{text}" e responda apenas o número.',
++                kind="extract_int",
++                args={"text": str(text), "strip0": bool(strip0)},
++            )
++        )
++
++    # B) JSON (10)
++    json_pairs: List[Tuple[int, int]] = [
++        (17, 25),
++        (9, 7),
++        (1, 0),
++        (42, 63),
++        (5, 5),
++        (3, 14),
++        (99, 1),
++        (8, 13),
++        (0, 11),
++        (12, 30),
++    ]
++    for i, (a, b) in enumerate(json_pairs):
++        tasks.append(
++            V63Task(
++                task_id=f"v63_json_{i:02d}",
++                category="json",
++                prompt_text=f"Retorne um JSON canônico apenas com chaves a,b inteiros: a={a}, b={b}.",
++                kind="json_ab",
++                args={"a": int(a), "b": int(b)},
++            )
++        )
++
++    # C) Arithmetic multi-step (7)
++    sums: List[Tuple[str, str]] = [
++        ("a=1", "b=2"),
++        ("x09y", "z7"),
++        ("id=10", "k=5"),
++        ("m=0003", "n=0004"),
++        ("p=12", "q=30"),
++        ("u=99", "v=1"),
++        ("foo42bar", "baz63"),
++    ]
++    for i, (ta, tb) in enumerate(sums):
++        tasks.append(
++            V63Task(
++                task_id=f"v63_math_{i:02d}",
++                category="math",
++                prompt_text=f'Some os inteiros extraídos de "{ta}" e "{tb}" e responda apenas o número.',
++                kind="sum_two_texts",
++                args={"text_a": str(ta), "text_b": str(tb), "strip0_a": True, "strip0_b": False},
++            )
++        )
++
++    # D) Planning explicit (3) — extract -> calc -> serialize
++    plans: List[Tuple[str, str]] = [
++        ("A=0002", "B=40"),
++        ("x9", "y7"),
++        ("foo17", "bar25"),
++    ]
++    for i, (ta, tb) in enumerate(plans):
++        tasks.append(
++            V63Task(
++                task_id=f"v63_plan_{i:02d}",
++                category="plan",
++                prompt_text=(
++                    f'Plano: extraia A de "{ta}", extraia B de "{tb}", compute S=A+B e responda JSON {{"a":S,"b":B}}.'
++                ),
++                kind="plan_json_sum",
++                args={"text_a": str(ta), "text_b": str(tb), "strip0_a": True, "strip0_b": False},
++            )
++        )
++
++    assert len(tasks) >= 30
++    return tasks
++
++
++def plan_task_steps(task: V63Task) -> List[Dict[str, Any]]:
++    """
++    Deterministic planner: returns a list of step specs, each with:
++      - step_name
++      - concept_key
++      - inputs
++      - expected (for validator)
++      - expected_output_text
++    """
++    kind = str(task.kind)
++    a: Any
++    b: Any
++    steps: List[Dict[str, Any]] = []
++
++    if kind == "extract_int":
++        text = str(task.args.get("text") or "")
++        strip0 = bool(task.args.get("strip0", False))
++        n = extract_int(text, strip_one_zero=strip0)
++        steps.append(
++            {
++                "step_name": "extract_int",
++                "concept_key": "extract_int_strip0" if strip0 else "extract_int",
++                "inputs": {"text": str(text)},
++                "expected": int(n),
++                "expected_output_text": str(int(n)),
++            }
++        )
++        return steps
++
++    if kind == "json_ab":
++        a = int(task.args.get("a", 0) or 0)
++        b = int(task.args.get("b", 0) or 0)
++        expected = {"a": int(a), "b": int(b)}
++        steps.append(
++            {
++                "step_name": "json_ab",
++                "concept_key": "json_ab",
++                "inputs": {"a": int(a), "b": int(b)},
++                "expected": dict(expected),
++                "expected_output_text": canonical_json_dumps(expected),
++            }
++        )
++        return steps
++
++    if kind == "sum_two_texts":
++        ta = str(task.args.get("text_a") or "")
++        tb = str(task.args.get("text_b") or "")
++        strip0_a = bool(task.args.get("strip0_a", False))
++        strip0_b = bool(task.args.get("strip0_b", False))
++        a = extract_int(ta, strip_one_zero=strip0_a)
++        b = extract_int(tb, strip_one_zero=strip0_b)
++        s = int(a) + int(b)
++        steps.extend(
++            [
++                {
++                    "step_name": "extract_a",
++                    "concept_key": "extract_int_strip0" if strip0_a else "extract_int",
++                    "inputs": {"text": str(ta)},
++                    "expected": int(a),
++                    "expected_output_text": str(int(a)),
++                },
++                {
++                    "step_name": "extract_b",
++                    "concept_key": "extract_int_strip0" if strip0_b else "extract_int",
++                    "inputs": {"text": str(tb)},
++                    "expected": int(b),
++                    "expected_output_text": str(int(b)),
++                },
++                {
++                    "step_name": "add",
++                    "concept_key": "add_int",
++                    "inputs": {"a": int(a), "b": int(b)},
++                    "expected": int(s),
++                    "expected_output_text": str(int(s)),
++                },
++            ]
++        )
++        return steps
++
++    if kind == "plan_json_sum":
++        ta = str(task.args.get("text_a") or "")
++        tb = str(task.args.get("text_b") or "")
++        strip0_a = bool(task.args.get("strip0_a", False))
++        strip0_b = bool(task.args.get("strip0_b", False))
++        a = extract_int(ta, strip_one_zero=strip0_a)
++        b = extract_int(tb, strip_one_zero=strip0_b)
++        s = int(a) + int(b)
++        expected_json = {"a": int(s), "b": int(b)}
++        steps.extend(
++            [
++                {
++                    "step_name": "extract_a",
++                    "concept_key": "extract_int_strip0" if strip0_a else "extract_int",
++                    "inputs": {"text": str(ta)},
++                    "expected": int(a),
++                    "expected_output_text": str(int(a)),
++                },
++                {
++                    "step_name": "extract_b",
++                    "concept_key": "extract_int_strip0" if strip0_b else "extract_int",
++                    "inputs": {"text": str(tb)},
++                    "expected": int(b),
++                    "expected_output_text": str(int(b)),
++                },
++                {
++                    "step_name": "add",
++                    "concept_key": "add_int",
++                    "inputs": {"a": int(a), "b": int(b)},
++                    "expected": int(s),
++                    "expected_output_text": str(int(s)),
++                },
++                {
++                    "step_name": "json",
++                    "concept_key": "json_ab",
++                    "inputs": {"a": int(s), "b": int(b)},
++                    "expected": dict(expected_json),
++                    "expected_output_text": canonical_json_dumps(expected_json),
++                },
++            ]
++        )
++        return steps
++
++    raise ValueError(f"unknown_task_kind:{kind}")
++
+--- /dev/null	2026-01-11 18:34:48
++++ scripts/agent_loop_v63.py	2026-01-11 18:32:52
+@@ -0,0 +1,275 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.agent_v63 import build_v63_tasks, build_v63_toolbox, plan_task_steps, stable_act_id
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++from atos_core.proof import program_sha256
++from atos_core.act import Act
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> str:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def write_text(path: str, text: str) -> str:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    ensure_absent(path)
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(text)
++    return sha256_file(path)
++
++
++def _events_sig(events: List[Dict[str, Any]]) -> str:
++    return sha256_hex(canonical_json_dumps(events).encode("utf-8"))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True, help="Base run dir containing acts.jsonl")
++    ap.add_argument("--out", required=True, help="WORM out dir (must not exist)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_steps", type=int, default=512)
++    ap.add_argument("--max_depth", type=int, default=8)
++    ap.add_argument("--max_events_per_step", type=int, default=128)
++    args = ap.parse_args()
++
++    ensure_absent(args.out)
++    os.makedirs(args.out, exist_ok=False)
++    traces_dir = os.path.join(args.out, "traces")
++    os.makedirs(traces_dir, exist_ok=False)
++
++    base_acts = os.path.join(args.acts_run, "acts.jsonl")
++    if not os.path.exists(base_acts):
++        _fail(f"ERROR: missing base acts.jsonl: {base_acts}")
++    base_acts_sha256 = sha256_file(base_acts)
++    run_id = f"agent_loop_v63␟acts={base_acts_sha256}␟seed={int(args.seed)}"
++
++    store = ActStore.load_jsonl(base_acts)
++    store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig", "concept_csv", "goal"])
++
++    toolbox = build_v63_toolbox(step=1, store_hash_excl_semantic=store_hash_excl, overhead_bits=1024)
++    for act in toolbox.values():
++        if store.get(act.id) is None:
++            store.add(act)
++
++    engine = Engine(store, seed=int(args.seed), config=EngineConfig())
++
++    tasks = build_v63_tasks()
++    trace_rows: List[Dict[str, Any]] = []
++    task_results: List[Dict[str, Any]] = []
++    steps_total = 0
++    tasks_ok = 0
++
++    by_cat_total: Dict[str, int] = {}
++    by_cat_ok: Dict[str, int] = {}
++
++    ethics_passed = 0
++    uncertainty_ic_count = 0
++
++    for ti, task in enumerate(tasks):
++        cat = str(task.category)
++        by_cat_total[cat] = by_cat_total.get(cat, 0) + 1
++
++        plan = plan_task_steps(task)
++        plan_view = [{"step_name": s["step_name"], "concept_key": s["concept_key"]} for s in plan]
++
++        task_ok = True
++        last_output_text = ""
++        last_expected_text = ""
++
++        for si, step in enumerate(plan):
++            if steps_total >= int(args.max_steps):
++                _fail("ERROR: max_steps exceeded")
++
++            concept_key = str(step["concept_key"])
++            concept = toolbox.get(concept_key)
++            if concept is None:
++                _fail(f"ERROR: missing toolbox concept: {concept_key}")
++
++            inputs = step["inputs"]
++            expected = step["expected"]
++            expected_text = str(step["expected_output_text"] or "")
++
++            goal_ev = {
++                "name": "goal_v0",
++                "meta": {"title": f"agent_v63:{task.task_id}:{step['step_name']}"},
++                "goal": {
++                    "priority": 10,
++                    "concept_id": str(concept.id),
++                    "inputs": dict(inputs),
++                    "expected": expected,
++                },
++            }
++            goal_body = {
++                "kind": "goal",
++                "version": 1,
++                "match": {},
++                "program": [],
++                "evidence": goal_ev,
++                "deps": [],
++                "active": True,
++            }
++            goal_id = stable_act_id("act_goal_", goal_body)
++            if store.get(goal_id) is None:
++                store.add(
++                    Act(
++                        id=str(goal_id),
++                        version=1,
++                        created_at="1970-01-01T00:00:00+00:00",
++                        kind="goal",
++                        match={},
++                        program=[],
++                        evidence=goal_ev,
++                        cost={"overhead_bits": 0},
++                        deps=[],
++                        active=True,
++                    )
++                )
++
++            r = engine.execute_goal(goal_act_id=str(goal_id), step=int(steps_total), max_depth=int(args.max_depth))
++            tr = r.get("trace") if isinstance(r, dict) else {}
++            tr = tr if isinstance(tr, dict) else {}
++            meta = tr.get("concept_meta") if isinstance(tr.get("concept_meta"), dict) else {}
++            meta = meta if isinstance(meta, dict) else {}
++
++            out_text = str(meta.get("output_text") or "")
++            ok = bool(r.get("ok", False))
++            reason = str(r.get("reason") or "")
++            selected_concept_id = str(tr.get("selected_concept_id") or "")
++
++            eth = meta.get("ethics") if isinstance(meta.get("ethics"), dict) else {}
++            unc = meta.get("uncertainty") if isinstance(meta.get("uncertainty"), dict) else {}
++            if bool(eth.get("ok", True)):
++                ethics_passed += 1
++            if str(unc.get("mode_out") or "") == "IC":
++                uncertainty_ic_count += 1
++
++            events_full = r.get("events") if isinstance(r, dict) else []
++            events_full = events_full if isinstance(events_full, list) else []
++            events: List[Dict[str, Any]] = []
++            for ev in events_full[: int(args.max_events_per_step)]:
++                if isinstance(ev, dict):
++                    events.append(dict(ev))
++            events_truncated = len(events_full) > len(events)
++
++            ctx_sig = f"agent_v63␟task={task.task_id}␟step={si}"
++            row = {
++                "run_id": str(run_id),
++                "ctx_sig": str(ctx_sig),
++                "task_id": str(task.task_id),
++                "category": str(cat),
++                "prompt_text": str(task.prompt_text),
++                "plan": plan_view if si == 0 else None,
++                "step_id": int(steps_total),
++                "goal_id": str(goal_id),
++                "step_name": str(step["step_name"]),
++                "inputs": dict(inputs),
++                "output_text": str(out_text),
++                "expected_output_text": str(expected_text),
++                "ok": bool(ok),
++                "reason": str(reason),
++                "selected_concept_id": str(selected_concept_id),
++                "program_sig": str(program_sha256(concept)),
++                "events_sig": str(_events_sig(events)),
++                "events_truncated": bool(events_truncated),
++                "events": events,
++            }
++            trace_rows.append(row)
++
++            last_output_text = out_text
++            last_expected_text = expected_text
++            if (not ok) or (out_text != expected_text):
++                task_ok = False
++
++            steps_total += 1
++
++        if task_ok:
++            tasks_ok += 1
++            by_cat_ok[cat] = by_cat_ok.get(cat, 0) + 1
++
++        task_results.append(
++            {
++                "task_id": str(task.task_id),
++                "category": str(cat),
++                "ok": bool(task_ok),
++                "final_output_text": str(last_output_text),
++                "final_expected_output_text": str(last_expected_text),
++            }
++        )
++
++    # Persist trace + summaries (WORM).
++    trace_path = os.path.join(traces_dir, "agent_trace_v63.jsonl")
++    trace_sha256 = write_jsonl(trace_path, trace_rows)
++
++    summary = {
++        "seed": int(args.seed),
++        "tasks_total": int(len(tasks)),
++        "tasks_ok": int(tasks_ok),
++        "pass_rate": float(tasks_ok / max(1, len(tasks))),
++        "steps_total": int(steps_total),
++        "by_category_total": dict(sorted(by_cat_total.items(), key=lambda kv: str(kv[0]))),
++        "by_category_ok": dict(sorted(by_cat_ok.items(), key=lambda kv: str(kv[0]))),
++        "ethics_checks_passed": int(ethics_passed),
++        "uncertainty_ic_count": int(uncertainty_ic_count),
++        "agent_trace_sha256": str(trace_sha256),
++    }
++
++    summary_csv = os.path.join(args.out, "summary.csv")
++    ensure_absent(summary_csv)
++    with open(summary_csv, "w", encoding="utf-8") as f:
++        f.write("seed,tasks_total,tasks_ok,pass_rate,steps_total,ethics_checks_passed,uncertainty_ic_count,agent_trace_sha256\n")
++        f.write(
++            f"{summary['seed']},{summary['tasks_total']},{summary['tasks_ok']},{summary['pass_rate']},{summary['steps_total']},{summary['ethics_checks_passed']},{summary['uncertainty_ic_count']},{summary['agent_trace_sha256']}\n"
++        )
++
++    summary_json = os.path.join(args.out, "summary.json")
++    write_text(
++        summary_json,
++        json.dumps({"summary": summary, "tasks": task_results}, ensure_ascii=False, indent=2, sort_keys=True),
++    )
++
++    print(json.dumps({"summary": summary, "out_dir": str(args.out)}, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-11 18:34:48
++++ scripts/agent_trace_mine_end2end_v63.py	2026-01-11 18:33:48
+@@ -0,0 +1,626 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, Patch, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.agent_v63 import build_v63_tasks, build_v63_toolbox, make_concept_act, make_goal_act, plan_task_steps
++from atos_core.csv_miner import materialize_concept_act_from_candidate, mine_csv_candidates
++from atos_core.engine import Engine, EngineConfig
++from atos_core.ethics import validate_act_for_promotion
++from atos_core.ledger import Ledger
++from atos_core.proof import act_body_sha256_placeholder, build_concept_pcc_certificate_v2, verify_concept_pcc_v2
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_jsonl(path: str, rows: Sequence[Dict[str, Any]]) -> str:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        for r in rows:
++            f.write(canonical_json_dumps(r))
++            f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def write_promoted_acts_preserve_order(
++    *, base_acts_path: str, out_acts_path: str, appended_acts: Sequence[Act]
++) -> str:
++    with open(base_acts_path, "rb") as f:
++        base_bytes = f.read()
++    if base_bytes and not base_bytes.endswith(b"\n"):
++        base_bytes += b"\n"
++    tail = b"".join(canonical_json_dumps(a.to_dict()).encode("utf-8") + b"\n" for a in appended_acts)
++    tmp = out_acts_path + ".tmp"
++    with open(tmp, "wb") as f:
++        f.write(base_bytes)
++        f.write(tail)
++    os.replace(tmp, out_acts_path)
++    return sha256_file(out_acts_path)
++
++
++def _unique_vectors_from_examples(examples: Sequence[Dict[str, Any]], *, min_vectors: int = 3) -> List[Dict[str, Any]]:
++    uniq: set = set()
++    out: List[Dict[str, Any]] = []
++    for ex in examples:
++        if not isinstance(ex, dict):
++            continue
++        sig = str(ex.get("expected_sig") or "")
++        if not sig or sig in uniq:
++            continue
++        uniq.add(sig)
++        out.append(
++            {
++                "inputs": dict(ex.get("inputs") or {}),
++                "expected": ex.get("expected"),
++                "expected_output_text": str(ex.get("expected_output_text") or ""),
++            }
++        )
++        if len(out) >= int(min_vectors):
++            break
++    return out
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--max_steps", type=int, default=512)
++    ap.add_argument("--max_depth", type=int, default=8)
++    ap.add_argument("--max_events_per_step", type=int, default=128)
++    ap.add_argument("--top_k_candidates", type=int, default=6)
++    ap.add_argument("--max_total_overhead_bits", type=int, default=4096)
++    ap.add_argument("--concept_overhead_bits", type=int, default=1024)
++    ap.add_argument("--patch_diff", default="")
++    ap.add_argument("--freeze_path", default="")
++    args = ap.parse_args()
++
++    ensure_absent(args.out)
++    if args.freeze_path:
++        ensure_absent(args.freeze_path)
++    os.makedirs(args.out, exist_ok=False)
++    traces_dir = os.path.join(args.out, "traces")
++    os.makedirs(traces_dir, exist_ok=False)
++
++    base_acts = os.path.join(args.acts_run, "acts.jsonl")
++    if not os.path.exists(base_acts):
++        _fail(f"ERROR: missing base acts.jsonl: {base_acts}")
++    base_acts_sha256 = sha256_file(base_acts)
++    run_id = f"agent_trace_mine_v63␟acts={base_acts_sha256}␟seed={int(args.seed)}"
++
++    store = ActStore.load_jsonl(base_acts)
++    store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig", "concept_csv", "goal"])
++
++    toolbox = build_v63_toolbox(step=1, store_hash_excl_semantic=store_hash_excl, overhead_bits=1024)
++    for act in toolbox.values():
++        if store.get(act.id) is None:
++            store.add(act)
++    engine = Engine(store, seed=int(args.seed), config=EngineConfig())
++
++    # (1) Agent loop (deterministic) producing miner-ready traces (INS events).
++    tasks = build_v63_tasks()
++    trace_rows: List[Dict[str, Any]] = []
++    task_rows: List[Dict[str, Any]] = []
++
++    by_cat_total: Dict[str, int] = {}
++    by_cat_ok: Dict[str, int] = {}
++    tasks_ok = 0
++    steps_total = 0
++    ethics_passed = 0
++    ic_count = 0
++
++    for task in tasks:
++        cat = str(task.category)
++        by_cat_total[cat] = by_cat_total.get(cat, 0) + 1
++
++        plan = plan_task_steps(task)
++        plan_view = [{"step_name": s["step_name"], "concept_key": s["concept_key"]} for s in plan]
++
++        task_ok = True
++        last_out = ""
++        last_exp = ""
++        for si, step in enumerate(plan):
++            if steps_total >= int(args.max_steps):
++                _fail("ERROR: max_steps exceeded")
++
++            concept_key = str(step["concept_key"])
++            concept = toolbox.get(concept_key)
++            if concept is None:
++                _fail(f"ERROR: missing toolbox concept: {concept_key}")
++
++            inputs = dict(step["inputs"])
++            expected = step["expected"]
++            expected_text = str(step["expected_output_text"] or "")
++
++            # Create a goal act (deterministic id) and execute via Engine.execute_goal.
++            g = make_goal_act(
++                step=steps_total,
++                store_hash_excl_semantic=store_hash_excl,
++                title=f"agent_v63:{task.task_id}:{step['step_name']}",
++                concept_id=str(concept.id),
++                inputs=dict(inputs),
++                expected=expected,
++                priority=10,
++                overhead_bits=0,
++            )
++            if store.get(g.id) is None:
++                store.add(g)
++
++            r = engine.execute_goal(goal_act_id=str(g.id), step=int(steps_total), max_depth=int(args.max_depth))
++            tr = r.get("trace") if isinstance(r, dict) else {}
++            tr = tr if isinstance(tr, dict) else {}
++            meta = tr.get("concept_meta") if isinstance(tr.get("concept_meta"), dict) else {}
++            meta = meta if isinstance(meta, dict) else {}
++            eth = meta.get("ethics") if isinstance(meta.get("ethics"), dict) else {}
++            unc = meta.get("uncertainty") if isinstance(meta.get("uncertainty"), dict) else {}
++            if bool(eth.get("ok", True)):
++                ethics_passed += 1
++            if str(unc.get("mode_out") or "") == "IC":
++                ic_count += 1
++
++            out_text = str(meta.get("output_text") or "")
++            ok = bool(r.get("ok", False))
++            reason = str(r.get("reason") or "")
++            selected_concept_id = str(tr.get("selected_concept_id") or "")
++
++            events_full = r.get("events") if isinstance(r, dict) else []
++            events_full = events_full if isinstance(events_full, list) else []
++            events: List[Dict[str, Any]] = []
++            for ev in events_full[: int(args.max_events_per_step)]:
++                if isinstance(ev, dict):
++                    events.append(dict(ev))
++            events_truncated = len(events_full) > len(events)
++
++            row = {
++                "run_id": str(run_id),
++                "ctx_sig": f"agent_v63␟task={task.task_id}␟step={si}",
++                "task_id": str(task.task_id),
++                "category": str(cat),
++                "prompt_text": str(task.prompt_text),
++                "plan": plan_view if si == 0 else None,
++                "step_id": int(steps_total),
++                "goal_id": str(g.id),
++                "step_name": str(step["step_name"]),
++                "inputs": dict(inputs),
++                "output_text": str(out_text),
++                "expected_output_text": str(expected_text),
++                "ok": bool(ok),
++                "reason": str(reason),
++                "selected_concept_id": str(selected_concept_id),
++                "events_sig": sha256_hex(canonical_json_dumps(events).encode("utf-8")),
++                "events_truncated": bool(events_truncated),
++                "events": events,
++            }
++            trace_rows.append(row)
++
++            last_out = out_text
++            last_exp = expected_text
++            if (not ok) or (out_text != expected_text):
++                task_ok = False
++
++            steps_total += 1
++
++        if task_ok:
++            tasks_ok += 1
++            by_cat_ok[cat] = by_cat_ok.get(cat, 0) + 1
++
++        task_rows.append(
++            {
++                "task_id": str(task.task_id),
++                "category": str(cat),
++                "ok": bool(task_ok),
++                "final_output_text": str(last_out),
++                "final_expected_output_text": str(last_exp),
++            }
++        )
++
++    agent_trace_path = os.path.join(traces_dir, "agent_trace_v63.jsonl")
++    agent_trace_sha256 = write_jsonl(agent_trace_path, trace_rows)
++
++    # (2) Mine candidates from agent traces.
++    candidates = mine_csv_candidates(
++        agent_trace_path,
++        min_ops=2,
++        max_ops=6,
++        bits_per_op=128,
++        overhead_bits=int(args.concept_overhead_bits),
++    )
++    if len(candidates) < 2:
++        _fail(f"ERROR: expected >=2 candidates, got {len(candidates)}")
++    mined_candidates_path = os.path.join(args.out, "mined_candidates.json")
++    ensure_absent(mined_candidates_path)
++    with open(mined_candidates_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps([c.to_dict() for c in candidates], ensure_ascii=False, indent=2))
++
++    # (3) Materialize top-K candidates and attach PCC v2 (deterministic).
++    top_k = max(1, int(args.top_k_candidates))
++    top = candidates[:top_k]
++    materialized: List[Act] = []
++    rejected: List[Dict[str, Any]] = []
++
++    for idx, cand in enumerate(top):
++        concept = materialize_concept_act_from_candidate(
++            cand,
++            step=200 + idx,
++            store_content_hash_excluding_semantic=store_hash_excl,
++            title=f"mined_concept_v63_rank{idx:02d}",
++            overhead_bits=int(args.concept_overhead_bits),
++            meta={
++                "builder": "agent_trace_v63",
++                "trace_file_sha256": str(agent_trace_sha256),
++                "gain_bits_est": int(cand.gain_bits_est),
++            },
++        )
++        vecs = _unique_vectors_from_examples(cand.examples, min_vectors=3)
++        if len(vecs) < 3:
++            rejected.append({"candidate_sig": str(cand.candidate_sig), "reason": "not_enough_vectors"})
++            continue
++
++        ethics = validate_act_for_promotion(concept)
++        if not bool(ethics.ok):
++            rejected.append(
++                {"candidate_sig": str(cand.candidate_sig), "reason": "ethics_fail_closed", "ethics": ethics.to_dict()}
++            )
++            continue
++
++        cert = build_concept_pcc_certificate_v2(
++            concept,
++            store=store,
++            mined_from={
++                "trace_file_sha256": str(agent_trace_sha256),
++                "store_hash_excluding_semantic": str(store_hash_excl),
++                "seed": int(args.seed),
++                "candidate_sig": str(cand.candidate_sig),
++            },
++            test_vectors=list(vecs),
++            ethics_verdict=ethics.to_dict(),
++            uncertainty_policy="no_ic",
++        )
++        concept.evidence.setdefault("certificate_v2", cert)
++        try:
++            concept.evidence["certificate_v2"]["hashes"]["act_body_sha256"] = act_body_sha256_placeholder(concept)
++        except Exception:
++            pass
++
++        pv = verify_concept_pcc_v2(concept, store)
++        if not bool(pv.ok):
++            rejected.append({"candidate_sig": str(cand.candidate_sig), "reason": "pcc_verify_failed", "pcc": pv.to_dict()})
++            continue
++        materialized.append(concept)
++
++    if len(materialized) < 2:
++        _fail(f"ERROR: expected >=2 materialized concepts, got {len(materialized)}")
++
++    # (4) Create one wrapper concept with CSV_CALL to the first mined int concept.
++    callee_int: Optional[Act] = None
++    for c in materialized:
++        iface = c.evidence.get("interface") if isinstance(c.evidence, dict) else {}
++        iface = iface if isinstance(iface, dict) else {}
++        if str(iface.get("validator_id") or "") == "int_value_exact":
++            callee_int = c
++            break
++    if callee_int is None:
++        _fail("ERROR: missing int concept for wrapper")
++
++    callee_iface = callee_int.evidence.get("interface") if isinstance(callee_int.evidence, dict) else {}
++    callee_iface = callee_iface if isinstance(callee_iface, dict) else {}
++    in_schema = callee_iface.get("input_schema") if isinstance(callee_iface.get("input_schema"), dict) else {}
++    in_schema = dict(in_schema)
++    out_schema = callee_iface.get("output_schema") if isinstance(callee_iface.get("output_schema"), dict) else {}
++    out_schema = dict(out_schema)
++    validator_id = str(callee_iface.get("validator_id") or "")
++    in_keys = sorted(list(in_schema.keys()))
++
++    wrapper_prog: List[Instruction] = []
++    bind: Dict[str, str] = {}
++    for idx, name in enumerate(in_keys):
++        wrapper_prog.append(Instruction("CSV_GET_INPUT", {"name": str(name), "out": f"in{idx}"}))
++        bind[str(name)] = f"in{idx}"
++    wrapper_prog.append(Instruction("CSV_CALL", {"concept_id": str(callee_int.id), "out": "out0", "bind": dict(bind)}))
++    wrapper_prog.append(Instruction("CSV_RETURN", {"var": "out0"}))
++
++    wrapper = make_concept_act(
++        step=400,
++        store_hash_excl_semantic=store_hash_excl,
++        title="wrapper_call_mined_int_v63",
++        program=wrapper_prog,
++        interface={"input_schema": dict(in_schema), "output_schema": dict(out_schema), "validator_id": str(validator_id)},
++        overhead_bits=int(args.concept_overhead_bits),
++        meta={"builder": "wrapper_v63", "callee_id": str(callee_int.id)},
++    )
++
++    callee_cert = callee_int.evidence.get("certificate_v2") if isinstance(callee_int.evidence, dict) else {}
++    callee_cert = callee_cert if isinstance(callee_cert, dict) else {}
++    callee_vecs = callee_cert.get("test_vectors") if isinstance(callee_cert.get("test_vectors"), list) else []
++    callee_vecs = list(callee_vecs)
++    wrapper_vecs = callee_vecs[:3]
++    if len(wrapper_vecs) < 3:
++        _fail("ERROR: callee missing vectors for wrapper")
++
++    wrapper_ethics = validate_act_for_promotion(wrapper)
++    if not bool(wrapper_ethics.ok):
++        _fail(f"ERROR: wrapper ethics failed: {wrapper_ethics.reason}:{wrapper_ethics.violated_laws}")
++
++    store_for_wrapper = ActStore(acts=dict(store.acts), next_id_int=int(store.next_id_int))
++    for c in materialized:
++        store_for_wrapper.add(c)
++    store_for_wrapper.add(wrapper)
++
++    wrapper_cert = build_concept_pcc_certificate_v2(
++        wrapper,
++        store=store_for_wrapper,
++        mined_from={
++            "trace_file_sha256": str(agent_trace_sha256),
++            "store_hash_excluding_semantic": str(store_hash_excl),
++            "seed": int(args.seed),
++            "kind": "wrapper_manual_v63",
++            "callee_id": str(callee_int.id),
++        },
++        test_vectors=list(wrapper_vecs),
++        ethics_verdict=wrapper_ethics.to_dict(),
++        uncertainty_policy="no_ic",
++    )
++    wrapper.evidence.setdefault("certificate_v2", wrapper_cert)
++    try:
++        wrapper.evidence["certificate_v2"]["hashes"]["act_body_sha256"] = act_body_sha256_placeholder(wrapper)
++    except Exception:
++        pass
++    wv = verify_concept_pcc_v2(wrapper, store_for_wrapper)
++    if not bool(wv.ok):
++        _fail(f"ERROR: wrapper PCC v2 failed: {wv.reason}:{wv.details}")
++
++    # (5) Budgeted promotion under max_total_overhead_bits (deterministic).
++    max_bits = max(0, int(args.max_total_overhead_bits))
++    used_bits = 0
++    promoted_concepts: List[Act] = []
++    promotion_rejections: List[Dict[str, Any]] = []
++
++    for c in list(materialized) + [wrapper]:
++        ob = int(c.cost.get("overhead_bits", 1024))
++        if used_bits + ob > max_bits:
++            promotion_rejections.append({"act_id": str(c.id), "kind": "concept_csv", "reason": "budget_exceeded", "overhead_bits": ob})
++            continue
++        used_bits += ob
++        promoted_concepts.append(c)
++
++    if len(promoted_concepts) < 2:
++        _fail("ERROR: budget caused <2 concepts to be promoted")
++
++    # (6) Goals: >=3 per promoted concept.
++    goals: List[Act] = []
++    goal_rows_expected: List[Dict[str, Any]] = []
++    gstep = 500
++    for c in promoted_concepts:
++        cert = c.evidence.get("certificate_v2") if isinstance(c.evidence, dict) else {}
++        cert = cert if isinstance(cert, dict) else {}
++        vecs = cert.get("test_vectors") if isinstance(cert.get("test_vectors"), list) else []
++        vecs = list(vecs)
++        if len(vecs) < 3:
++            _fail(f"ERROR: promoted concept missing vectors: {c.id}")
++        for vi, v in enumerate(vecs[:3]):
++            if not isinstance(v, dict):
++                continue
++            inputs = v.get("inputs") if isinstance(v.get("inputs"), dict) else {}
++            expected = v.get("expected")
++            expected_text = str(v.get("expected_output_text") or "")
++            g = make_goal_act(
++                step=gstep,
++                store_hash_excl_semantic=store_hash_excl,
++                title=f"goal_v63_{c.id}_v{vi}",
++                concept_id=str(c.id),
++                inputs=dict(inputs),
++                expected=expected,
++                priority=10,
++                overhead_bits=1024,
++            )
++            gstep += 1
++            goals.append(g)
++            goal_rows_expected.append(
++                {
++                    "goal_id": str(g.id),
++                    "concept_id": str(c.id),
++                    "inputs": dict(inputs),
++                    "expected": expected,
++                    "expected_output_text": expected_text,
++                }
++            )
++
++    # (7) Promote append-only: base + concepts + goals; preserve base order; hash-chained promotion ledger.
++    promo_dir = os.path.join(args.out, "promotion")
++    os.makedirs(promo_dir, exist_ok=False)
++    acts_promoted = os.path.join(promo_dir, "acts_promoted.jsonl")
++    appended = list(promoted_concepts) + list(goals)
++    promoted_sha256 = write_promoted_acts_preserve_order(base_acts_path=base_acts, out_acts_path=acts_promoted, appended_acts=appended)
++
++    promotion_ledger_path = os.path.join(promo_dir, "promotion_ledger.jsonl")
++    ledger = Ledger(path=promotion_ledger_path)
++    for idx, a in enumerate(appended):
++        patch = Patch(kind="ADD_ACT", payload={"act_id": str(a.id), "kind": str(a.kind)})
++        ledger.append(step=int(idx), patch=patch, acts_hash=str(promoted_sha256), metrics={"promotion": True, "act_id": str(a.id), "kind": str(a.kind)}, snapshot_path=None)
++    promotion_chain_ok = bool(ledger.verify_chain())
++
++    promotion_manifest = {
++        "base_acts_path": str(base_acts),
++        "base_acts_sha256": str(base_acts_sha256),
++        "store_hash_excluding_semantic": str(store_hash_excl),
++        "agent_trace_path": str(agent_trace_path),
++        "agent_trace_sha256": str(agent_trace_sha256),
++        "mined_candidates_total": int(len(candidates)),
++        "top_k_candidates": int(top_k),
++        "materialized_concepts_total": int(len(materialized)),
++        "rejected_materialization": list(rejected),
++        "promotion_budget": {"max_total_overhead_bits": int(max_bits), "used_bits": int(used_bits)},
++        "promoted_concept_ids": [str(c.id) for c in promoted_concepts],
++        "promotion_rejections": list(promotion_rejections),
++        "goal_ids": [str(g.id) for g in goals],
++        "promotion_chain_ok": bool(promotion_chain_ok),
++    }
++    promotion_manifest_path = os.path.join(promo_dir, "promotion_manifest.json")
++    ensure_absent(promotion_manifest_path)
++    with open(promotion_manifest_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps(promotion_manifest, ensure_ascii=False, indent=2))
++
++    # (8) From-store: execute goals and compare expected outputs.
++    store2 = ActStore.load_jsonl(acts_promoted)
++    engine2 = Engine(store2, seed=int(args.seed), config=EngineConfig())
++
++    mismatch_goals = 0
++    call_depth_max = 0
++    ethics_passed2 = 0
++    ic_count2 = 0
++    from_store_rows: List[Dict[str, Any]] = []
++
++    for i, row in enumerate(goal_rows_expected):
++        gid = str(row["goal_id"])
++        r = engine2.execute_goal(goal_act_id=gid, step=i, max_depth=8)
++        tr = r.get("trace") if isinstance(r, dict) else {}
++        tr = tr if isinstance(tr, dict) else {}
++        meta = tr.get("concept_meta") if isinstance(tr.get("concept_meta"), dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++        eth2 = meta.get("ethics") if isinstance(meta.get("ethics"), dict) else {}
++        unc2 = meta.get("uncertainty") if isinstance(meta.get("uncertainty"), dict) else {}
++        if bool(eth2.get("ok", True)):
++            ethics_passed2 += 1
++        if str(unc2.get("mode_out") or "") == "IC":
++            ic_count2 += 1
++        evs = r.get("events") if isinstance(r, dict) else []
++        if isinstance(evs, list):
++            for ev in evs:
++                if isinstance(ev, dict):
++                    call_depth_max = max(call_depth_max, int(ev.get("depth", 0) or 0))
++        out_text = str(meta.get("output_text") or "")
++        expected_text = str(row.get("expected_output_text") or "")
++        if out_text != expected_text:
++            mismatch_goals += 1
++        from_store_rows.append(
++            {
++                "goal_id": str(gid),
++                "ok": bool(r.get("ok", False)),
++                "output_text": out_text,
++                "expected_output_text": expected_text,
++                "selected_concept_id": str(tr.get("selected_concept_id") or ""),
++                "ethics": eth2,
++                "uncertainty": unc2,
++            }
++        )
++
++    reuse = sum(1 for r in from_store_rows if str(r.get("selected_concept_id") or ""))
++    reuse_rate = float(reuse / max(1, len(from_store_rows)))
++
++    gain_bits_est_total = 0
++    for c in promoted_concepts:
++        meta = c.evidence.get("meta") if isinstance(c.evidence, dict) else {}
++        meta = meta if isinstance(meta, dict) else {}
++        try:
++            gain_bits_est_total += int(meta.get("gain_bits_est") or 0)
++        except Exception:
++            pass
++
++    summary = {
++        "seed": int(args.seed),
++        "tasks_total": int(len(tasks)),
++        "tasks_ok": int(tasks_ok),
++        "pass_rate": float(tasks_ok / max(1, len(tasks))),
++        "by_category_total": dict(sorted(by_cat_total.items(), key=lambda kv: str(kv[0]))),
++        "by_category_ok": dict(sorted(by_cat_ok.items(), key=lambda kv: str(kv[0]))),
++        "steps_total": int(steps_total),
++        "agent_trace_sha256": str(agent_trace_sha256),
++        "mined_candidates_total": int(len(candidates)),
++        "promoted_concepts_total": int(len(promoted_concepts)),
++        "gain_bits_est_total": int(gain_bits_est_total),
++        "goals_total": int(len(goal_rows_expected)),
++        "mismatch_goals": int(mismatch_goals),
++        "reuse_rate": float(reuse_rate),
++        "call_depth_max": int(call_depth_max),
++        "ethics_checks_passed": int(ethics_passed2),
++        "uncertainty_ic_count": int(ic_count2),
++        "promotion_chain_ok": bool(promotion_chain_ok),
++    }
++
++    summary_csv = os.path.join(args.out, "summary.csv")
++    ensure_absent(summary_csv)
++    with open(summary_csv, "w", encoding="utf-8") as f:
++        f.write(
++            "seed,tasks_total,tasks_ok,pass_rate,steps_total,mined_candidates_total,promoted_concepts_total,gain_bits_est_total,goals_total,mismatch_goals,reuse_rate,call_depth_max,ethics_checks_passed,uncertainty_ic_count,promotion_chain_ok\n"
++        )
++        f.write(
++            f"{summary['seed']},{summary['tasks_total']},{summary['tasks_ok']},{summary['pass_rate']},{summary['steps_total']},{summary['mined_candidates_total']},{summary['promoted_concepts_total']},{summary['gain_bits_est_total']},{summary['goals_total']},{summary['mismatch_goals']},{summary['reuse_rate']},{summary['call_depth_max']},{summary['ethics_checks_passed']},{summary['uncertainty_ic_count']},{int(summary['promotion_chain_ok'])}\n"
++        )
++
++    summary_json = os.path.join(args.out, "summary.json")
++    ensure_absent(summary_json)
++    with open(summary_json, "w", encoding="utf-8") as f:
++        f.write(json.dumps({"summary": summary, "promotion_manifest": promotion_manifest, "from_store": from_store_rows, "tasks": task_rows}, ensure_ascii=False, indent=2))
++
++    if args.freeze_path:
++        sha: Dict[str, str] = {
++            "base_acts_jsonl": str(base_acts_sha256),
++            "patch_diff": str(sha256_file(args.patch_diff)) if args.patch_diff and os.path.exists(args.patch_diff) else "",
++            "agent_trace_jsonl": str(agent_trace_sha256),
++            "mined_candidates_json": str(sha256_file(mined_candidates_path)),
++            "acts_promoted_jsonl": str(promoted_sha256),
++            "promotion_ledger_jsonl": str(sha256_file(promotion_ledger_path)),
++            "promotion_manifest_json": str(sha256_file(promotion_manifest_path)),
++            "summary_csv": str(sha256_file(summary_csv)),
++            "summary_json": str(sha256_file(summary_json)),
++        }
++        sha_paths = {
++            "base_acts_jsonl": str(os.path.join(args.acts_run, "acts.jsonl")),
++            "patch_diff": str(args.patch_diff),
++            "agent_trace_jsonl": str(agent_trace_path),
++            "mined_candidates_json": str(mined_candidates_path),
++            "acts_promoted_jsonl": str(acts_promoted),
++            "promotion_ledger_jsonl": str(promotion_ledger_path),
++            "promotion_manifest_json": str(promotion_manifest_path),
++            "summary_csv": str(summary_csv),
++            "summary_json": str(summary_json),
++        }
++        freeze = {
++            "name": "V63_AGENT_TRACE_MINE_END2END",
++            "acts_source_run": str(args.acts_run),
++            "out_dir": str(args.out),
++            "commands": [" ".join(sys.argv)],
++            "verify_chain": bool(promotion_chain_ok),
++            "sha256": sha,
++            "sha256_paths": sha_paths,
++            "summary": summary,
++        }
++        with open(args.freeze_path, "w", encoding="utf-8") as f:
++            f.write(json.dumps(freeze, ensure_ascii=False, indent=2))
++
++    print(json.dumps({"summary": summary, "out_dir": str(args.out)}, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-11 18:34:48
++++ scripts/smoke_agent_trace_miner_v63.py	2026-01-11 18:31:19
+@@ -0,0 +1,272 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.agent_v63 import build_v63_toolbox
++from atos_core.csv_miner import materialize_concept_act_from_candidate, mine_csv_candidates
++from atos_core.ethics import validate_act_for_promotion
++from atos_core.proof import act_body_sha256_placeholder, build_concept_pcc_certificate_v2, verify_concept_pcc_v2
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(2)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def stable_act_id(prefix: str, body: Dict[str, Any]) -> str:
++    return f"{prefix}{sha256_hex(canonical_json_dumps(body).encode('utf-8'))[:12]}"
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True)
++    ap.add_argument("--out", required=True, help="WORM out dir (must not exist)")
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    ensure_absent(args.out)
++    os.makedirs(args.out, exist_ok=False)
++
++    # (1) Determinism: run agent_loop twice with the same seed and compare hashes.
++    run_a = os.path.join(args.out, "run_a")
++    run_b = os.path.join(args.out, "run_b")
++    ensure_absent(run_a)
++    ensure_absent(run_b)
++
++    cmd_base = [
++        sys.executable,
++        os.path.join(os.path.dirname(__file__), "agent_loop_v63.py"),
++        "--acts_run",
++        str(args.acts_run),
++        "--seed",
++        str(int(args.seed)),
++        "--max_steps",
++        "512",
++        "--max_depth",
++        "8",
++        "--max_events_per_step",
++        "128",
++    ]
++    subprocess.run(cmd_base + ["--out", run_a], check=True)
++    subprocess.run(cmd_base + ["--out", run_b], check=True)
++
++    trace_a = os.path.join(run_a, "traces", "agent_trace_v63.jsonl")
++    trace_b = os.path.join(run_b, "traces", "agent_trace_v63.jsonl")
++    sum_a = os.path.join(run_a, "summary.json")
++    sum_b = os.path.join(run_b, "summary.json")
++    if not (os.path.exists(trace_a) and os.path.exists(trace_b) and os.path.exists(sum_a) and os.path.exists(sum_b)):
++        _fail("FAIL: agent_loop did not produce expected artifacts")
++
++    h_trace_a = sha256_file(trace_a)
++    h_trace_b = sha256_file(trace_b)
++    h_sum_a = sha256_file(sum_a)
++    h_sum_b = sha256_file(sum_b)
++    if h_trace_a != h_trace_b or h_sum_a != h_sum_b:
++        _fail("FAIL: determinism check failed (hash mismatch across identical runs)")
++
++    # (2) Trace schema sanity.
++    try:
++        with open(trace_a, "r", encoding="utf-8") as f:
++            first = json.loads(next(iter(f)).strip())
++    except Exception:
++        _fail("FAIL: could not read/parse agent_trace_v63.jsonl")
++
++    required = [
++        "ctx_sig",
++        "step_id",
++        "goal_id",
++        "inputs",
++        "output_text",
++        "expected_output_text",
++        "selected_concept_id",
++        "events_sig",
++        "events",
++        "ok",
++        "reason",
++    ]
++    missing = [k for k in required if k not in first]
++    if missing:
++        _fail(f"FAIL: trace schema missing keys: {missing}")
++
++    # (3) Miner produces >=2 candidates from INS events in the trace.
++    cands = mine_csv_candidates(trace_a, min_ops=2, max_ops=6, bits_per_op=128, overhead_bits=1024)
++    if len(cands) < 2:
++        _fail(f"FAIL: expected >=2 mined candidates, got {len(cands)}")
++
++    # (4) PCC v2: wrapper CALL chain passes, then fails on callee tamper.
++    base_acts = os.path.join(args.acts_run, "acts.jsonl")
++    if not os.path.exists(base_acts):
++        _fail(f"FAIL: missing base acts.jsonl: {base_acts}")
++    store = ActStore.load_jsonl(base_acts)
++    store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig", "concept_csv", "goal"])
++    toolbox = build_v63_toolbox(step=1, store_hash_excl_semantic=store_hash_excl, overhead_bits=1024)
++    for a in toolbox.values():
++        if store.get(a.id) is None:
++            store.add(a)
++
++    top = cands[0]
++    concept1 = materialize_concept_act_from_candidate(
++        top,
++        step=10,
++        store_content_hash_excluding_semantic=store_hash_excl,
++        title="smoke_v63_mined_0",
++        overhead_bits=1024,
++        meta={"builder": "smoke_v63", "trace_file": trace_a},
++    )
++    vecs: List[Dict[str, Any]] = []
++    uniq: set = set()
++    for ex in top.examples:
++        sig = str(ex.get("expected_sig") or "")
++        if not sig or sig in uniq:
++            continue
++        uniq.add(sig)
++        vecs.append(
++            {
++                "inputs": dict(ex.get("inputs") or {}),
++                "expected": ex.get("expected"),
++                "expected_output_text": str(ex.get("expected_output_text") or ""),
++            }
++        )
++        if len(vecs) >= 3:
++            break
++    if len(vecs) < 3:
++        _fail("FAIL: mined candidate did not have >=3 unique vectors")
++
++    ethics = validate_act_for_promotion(concept1)
++    if not bool(ethics.ok):
++        _fail(f"FAIL: ethics rejected mined concept: {ethics.reason}:{ethics.violated_laws}")
++    cert1 = build_concept_pcc_certificate_v2(
++        concept1,
++        store=store,
++        mined_from={"trace_file": trace_a, "kind": "smoke_v63"},
++        test_vectors=list(vecs),
++        ethics_verdict=ethics.to_dict(),
++        uncertainty_policy="no_ic",
++    )
++    concept1.evidence.setdefault("certificate_v2", cert1)
++    concept1.evidence["certificate_v2"]["hashes"]["act_body_sha256"] = act_body_sha256_placeholder(concept1)
++    v1 = verify_concept_pcc_v2(concept1, store)
++    if not bool(v1.ok):
++        _fail(f"FAIL: PCC v2 verify should pass for callee, got {v1.reason}:{v1.details}")
++
++    iface = concept1.evidence.get("interface") if isinstance(concept1.evidence, dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++    in_schema = dict(in_schema)
++    out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++    out_schema = dict(out_schema)
++    validator_id = str(iface.get("validator_id") or "")
++    in_keys = sorted(list(in_schema.keys()))
++
++    prog: List[Instruction] = []
++    bind: Dict[str, str] = {}
++    for idx, name in enumerate(in_keys):
++        prog.append(Instruction("CSV_GET_INPUT", {"name": str(name), "out": f"in{idx}"}))
++        bind[str(name)] = f"in{idx}"
++    prog.append(Instruction("CSV_CALL", {"concept_id": str(concept1.id), "out": "out0", "bind": dict(bind)}))
++    prog.append(Instruction("CSV_RETURN", {"var": "out0"}))
++
++    wrapper = Act(
++        id="",
++        version=1,
++        created_at=deterministic_iso(step=20),
++        kind="concept_csv",
++        match={},
++        program=list(prog),
++        evidence={
++            "name": "concept_csv_v0",
++            "interface": {"input_schema": dict(in_schema), "output_schema": dict(out_schema), "validator_id": str(validator_id)},
++            "meta": {"title": "wrapper_smoke_v63"},
++        },
++        cost={"overhead_bits": 1024},
++        deps=[],
++        active=True,
++    )
++    body_w = {
++        "kind": "concept_csv",
++        "version": 1,
++        "match": {},
++        "program": [ins.to_dict() for ins in wrapper.program],
++        "evidence": wrapper.evidence,
++        "deps": [],
++        "active": True,
++    }
++    wrapper.id = stable_act_id("act_concept_csv_", body_w)
++
++    store2 = ActStore(acts=dict(store.acts), next_id_int=int(store.next_id_int))
++    store2.add(concept1)
++    store2.add(wrapper)
++
++    cert_w = build_concept_pcc_certificate_v2(
++        wrapper,
++        store=store2,
++        mined_from={"kind": "wrapper_smoke_v63", "callee_id": str(concept1.id)},
++        test_vectors=list(vecs),
++        ethics_verdict=validate_act_for_promotion(wrapper).to_dict(),
++        uncertainty_policy="no_ic",
++    )
++    wrapper.evidence.setdefault("certificate_v2", cert_w)
++    wrapper.evidence["certificate_v2"]["hashes"]["act_body_sha256"] = act_body_sha256_placeholder(wrapper)
++    vw = verify_concept_pcc_v2(wrapper, store2)
++    if not bool(vw.ok):
++        _fail(f"FAIL: PCC v2 verify should pass for wrapper, got {vw.reason}:{vw.details}")
++
++    # Tamper callee program: change one primitive; wrapper verify must fail on callee hash mismatch.
++    tampered = ActStore(acts=dict(store2.acts), next_id_int=int(store2.next_id_int))
++    callee_t = tampered.get(concept1.id)
++    if callee_t is None:
++        _fail("FAIL: callee missing in tampered store")
++    for idx, ins in enumerate(list(callee_t.program)):
++        if str(ins.op) == "CSV_PRIMITIVE":
++            new_args = dict(ins.args or {})
++            new_args["fn"] = "strip_one_leading_zero"
++            callee_t.program[idx] = Instruction("CSV_PRIMITIVE", new_args)
++            break
++
++    vt = verify_concept_pcc_v2(wrapper, tampered)
++    if bool(vt.ok) or str(vt.reason) != "callee_program_sha256_mismatch":
++        _fail(f"FAIL: expected callee_program_sha256_mismatch, got {vt.reason}:{vt.details}")
++
++    out = {
++        "ok": True,
++        "determinism": {"trace_sha256": h_trace_a, "summary_sha256": h_sum_a},
++        "candidates_total": int(len(cands)),
++        "top_candidate_sig": str(top.candidate_sig),
++    }
++    out_path = os.path.join(args.out, "smoke_result.json")
++    ensure_absent(out_path)
++    with open(out_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++    print(json.dumps(out, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null	2026-01-11 18:34:48
++++ docs/state_of_project.md	2026-01-11 18:23:33
+@@ -0,0 +1,42 @@
++# Estado do Projeto ACT (pós‑V62)
++
++## 1) O que já construímos (componentes rodáveis)
++- **Núcleo ATOS**: `atos_core/act.py`, `atos_core/store.py`, `atos_core/ledger.py` (WORM/hash‑chain), `atos_core/engine.py` (geração + execução determinística de atos).
++- **Ética + incerteza (invariantes fail‑closed)**: `atos_core/ethics.py`, `atos_core/uncertainty.py` integrados em load/add/promotion/execute.
++- **Conceitos/CSV + Goals (first‑class)**:
++  - `kind="concept_csv"` com execução determinística via `Engine.execute_concept_csv(...)` (trace de instruções `t:"INS"`).
++  - `kind="goal"` com execução determinística via `Engine.execute_goal(...)`.
++- **Mining + promoção WORM**:
++  - Miner determinístico de CSV: `atos_core/csv_miner.py` (n‑grams de primitivas a partir de traces INS).
++  - Proof‑Carrying Concept (PCC): `atos_core/proof.py` (`certificate_v1` e `certificate_v2` com `call_deps` + verificação + tamper detection).
++- **Gate / custo de scan (eficiência)**:
++  - Gate compare+fallback determinístico por token e builders “competitor‑aware” (scripts em `scripts/`).
++  - Promoção do gate table como ACT: `kind="gate_table_ctxsig"` + uso opcional via `EngineConfig.use_gate_table_act`.
++- **Suites e telemetria**:
++  - `atos_core/suite.py` com chat suite + goal shadow (scheduler determinístico) + logs WORM.
++  - Scripts de smoke/pipelines (v50…v62) em `scripts/`.
++
++## 2) O que já provamos (com evidência WORM)
++- **Determinismo + invariância**: chat suite preserva `sha256(full_text)` com goal shadow ativado (telemetria pura).
++- **WORM auditável**: promoção append‑only com ledger hash‑chained e freeze com `verify_chain=true` (ex.: `LEDGER_ATOLANG_*_V62_*_TRY2.json`).
++- **Mining real do chat**: traces do goal‑shadow (`goal_shadow_trace.jsonl` com `INS`) → miner → multi‑promoção sob budget → reexecução from‑store com `mismatch_goals==0`.
++- **PCC v2 (composição)**: wrapper com `CSV_CALL` verifica `call_deps` e falha sob tamper (`callee_program_sha256_mismatch`).
++- **Segurança estrutural**: ética e disciplina IR/IC aplicadas em load/add/promotion/execute (fail‑closed).
++- **Eficiência**: gate híbrido (K=2) validado com economia real de scan e divergência 0 em seeds/modes (v56–v58), e promovido para dentro do store (v57).
++
++## 3) Onde estamos no roadmap do atrator (o gargalo atual)
++- **Já resolvido**: eficiência/gating e infraestrutura de governança (WORM, prova, hashes, invariância).
++- **Em andamento**: transformar experiência real (traces) em **objetos cognitivos reutilizáveis** (CSV) com prova forte e promoção automática.
++- **Gargalo atual**: **agência/planejamento** (composição de conceitos sob objetivos), com auditoria e sem mudar o caminho padrão de geração.
++
++## 4) O progresso está no foco certo? (justificativa técnica)
++Sim: o projeto já tem (i) ontologia única (atos), (ii) mecanismos de evolução (mineração+promoção), (iii) prova verificável (PCC), e (iv) invariantes (ética/uncertainty). O próximo salto lógico é um loop agentivo determinístico que produza traces mineráveis e force composição/transferência — sem depender de “fluência” como sinal.
++
++## 5) Top 3 gargalos críticos (ordem) + estratégia incremental
++1) **Planejamento determinístico sobre conceitos/goals (search + orçamento)**  
++   - Estratégia: loop agentivo com plano explícito + execução + validação + traces mineráveis; mining/promoção a partir de agent traces; reexecução from‑store para invariância.
++2) **Transferência/composição em escala (ToC, merge/split, lifecycle)**  
++   - Estratégia: ampliar PCC (deps transitivas quando necessário), ToC como critério de sobrevivência, budget/eviction por ΔMDL real + reuse + falhas; testes “cross‑task” determinísticos.
++3) **Sinal de utilidade robusto (avaliadores determinísticos mais ricos)**  
++   - Estratégia: expandir suites determinísticas (estado multi‑turn, formato, aritmética multi‑etapa, memória) e plugar em seleção/promoção (peso inicialmente shadow).
++

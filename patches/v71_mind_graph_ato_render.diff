@@ -1,0 +1,1129 @@
+--- /dev/null	2026-01-12 08:01:59
++++ atos_core/ato_v71.py	2026-01-12 07:58:07
+@@ -0,0 +1,128 @@
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++ATO_TYPES: Tuple[str, ...] = (
++    "OBS",
++    "STATE",
++    "CONCEPT",
++    "GOAL",
++    "PLAN",
++    "OPERATOR",
++    "EVAL",
++)
++
++
++def ensure_ato_type(ato_type: str) -> str:
++    t = str(ato_type or "")
++    if t not in set(ATO_TYPES):
++        raise ValueError(f"unknown_ato_type:{t}")
++    return t
++
++
++def stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def ato_struct_sig(ato_sem_sig: Dict[str, Any]) -> str:
++    """
++    Optional structural signature to freeze identity-relevant structure.
++    Deterministic: sha256(canonical_json(structural_view)).
++    """
++    body = {
++        "ato_type": str(ato_sem_sig.get("ato_type") or ""),
++        "subgraph": ato_sem_sig.get("subgraph") if isinstance(ato_sem_sig.get("subgraph"), dict) else {},
++        "slots": ato_sem_sig.get("slots") if isinstance(ato_sem_sig.get("slots"), dict) else {},
++        "invariants": ato_sem_sig.get("invariants") if isinstance(ato_sem_sig.get("invariants"), dict) else {},
++    }
++    return stable_hash_obj(body)
++
++
++def ato_sig(ato_sem_sig: Dict[str, Any]) -> str:
++    return stable_hash_obj(ato_sem_sig)
++
++
++def _sorted_evidence_refs(evidence_refs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    items: List[Tuple[str, Dict[str, Any]]] = []
++    for r in evidence_refs:
++        if not isinstance(r, dict):
++            continue
++        try:
++            key = canonical_json_dumps(r)
++        except Exception:
++            key = str(r)
++        items.append((key, dict(r)))
++    items.sort(key=lambda kv: str(kv[0]))
++    return [v for _, v in items]
++
++
++@dataclass(frozen=True)
++class ATOv71:
++    ato_id: str
++    ato_type: str
++    subgraph: Dict[str, Any] = field(default_factory=dict)
++    slots: Dict[str, Any] = field(default_factory=dict)
++    bindings: Dict[str, Any] = field(default_factory=dict)
++    cost: float = 0.0
++    evidence_refs: List[Dict[str, Any]] = field(default_factory=list)
++    invariants: Dict[str, Any] = field(default_factory=dict)
++    created_step: int = 0
++    last_step: int = 0
++
++    def __post_init__(self) -> None:
++        ensure_ato_type(self.ato_type)
++        object.__setattr__(self, "ato_id", str(self.ato_id or ""))
++        object.__setattr__(self, "ato_type", str(self.ato_type or ""))
++        object.__setattr__(self, "created_step", int(self.created_step or 0))
++        object.__setattr__(self, "last_step", int(self.last_step or 0))
++        try:
++            object.__setattr__(self, "cost", float(self.cost or 0.0))
++        except Exception:
++            object.__setattr__(self, "cost", 0.0)
++
++        # Deep-copy snapshots to avoid aliasing.
++        for key in ("subgraph", "slots", "bindings", "invariants"):
++            v = getattr(self, key)
++            if not isinstance(v, dict):
++                v = {}
++            try:
++                v2 = copy.deepcopy(v)
++            except Exception:
++                v2 = dict(v)
++            object.__setattr__(self, key, v2 if isinstance(v2, dict) else {})
++
++        ev = self.evidence_refs
++        if not isinstance(ev, list):
++            ev = []
++        try:
++            ev2 = copy.deepcopy(ev)
++        except Exception:
++            ev2 = list(ev)
++        if not isinstance(ev2, list):
++            ev2 = []
++        ev3 = _sorted_evidence_refs([x for x in ev2 if isinstance(x, dict)])
++        object.__setattr__(self, "evidence_refs", ev3)
++
++    def to_dict(self, *, include_sig: bool = True, include_struct_sig: bool = False) -> Dict[str, Any]:
++        body = {
++            "ato_id": str(self.ato_id),
++            "ato_type": str(self.ato_type),
++            "subgraph": dict(self.subgraph),
++            "slots": dict(self.slots),
++            "bindings": dict(self.bindings),
++            "cost": float(self.cost),
++            "evidence_refs": list(self.evidence_refs),
++            "invariants": dict(self.invariants),
++            "created_step": int(self.created_step),
++            "last_step": int(self.last_step),
++        }
++        if include_struct_sig:
++            body["ato_struct_sig"] = ato_struct_sig(body)
++        if include_sig:
++            body["ato_sig"] = ato_sig(body)
++        return body
++
+--- /dev/null	2026-01-12 08:01:59
++++ atos_core/mind_graph_v71.py	2026-01-12 07:58:48
+@@ -0,0 +1,243 @@
++from __future__ import annotations
++
++import copy
++import json
++import os
++from dataclasses import dataclass, field
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
++
++from .act import canonical_json_dumps, deterministic_iso, sha256_hex
++from .ato_v71 import ATOv71, ensure_ato_type, stable_hash_obj
++
++EDGE_TYPES: Tuple[str, ...] = (
++    "SUPPORTS",
++    "DEPENDS_ON",
++    "CALLS",
++    "DERIVED_FROM",
++    "USED_BY",
++    "CAUSES",
++)
++
++
++def ensure_edge_type(edge_type: str) -> str:
++    t = str(edge_type or "")
++    if t not in set(EDGE_TYPES):
++        raise ValueError(f"unknown_edge_type:{t}")
++    return t
++
++
++def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(row))
++        f.write("\n")
++
++
++def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
++    if not os.path.exists(path):
++        return iter(())
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            yield json.loads(line)
++
++
++def append_chained_jsonl(path: str, entry: Dict[str, Any], *, prev_hash: Optional[str]) -> str:
++    body = dict(entry)
++    body["prev_hash"] = prev_hash
++    entry_hash = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    body["entry_hash"] = entry_hash
++    _append_jsonl(path, body)
++    return entry_hash
++
++
++def verify_chained_jsonl(path: str) -> bool:
++    prev = None
++    for row in _read_jsonl(path):
++        row = dict(row)
++        entry_hash = row.pop("entry_hash", None)
++        if row.get("prev_hash") != prev:
++            return False
++        expected = sha256_hex(canonical_json_dumps(row).encode("utf-8"))
++        if expected != entry_hash:
++            return False
++        prev = entry_hash
++    return True
++
++
++def mind_graph_sig(snapshot: Dict[str, Any]) -> str:
++    return sha256_hex(canonical_json_dumps(snapshot).encode("utf-8"))
++
++
++def ato_from_concept_registry_v70(concept: Dict[str, Any]) -> ATOv71:
++    """
++    Adapter (V70 -> V71): ConceptObjectV70 dict -> ATOv71(CONCEPT).
++    """
++    if not isinstance(concept, dict):
++        raise ValueError("concept_not_dict")
++    concept_id = str(concept.get("concept_id") or "")
++    if not concept_id:
++        raise ValueError("concept_missing_id")
++    subgraph = {
++        "interface_sig": str(concept.get("interface_sig") or ""),
++        "program_sha256": str(concept.get("program_sha256") or ""),
++        "program_len": int(concept.get("program_len", 0) or 0),
++        "concept_state": str(concept.get("concept_state") or ""),
++    }
++    slots = concept.get("slots") if isinstance(concept.get("slots"), dict) else {}
++    invariants = concept.get("invariants") if isinstance(concept.get("invariants"), dict) else {}
++    evidence_refs = concept.get("evidence_refs") if isinstance(concept.get("evidence_refs"), list) else []
++    ev2 = [x for x in evidence_refs if isinstance(x, dict)]
++    created_step = int(concept.get("created_step", 0) or 0)
++    last_step = int(concept.get("last_step", created_step) or created_step)
++    cost = concept.get("cost", 0.0) or 0.0
++    return ATOv71(
++        ato_id=str(concept_id),
++        ato_type="CONCEPT",
++        subgraph=dict(subgraph),
++        slots=dict(slots),
++        bindings={},
++        cost=float(cost),
++        evidence_refs=list(ev2),
++        invariants=dict(invariants),
++        created_step=int(created_step),
++        last_step=int(last_step),
++    )
++
++
++def _sorted_dict_list(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    pairs: List[Tuple[str, Dict[str, Any]]] = []
++    for it in items:
++        if not isinstance(it, dict):
++            continue
++        try:
++            k = canonical_json_dumps(it)
++        except Exception:
++            k = str(it)
++        pairs.append((k, dict(it)))
++    pairs.sort(key=lambda kv: str(kv[0]))
++    return [v for _, v in pairs]
++
++
++@dataclass
++class MindGraphV71:
++    run_dir: str
++    nodes_path: str = field(init=False)
++    edges_path: str = field(init=False)
++
++    _nodes_prev_hash: Optional[str] = field(default=None, init=False)
++    _edges_prev_hash: Optional[str] = field(default=None, init=False)
++    _nodes: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
++    _edge_sigs: Set[str] = field(default_factory=set, init=False)
++    _edges: List[Dict[str, Any]] = field(default_factory=list, init=False)
++
++    def __post_init__(self) -> None:
++        os.makedirs(self.run_dir, exist_ok=False)
++        self.nodes_path = os.path.join(self.run_dir, "mind_nodes.jsonl")
++        self.edges_path = os.path.join(self.run_dir, "mind_edges.jsonl")
++
++    def add_node(self, *, step: int, ato: ATOv71, reason: str) -> Dict[str, Any]:
++        if not isinstance(ato, ATOv71):
++            raise ValueError("ato_must_be_ATOv71")
++        ensure_ato_type(ato.ato_type)
++
++        ato_dict = ato.to_dict(include_sig=True)
++        ato_id = str(ato_dict.get("ato_id") or "")
++        if not ato_id:
++            raise ValueError("missing_ato_id")
++
++        existing = self._nodes.get(ato_id)
++        if isinstance(existing, dict) and str(existing.get("ato_sig") or "") == str(ato_dict.get("ato_sig") or ""):
++            return dict(existing)
++
++        try:
++            snap = copy.deepcopy(ato_dict)
++        except Exception:
++            snap = dict(ato_dict)
++        if not isinstance(snap, dict):
++            snap = dict(ato_dict)
++        self._nodes[ato_id] = snap
++
++        self._nodes_prev_hash = append_chained_jsonl(
++            self.nodes_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": "NODE",
++                "payload": {"reason": str(reason), "ato": dict(snap)},
++            },
++            prev_hash=self._nodes_prev_hash,
++        )
++        return dict(snap)
++
++    def add_edge(
++        self,
++        *,
++        step: int,
++        src_ato_id: str,
++        dst_ato_id: str,
++        edge_type: str,
++        evidence_refs: Sequence[Dict[str, Any]],
++        reason: str,
++    ) -> Dict[str, Any]:
++        et = ensure_edge_type(edge_type)
++        src = str(src_ato_id or "")
++        dst = str(dst_ato_id or "")
++        if not src or not dst:
++            raise ValueError("missing_src_or_dst")
++        if src not in self._nodes or dst not in self._nodes:
++            raise ValueError("missing_endpoint_node")
++
++        ev2 = _sorted_dict_list([x for x in evidence_refs if isinstance(x, dict)])
++        edge_sem_sig = {"src": src, "dst": dst, "edge_type": et, "evidence_refs": list(ev2)}
++        edge_sig = stable_hash_obj(edge_sem_sig)
++        if edge_sig in self._edge_sigs:
++            # Idempotent: do not append duplicates.
++            return dict(edge_sem_sig, edge_sig=str(edge_sig))
++        self._edge_sigs.add(edge_sig)
++
++        edge = dict(edge_sem_sig, edge_sig=str(edge_sig))
++        try:
++            edge_snap = copy.deepcopy(edge)
++        except Exception:
++            edge_snap = dict(edge)
++        if not isinstance(edge_snap, dict):
++            edge_snap = dict(edge)
++        self._edges.append(edge_snap)
++
++        self._edges_prev_hash = append_chained_jsonl(
++            self.edges_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": "EDGE",
++                "payload": {"reason": str(reason), "edge": dict(edge_snap)},
++            },
++            prev_hash=self._edges_prev_hash,
++        )
++        return dict(edge_snap)
++
++    def verify_chains(self) -> Dict[str, bool]:
++        return {
++            "mind_nodes_chain_ok": bool(verify_chained_jsonl(self.nodes_path)),
++            "mind_edges_chain_ok": bool(verify_chained_jsonl(self.edges_path)),
++        }
++
++    def snapshot_graph_state(self) -> Dict[str, Any]:
++        nodes = [self._nodes[k] for k in sorted(self._nodes.keys())]
++        edges = list(self._edges)
++        edges.sort(
++            key=lambda e: (
++                str(e.get("src") or ""),
++                str(e.get("dst") or ""),
++                str(e.get("edge_type") or ""),
++                str(e.get("edge_sig") or ""),
++            )
++        )
++        return {"schema_version": 1, "nodes": list(nodes), "edges": list(edges)}
++
++    def graph_sig(self) -> str:
++        return mind_graph_sig(self.snapshot_graph_state())
++
+--- /dev/null	2026-01-12 08:01:59
++++ atos_core/render_v71.py	2026-01-12 07:59:22
+@@ -0,0 +1,190 @@
++from __future__ import annotations
++
++from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++
++def _sha256_text(s: str) -> str:
++    return sha256_hex(str(s).encode("utf-8"))
++
++
++def _index_graph(graph_snapshot: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
++    nodes = graph_snapshot.get("nodes") if isinstance(graph_snapshot.get("nodes"), list) else []
++    edges = graph_snapshot.get("edges") if isinstance(graph_snapshot.get("edges"), list) else []
++    node_by_id: Dict[str, Dict[str, Any]] = {}
++    for n in nodes:
++        if not isinstance(n, dict):
++            continue
++        nid = str(n.get("ato_id") or "")
++        if not nid:
++            continue
++        node_by_id[nid] = dict(n)
++    edge_list = [dict(e) for e in edges if isinstance(e, dict)]
++    return node_by_id, edge_list
++
++
++def _reachable_subgraph(
++    *,
++    graph_snapshot: Dict[str, Any],
++    root_ids: Sequence[str],
++    max_depth: int,
++    allowed_edge_types: Optional[Set[str]] = None,
++) -> Dict[str, Any]:
++    node_by_id, edges = _index_graph(graph_snapshot)
++
++    adj: Dict[str, List[Dict[str, Any]]] = {}
++    for e in edges:
++        src = str(e.get("src") or "")
++        if not src:
++            continue
++        adj.setdefault(src, []).append(e)
++
++    for src in list(adj.keys()):
++        adj[src].sort(
++            key=lambda e: (
++                str(e.get("edge_type") or ""),
++                str(e.get("dst") or ""),
++                str(e.get("edge_sig") or ""),
++            )
++        )
++
++    roots = [str(r) for r in root_ids if isinstance(r, str) and str(r)]
++    roots = sorted(set(roots))
++
++    seen: Set[str] = set()
++    q: List[Tuple[str, int]] = []
++    for r in roots:
++        if r in node_by_id:
++            seen.add(r)
++            q.append((r, 0))
++    q.sort(key=lambda x: (x[1], x[0]))
++
++    active_edges: List[Dict[str, Any]] = []
++    while q:
++        cur, d = q.pop(0)
++        if d >= int(max_depth):
++            continue
++        for e in adj.get(cur, []):
++            et = str(e.get("edge_type") or "")
++            if allowed_edge_types is not None and et not in allowed_edge_types:
++                continue
++            dst = str(e.get("dst") or "")
++            if not dst:
++                continue
++            if dst not in node_by_id:
++                continue
++            active_edges.append(dict(e))
++            if dst not in seen:
++                seen.add(dst)
++                q.append((dst, d + 1))
++        q.sort(key=lambda x: (x[1], x[0]))
++
++    active_nodes = [node_by_id[nid] for nid in sorted(seen)]
++    active_edges.sort(
++        key=lambda e: (
++            str(e.get("src") or ""),
++            str(e.get("dst") or ""),
++            str(e.get("edge_type") or ""),
++            str(e.get("edge_sig") or ""),
++        )
++    )
++    return {"schema_version": 1, "roots": roots, "nodes": active_nodes, "edges": active_edges}
++
++
++def render_projection(
++    *,
++    graph_snapshot: Dict[str, Any],
++    root_ids: Sequence[str],
++    max_depth: int,
++    bindings: Dict[str, Any],
++    goals: Sequence[Dict[str, Any]],
++    plan_state: Dict[str, Any],
++    style: str = "v1",
++) -> Dict[str, Any]:
++    """
++    Deterministic projection: language is a renderable view of the active subgraph.
++    Must not mutate the graph.
++    """
++    st = str(style or "v1")
++    if st not in {"v1", "v2"}:
++        raise ValueError(f"unknown_style:{st}")
++
++    active = _reachable_subgraph(graph_snapshot=graph_snapshot, root_ids=root_ids, max_depth=int(max_depth))
++    active_sig = sha256_hex(canonical_json_dumps(active).encode("utf-8"))
++
++    inputs = {
++        "schema_version": 1,
++        "active_graph_sig": str(active_sig),
++        "root_ids": sorted(set(str(r) for r in root_ids if str(r))),
++        "max_depth": int(max_depth),
++        "bindings": bindings if isinstance(bindings, dict) else {},
++        "goals": list(goals) if isinstance(goals, (list, tuple)) else [],
++        "plan_state": plan_state if isinstance(plan_state, dict) else {},
++        "style": str(st),
++    }
++    inputs_sig = sha256_hex(canonical_json_dumps(inputs).encode("utf-8"))
++
++    nodes = active.get("nodes") if isinstance(active.get("nodes"), list) else []
++    edges = active.get("edges") if isinstance(active.get("edges"), list) else []
++
++    if st == "v1":
++        lines: List[str] = []
++        lines.append("V71_RENDER_STYLE_V1")
++        lines.append(f"active_graph_sig={active_sig}")
++        lines.append(f"roots={canonical_json_dumps(active.get('roots'))}")
++        lines.append(f"bindings={canonical_json_dumps(inputs['bindings'])}")
++        lines.append(f"plan_state={canonical_json_dumps(inputs['plan_state'])}")
++        lines.append(f"goals={canonical_json_dumps(inputs['goals'])}")
++        lines.append("nodes:")
++        for n in nodes:
++            if not isinstance(n, dict):
++                continue
++            nid = str(n.get("ato_id") or "")
++            nt = str(n.get("ato_type") or "")
++            ns = str(n.get("ato_sig") or "")
++            lines.append(f"- {nt} {nid} sig={ns}")
++        lines.append("edges:")
++        for e in edges:
++            if not isinstance(e, dict):
++                continue
++            src = str(e.get("src") or "")
++            dst = str(e.get("dst") or "")
++            et = str(e.get("edge_type") or "")
++            es = str(e.get("edge_sig") or "")
++            lines.append(f"- {src} -{et}-> {dst} sig={es}")
++        text = "\n".join(lines) + "\n"
++    else:
++        # v2 is structurally the same view, but rendered differently (substitutable projection).
++        body = {
++            "render_style": "V71_RENDER_STYLE_V2",
++            "active_graph_sig": str(active_sig),
++            "roots": active.get("roots"),
++            "nodes": [
++                {
++                    "id": str(n.get("ato_id") or ""),
++                    "type": str(n.get("ato_type") or ""),
++                    "sig": str(n.get("ato_sig") or ""),
++                }
++                for n in nodes
++                if isinstance(n, dict)
++            ],
++            "edges": [
++                {
++                    "src": str(e.get("src") or ""),
++                    "dst": str(e.get("dst") or ""),
++                    "type": str(e.get("edge_type") or ""),
++                    "sig": str(e.get("edge_sig") or ""),
++                }
++                for e in edges
++                if isinstance(e, dict)
++            ],
++            "bindings": inputs["bindings"],
++            "plan_state": inputs["plan_state"],
++            "goals": inputs["goals"],
++        }
++        text = canonical_json_dumps(body) + "\n"
++
++    render_sig = _sha256_text(text)
++    return {"text": str(text), "render_sig": str(render_sig), "inputs_sig": str(inputs_sig)}
++
+--- /dev/null	2026-01-12 08:01:59
++++ scripts/smoke_mind_graph_ato_render_v71.py	2026-01-12 08:01:54
+@@ -0,0 +1,556 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.ato_v71 import ATOv71
++from atos_core.concept_registry_v70 import ConceptRegistryV70
++from atos_core.engine import Engine, EngineConfig
++from atos_core.mind_graph_v71 import MindGraphV71, ato_from_concept_registry_v70
++from atos_core.render_v71 import render_projection
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def make_concept_act(
++    *,
++    act_id: str,
++    input_schema: Dict[str, str],
++    output_schema: Dict[str, str],
++    validator_id: str,
++    program: List[Instruction],
++) -> Act:
++    return Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence={
++            "interface": {
++                "input_schema": dict(input_schema),
++                "output_schema": dict(output_schema),
++                "validator_id": str(validator_id),
++            }
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def _interface_sig_from_act(act: Act) -> str:
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    body = {
++        "in": iface.get("input_schema", {}),
++        "out": iface.get("output_schema", {}),
++        "validator_id": str(iface.get("validator_id") or ""),
++    }
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def _program_sha256_from_act(act: Act) -> str:
++    prog = [ins.to_dict() for ins in (act.program or [])]
++    return sha256_hex(canonical_json_dumps(prog).encode("utf-8"))
++
++
++def ato_from_concept_act(*, act: Act, step: int, concept_state: str) -> ATOv71:
++    iface_sig = _interface_sig_from_act(act)
++    prog_sha = _program_sha256_from_act(act)
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    inp = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++    out = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++    slots = {"inputs": sorted(str(k) for k in inp.keys()), "outputs": sorted(str(k) for k in out.keys())}
++    invariants = {
++        "input_schema": {str(k): str(v) for k, v in sorted(inp.items(), key=lambda kv: str(kv[0]))},
++        "output_schema": {str(k): str(v) for k, v in sorted(out.items(), key=lambda kv: str(kv[0]))},
++        "validator_id": str(iface.get("validator_id") or ""),
++    }
++    subgraph = {
++        "interface_sig": str(iface_sig),
++        "program_sha256": str(prog_sha),
++        "program_len": int(len(act.program or [])),
++        "concept_state": str(concept_state),
++    }
++    return ATOv71(
++        ato_id=str(act.id),
++        ato_type="CONCEPT",
++        subgraph=dict(subgraph),
++        slots=dict(slots),
++        bindings={},
++        cost=float(len(act.program or [])),
++        evidence_refs=[{"kind": "concept_act", "act_id": str(act.id)}],
++        invariants=dict(invariants),
++        created_step=int(step),
++        last_step=int(step),
++    )
++
++
++def _assert_ato_sig_deterministic() -> Dict[str, Any]:
++    a = ATOv71(
++        ato_id="test_ato",
++        ato_type="STATE",
++        subgraph={"k": "v"},
++        slots={"s": ["x"]},
++        bindings={"x": 1},
++        cost=1.0,
++        evidence_refs=[{"kind": "unit"}],
++        invariants={"v": 1},
++        created_step=0,
++        last_step=0,
++    )
++    d1 = a.to_dict(include_sig=True)
++    d2 = a.to_dict(include_sig=True)
++    if str(d1.get("ato_sig") or "") != str(d2.get("ato_sig") or ""):
++        _fail("ERROR: ato_sig_not_deterministic")
++    try:
++        _ = ATOv71(ato_id="bad", ato_type="NOT_A_TYPE")  # type: ignore[arg-type]
++        _fail("ERROR: expected closed ato_type rejection")
++    except Exception:
++        pass
++    return {"ok": True, "ato_sig": str(d1.get("ato_sig") or "")}
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    # (1) ATO types closed + deterministic signature.
++    ato_sig_test = _assert_ato_sig_deterministic()
++
++    # Build store (V70 smoke source): normalize + add_xy + clone.
++    store = ActStore()
++    out_schema = {"out": "str"}
++
++    normalize_id = "concept_v70_normalize_x_v0"
++    normalize = make_concept_act(
++        act_id=normalize_id,
++        input_schema={"x": "str"},
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["x"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "out"}),
++            Instruction("CSV_RETURN", {"var": "out"}),
++        ],
++    )
++    store.add(normalize)
++
++    good_id = "concept_v70_add_xy_v0"
++    good = make_concept_act(
++        act_id=good_id,
++        input_schema={"x": "str", "y": "str"},
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_GET_INPUT", {"name": "y", "out": "y"}),
++            Instruction("CSV_CALL", {"concept_id": normalize_id, "bind": {"x": "x"}, "out": "nx"}),
++            Instruction("CSV_CALL", {"concept_id": normalize_id, "bind": {"x": "y"}, "out": "ny"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["nx"], "out": "ix"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["ny"], "out": "iy"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["ix", "iy"], "out": "sum"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["sum"], "out": "out"}),
++            Instruction("CSV_RETURN", {"var": "out"}),
++        ],
++    )
++    store.add(good)
++
++    clone_id = "concept_v70_add_xy_clone_v0"
++    clone = make_concept_act(
++        act_id=clone_id,
++        input_schema={"x": "str", "y": "str"},
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=list(good.program),
++    )
++    store.add(clone)
++
++    # V70 registry (objects) -> V71 nodes.
++    reg_dir = os.path.join(out_dir, "concept_registry_v70")
++    reg = ConceptRegistryV70(reg_dir, toc_fail_threshold=2, similarity_threshold=0.95)
++    vectors_A = [
++        {"inputs": {"x": "007", "y": "0"}, "expected": "7", "expected_output_text": "7"},
++        {"inputs": {"x": "0004", "y": "0"}, "expected": "4", "expected_output_text": "4"},
++        {"inputs": {"x": "42", "y": "0"}, "expected": "42", "expected_output_text": "42"},
++    ]
++    vectors_B = [
++        {"inputs": {"x": "4", "y": "8"}, "expected": "12", "expected_output_text": "12"},
++        {"inputs": {"x": "09", "y": "1"}, "expected": "10", "expected_output_text": "10"},
++        {"inputs": {"x": "100", "y": "23"}, "expected": "123", "expected_output_text": "123"},
++    ]
++
++    r_good = reg.attempt_promote_with_toc(
++        step=1,
++        candidate=good,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[],
++    )
++    r_clone = reg.attempt_promote_with_toc(
++        step=2,
++        candidate=clone,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[good],
++    )
++
++    concept_good = r_good.get("concept") if isinstance(r_good.get("concept"), dict) else {}
++    concept_clone = r_clone.get("concept") if isinstance(r_clone.get("concept"), dict) else {}
++    if str(concept_good.get("concept_state") or "") != "ACTIVE":
++        _fail("ERROR: expected good concept ACTIVE in registry")
++    if str(concept_clone.get("concept_state") or "") == "ACTIVE":
++        _fail("ERROR: expected clone NOT ACTIVE in registry")
++
++    # Mind graph store (WORM).
++    mg_dir = os.path.join(out_dir, "mind_graph")
++    mg = MindGraphV71(mg_dir)
++
++    # Add concept nodes from registry (V70 -> V71 adapter).
++    mg.add_node(step=10, ato=ato_from_concept_registry_v70(concept_good), reason="from_v70_registry")
++    mg.add_node(step=11, ato=ato_from_concept_registry_v70(concept_clone), reason="from_v70_registry")
++
++    # Ensure callee concept node exists (normalize) for call edges.
++    mg.add_node(step=12, ato=ato_from_concept_act(act=normalize, step=12, concept_state="ACTIVE"), reason="from_concept_act")
++
++    # Create GOAL + PLAN (minimal).
++    goal_bindings = {"x": "0004", "y": "0008"}
++    goal_id = "goal_v71_add_xy_00"
++    goal = ATOv71(
++        ato_id=goal_id,
++        ato_type="GOAL",
++        subgraph={"kind": "add_xy_goal_v0"},
++        slots={"inputs": ["x", "y"], "outputs": ["out"]},
++        bindings=dict(goal_bindings),
++        cost=0.0,
++        evidence_refs=[{"kind": "smoke", "name": "v71"}],
++        invariants={"output_validator_id": "text_exact"},
++        created_step=13,
++        last_step=13,
++    )
++    plan_id = "plan_v71_use_add_xy_00"
++    plan = ATOv71(
++        ato_id=plan_id,
++        ato_type="PLAN",
++        subgraph={"kind": "call_concept_v0", "concept_id": good_id},
++        slots={"steps": ["call:add_xy"]},
++        bindings={"concept_id": good_id},
++        cost=0.0,
++        evidence_refs=[{"kind": "smoke", "name": "v71"}],
++        invariants={"requires": ["concept_active"]},
++        created_step=14,
++        last_step=14,
++    )
++    mg.add_node(step=13, ato=goal, reason="smoke_goal")
++    mg.add_node(step=14, ato=plan, reason="smoke_plan")
++
++    mg.add_edge(
++        step=15,
++        src_ato_id=goal_id,
++        dst_ato_id=plan_id,
++        edge_type="DEPENDS_ON",
++        evidence_refs=[{"kind": "goal_depends_on_plan"}],
++        reason="goal_plan",
++    )
++    mg.add_edge(
++        step=16,
++        src_ato_id=plan_id,
++        dst_ato_id=good_id,
++        edge_type="DEPENDS_ON",
++        evidence_refs=[{"kind": "plan_depends_on_concept", "concept_id": good_id}],
++        reason="plan_concept",
++    )
++
++    # (3) Execute concept and ingest callstack edges.
++    engine = Engine(store, seed=int(seed), config=EngineConfig(enable_contracts=False))
++    inputs = {"x": "0004", "y": "0008"}
++    out = engine.execute_concept_csv(concept_act_id=good_id, inputs=dict(inputs), expected="12", step=20)
++    tr = out.get("trace") if isinstance(out, dict) else None
++    tr = tr if isinstance(tr, dict) else {}
++    calls = tr.get("concept_calls")
++    if not isinstance(calls, list) or not calls:
++        _fail("ERROR: missing trace.concept_calls")
++
++    # Add any missing concept nodes discovered via runtime calls.
++    for ce in calls:
++        if not isinstance(ce, dict):
++            continue
++        cid = str(ce.get("concept_id") or "")
++        if not cid:
++            continue
++        if cid in {str(n.get("ato_id") or "") for n in mg.snapshot_graph_state().get("nodes", []) if isinstance(n, dict)}:
++            continue
++        act = store.get_concept_act(cid)
++        if act is None:
++            continue
++        mg.add_node(step=21, ato=ato_from_concept_act(act=act, step=21, concept_state="ACTIVE"), reason="from_runtime_call")
++
++    stack: Dict[int, str] = {}
++    # Keep a handle to an evidence payload for aliasing test.
++    first_call_with_bindings: Optional[Dict[str, Any]] = None
++    first_edge_sig = ""
++    first_edge_bindings_x = ""
++
++    for idx, ce in enumerate(calls):
++        if not isinstance(ce, dict):
++            continue
++        depth = int(ce.get("call_depth", 0) or 0)
++        cid = str(ce.get("concept_id") or "")
++        if not cid:
++            continue
++        if depth > 0 and (depth - 1) in stack:
++            parent = str(stack.get(depth - 1) or "")
++            if parent and parent != cid:
++                ev_ref = {
++                    "kind": "concept_call_event",
++                    "idx": int(idx),
++                    "call_depth": int(depth),
++                    "bindings": ce.get("bindings") if isinstance(ce.get("bindings"), dict) else {},
++                    "bindings_sig": str(ce.get("bindings_sig") or ""),
++                    "return": ce.get("return") if isinstance(ce.get("return"), dict) else {},
++                    "return_sig": str(ce.get("return_sig") or ""),
++                }
++                edge = mg.add_edge(
++                    step=30 + int(idx),
++                    src_ato_id=parent,
++                    dst_ato_id=cid,
++                    edge_type="CALLS",
++                    evidence_refs=[ev_ref],
++                    reason="from_trace_concept_calls",
++                )
++                if first_call_with_bindings is None:
++                    first_call_with_bindings = ce
++                    first_edge_sig = str(edge.get("edge_sig") or "")
++                    first_edge_bindings_x = str((ev_ref.get("bindings") or {}).get("x") or "")
++        stack[depth] = cid
++        for k in list(stack.keys()):
++            if k > depth:
++                stack.pop(k, None)
++
++    # (7) Anti-aliasing: mutate source bindings after ingestion and assert graph snapshot unchanged.
++    if first_call_with_bindings is not None and isinstance(first_call_with_bindings.get("bindings"), dict):
++        first_call_with_bindings["bindings"]["x"] = "MUTATED"
++
++    # (4) Projection depends only on active subgraph.
++    roots = [goal_id, plan_id]
++    base_snapshot = mg.snapshot_graph_state()
++    base_graph_sig = mg.graph_sig()
++    r_v1 = render_projection(
++        graph_snapshot=base_snapshot,
++        root_ids=roots,
++        max_depth=8,
++        bindings=dict(goal_bindings),
++        goals=[{"goal_id": goal_id}],
++        plan_state={"plan_id": plan_id, "concept_id": good_id},
++        style="v1",
++    )
++    r_v2 = render_projection(
++        graph_snapshot=base_snapshot,
++        root_ids=roots,
++        max_depth=8,
++        bindings=dict(goal_bindings),
++        goals=[{"goal_id": goal_id}],
++        plan_state={"plan_id": plan_id, "concept_id": good_id},
++        style="v2",
++    )
++    render_sig_v1 = str(r_v1.get("render_sig") or "")
++    render_sig_v2 = str(r_v2.get("render_sig") or "")
++    if not render_sig_v1 or not render_sig_v2:
++        _fail("ERROR: missing render_sig")
++    if render_sig_v1 == render_sig_v2:
++        _fail("ERROR: expected different render_sig for different styles")
++
++    # Add an irrelevant node (unreachable from roots) and prove render v1 unchanged.
++    irrelevant = ATOv71(
++        ato_id="obs_v71_irrelevant_00",
++        ato_type="OBS",
++        subgraph={"kind": "irrelevant"},
++        slots={},
++        bindings={"note": "ignored"},
++        cost=0.0,
++        evidence_refs=[{"kind": "irrelevant"}],
++        invariants={},
++        created_step=40,
++        last_step=40,
++    )
++    mg.add_node(step=40, ato=irrelevant, reason="irrelevant_node_unreachable")
++    full_snapshot = mg.snapshot_graph_state()
++    full_graph_sig = mg.graph_sig()
++    r_v1_after = render_projection(
++        graph_snapshot=full_snapshot,
++        root_ids=roots,
++        max_depth=8,
++        bindings=dict(goal_bindings),
++        goals=[{"goal_id": goal_id}],
++        plan_state={"plan_id": plan_id, "concept_id": good_id},
++        style="v1",
++    )
++    render_sig_v1_after = str(r_v1_after.get("render_sig") or "")
++    if render_sig_v1_after != render_sig_v1:
++        _fail("ERROR: render_sig_v1_changed_after_adding_unreachable_node")
++
++    # WORM chain verification.
++    chains = mg.verify_chains()
++    if not (bool(chains.get("mind_nodes_chain_ok")) and bool(chains.get("mind_edges_chain_ok"))):
++        _fail(f"ERROR: mind_graph_chain_verify_failed: {chains}")
++
++    # Validate anti-aliasing on stored edge evidence refs (by edge_sig lookup).
++    anti_aliasing_ok = True
++    if first_edge_sig:
++        stored_edges = full_snapshot.get("edges") if isinstance(full_snapshot.get("edges"), list) else []
++        got_x = None
++        for e in stored_edges:
++            if not isinstance(e, dict):
++                continue
++            if str(e.get("edge_sig") or "") != first_edge_sig:
++                continue
++            refs = e.get("evidence_refs") if isinstance(e.get("evidence_refs"), list) else []
++            for r in refs:
++                if isinstance(r, dict) and isinstance(r.get("bindings"), dict):
++                    got_x = str(r["bindings"].get("x") or "")
++        if got_x is None or got_x != first_edge_bindings_x:
++            anti_aliasing_ok = False
++
++    # Validate goal node bindings snapshot anti-aliasing.
++    goal_bindings["x"] = "MUTATED"
++    stored_goal_x = ""
++    for n in full_snapshot.get("nodes", []) if isinstance(full_snapshot.get("nodes"), list) else []:
++        if isinstance(n, dict) and str(n.get("ato_id") or "") == goal_id:
++            b = n.get("bindings") if isinstance(n.get("bindings"), dict) else {}
++            stored_goal_x = str(b.get("x") or "")
++    if stored_goal_x != "0004":
++        anti_aliasing_ok = False
++
++    return {
++        "seed": int(seed),
++        "ato_sig_test": dict(ato_sig_test),
++        "graph": {
++            "base_graph_sig": str(base_graph_sig),
++            "full_graph_sig": str(full_graph_sig),
++            "nodes_total": int(len(full_snapshot.get("nodes", [])) if isinstance(full_snapshot.get("nodes"), list) else 0),
++            "edges_total": int(len(full_snapshot.get("edges", [])) if isinstance(full_snapshot.get("edges"), list) else 0),
++        },
++        "render": {
++            "render_sig_v1": str(render_sig_v1),
++            "render_sig_v2": str(render_sig_v2),
++            "render_sig_v1_after_irrelevant": str(render_sig_v1_after),
++        },
++        "checks": {
++            "render_invariance_unreachable_node": bool(render_sig_v1_after == render_sig_v1),
++            "render_substitutable_styles": bool(render_sig_v1 != render_sig_v2),
++            "anti_aliasing_ok": bool(anti_aliasing_ok),
++            "chains": dict(chains),
++        },
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_mind_graph_ato_render_v71")
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    results: Dict[str, Any] = {"seed": seed, "tries": {}}
++    sigs: List[Tuple[str, str]] = []
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        ev = smoke_try(out_dir=out_dir, seed=seed)
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, ev)
++
++        core = {
++            "seed": seed,
++            "graph_sig": str(ev.get("graph", {}).get("full_graph_sig") if isinstance(ev.get("graph"), dict) else ""),
++            "render_sig_v1": str(ev.get("render", {}).get("render_sig_v1") if isinstance(ev.get("render"), dict) else ""),
++            "render_sig_v2": str(ev.get("render", {}).get("render_sig_v2") if isinstance(ev.get("render"), dict) else ""),
++            "sha256_eval_json": str(eval_sha),
++        }
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": str(summary_sha)}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++
++        sigs.append((str(core["graph_sig"]), str(core["render_sig_v1"])))
++        summary_shas.append(str(summary_sha))
++
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    determinism_ok = bool(len(sigs) == 2 and sigs[0] == sigs[1] and len(summary_shas) == 2 and summary_shas[0] == summary_shas[1])
++    if not determinism_ok:
++        _fail(f"ERROR: determinism mismatch: sigs={sigs} summary_shas={summary_shas}")
++    results["determinism"] = {"ok": True, "summary_sha256": summary_shas[0], "graph_sig": sigs[0][0], "render_sig_v1": sigs[0][1]}
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

@@ -1,0 +1,23 @@
+*** Begin Patch
+*** Update File: act/atos_core/engine.py
+@@
+     def _emit_candidates(
+         self,
+         *,
+         context: Sequence[str],
+         penalties: Optional[Dict[str, Any]] = None,
++        predictors: Optional[Sequence[Act]] = None,
+         trace: Optional[Dict[str, Any]] = None,
+     ) -> Dict[str, Candidate]:
+@@
+         merged: Dict[str, Candidate] = {}
+         predictor_matched = 0
+         predictor_emitted = 0
+         executed_predictor_ids: List[str] = []
+-        for act in self._predictors:
++        pred_list: Sequence[Act] = predictors if predictors is not None else self._predictors
++        for act in pred_list:
+             if not self.match_act(act, context=context):
+                 continue
+             predictor_matched += 1
+*** End Patch

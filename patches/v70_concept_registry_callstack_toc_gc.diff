@@ -1,0 +1,985 @@
+--- /dev/null	2026-01-12 00:21:53
++++ atos_core/concept_registry_v70.py	2026-01-12 00:19:16
+@@ -0,0 +1,382 @@
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import dataclass, field
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
++
++from .act import Act, canonical_json_dumps, deterministic_iso, sha256_hex
++from .ethics import validate_act_for_promotion
++from .proof import verify_concept_pcc_v2
++from .store import ActStore
++from .toc import detect_duplicate, toc_eval
++
++
++def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(canonical_json_dumps(row))
++        f.write("\n")
++
++
++def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
++    if not os.path.exists(path):
++        return iter(())
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            yield json.loads(line)
++
++
++def append_chained_jsonl(path: str, row: Dict[str, Any], *, prev_hash: Optional[str]) -> str:
++    body = dict(row)
++    body["prev_hash"] = prev_hash
++    entry_hash = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    body["entry_hash"] = entry_hash
++    _append_jsonl(path, body)
++    return entry_hash
++
++
++def verify_chained_jsonl(path: str) -> bool:
++    prev = None
++    for row in _read_jsonl(path):
++        row = dict(row)
++        entry_hash = row.pop("entry_hash", None)
++        if row.get("prev_hash") != prev:
++            return False
++        expected = sha256_hex(canonical_json_dumps(row).encode("utf-8"))
++        if expected != entry_hash:
++            return False
++        prev = entry_hash
++    return True
++
++
++def concept_sig(concept_obj: Dict[str, Any]) -> str:
++    return sha256_hex(canonical_json_dumps(concept_obj).encode("utf-8"))
++
++
++def interface_sig_from_act(act: Act) -> str:
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    body = {
++        "in": iface.get("input_schema", {}),
++        "out": iface.get("output_schema", {}),
++        "validator_id": str(iface.get("validator_id") or ""),
++    }
++    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++
++
++def program_sha256_from_act(act: Act) -> str:
++    prog = [ins.to_dict() for ins in (act.program or [])]
++    return sha256_hex(canonical_json_dumps(prog).encode("utf-8"))
++
++
++def _slots_and_invariants(act: Act) -> Tuple[Dict[str, Any], Dict[str, Any]]:
++    ev = act.evidence if isinstance(act.evidence, dict) else {}
++    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
++    iface = iface if isinstance(iface, dict) else {}
++    inp = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
++    out = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
++    slots = {
++        "inputs": sorted(str(k) for k in inp.keys()),
++        "outputs": sorted(str(k) for k in out.keys()),
++    }
++    invariants = {
++        "input_schema": {str(k): str(v) for k, v in sorted(inp.items(), key=lambda kv: str(kv[0]))},
++        "output_schema": {str(k): str(v) for k, v in sorted(out.items(), key=lambda kv: str(kv[0]))},
++        "validator_id": str(iface.get("validator_id") or ""),
++    }
++    return slots, invariants
++
++
++@dataclass
++class ConceptObjectV70:
++    concept_id: str
++    concept_state: str
++    interface_sig: str
++    program_sha256: str
++    program_len: int
++    cost: float
++    evidence_refs: List[Dict[str, Any]]
++    slots: Dict[str, Any]
++    invariants: Dict[str, Any]
++    created_step: int
++    last_step: int
++
++    toc_attempts: int = 0
++    toc_failures: int = 0
++    duplicate: bool = False
++    duplicate_of: str = ""
++    dead_reason: str = ""
++
++    def to_dict(self) -> Dict[str, Any]:
++        body = {
++            "concept_id": str(self.concept_id),
++            "concept_state": str(self.concept_state),
++            "interface_sig": str(self.interface_sig),
++            "program_sha256": str(self.program_sha256),
++            "program_len": int(self.program_len),
++            "cost": float(self.cost),
++            "evidence_refs": list(self.evidence_refs),
++            "slots": dict(self.slots),
++            "invariants": dict(self.invariants),
++            "created_step": int(self.created_step),
++            "last_step": int(self.last_step),
++            "toc_attempts": int(self.toc_attempts),
++            "toc_failures": int(self.toc_failures),
++            "duplicate": bool(self.duplicate),
++            "duplicate_of": str(self.duplicate_of),
++            "dead_reason": str(self.dead_reason),
++        }
++        body["concept_sig"] = concept_sig(body)
++        return body
++
++
++@dataclass
++class ConceptRegistryV70:
++    run_dir: str
++    toc_fail_threshold: int = 2
++    similarity_threshold: float = 0.95
++
++    registry_path: str = field(init=False)
++    evidence_path: str = field(init=False)
++
++    _registry_prev_hash: Optional[str] = field(default=None, init=False)
++    _evidence_prev_hash: Optional[str] = field(default=None, init=False)
++    _concepts: Dict[str, ConceptObjectV70] = field(default_factory=dict, init=False)
++
++    def __post_init__(self) -> None:
++        os.makedirs(self.run_dir, exist_ok=False)
++        self.registry_path = os.path.join(self.run_dir, "concept_registry.jsonl")
++        self.evidence_path = os.path.join(self.run_dir, "concept_registry_evidence.jsonl")
++
++    def define(self, *, step: int, concept_act: Act, reason: str) -> ConceptObjectV70:
++        cid = str(concept_act.id)
++        if cid in self._concepts:
++            return self._concepts[cid]
++
++        iface_sig = interface_sig_from_act(concept_act)
++        prog_sha = program_sha256_from_act(concept_act)
++        slots, invariants = _slots_and_invariants(concept_act)
++        c = ConceptObjectV70(
++            concept_id=str(cid),
++            concept_state="CANDIDATE",
++            interface_sig=str(iface_sig),
++            program_sha256=str(prog_sha),
++            program_len=int(len(concept_act.program or [])),
++            cost=float(len(concept_act.program or [])),
++            evidence_refs=[],
++            slots=slots,
++            invariants=invariants,
++            created_step=int(step),
++            last_step=int(step),
++        )
++        self._concepts[cid] = c
++
++        self._registry_prev_hash = append_chained_jsonl(
++            self.registry_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": "DEFINE",
++                "reason": str(reason),
++                "concept": c.to_dict(),
++            },
++            prev_hash=self._registry_prev_hash,
++        )
++        return c
++
++    def get(self, concept_id: str) -> Optional[ConceptObjectV70]:
++        return self._concepts.get(str(concept_id))
++
++    def _append_state(self, *, step: int, concept: ConceptObjectV70, event: str, reason: str) -> None:
++        self._registry_prev_hash = append_chained_jsonl(
++            self.registry_path,
++            {
++                "time": deterministic_iso(step=int(step)),
++                "step": int(step),
++                "event": str(event),
++                "reason": str(reason),
++                "concept": concept.to_dict(),
++            },
++            prev_hash=self._registry_prev_hash,
++        )
++
++    def _append_evidence(self, *, step: int, row: Dict[str, Any]) -> None:
++        self._evidence_prev_hash = append_chained_jsonl(
++            self.evidence_path,
++            {"time": deterministic_iso(step=int(step)), "step": int(step), **row},
++            prev_hash=self._evidence_prev_hash,
++        )
++
++    def attempt_promote_with_toc(
++        self,
++        *,
++        step: int,
++        candidate: Act,
++        store: ActStore,
++        vectors_A: Sequence[Dict[str, Any]],
++        vectors_B: Sequence[Dict[str, Any]],
++        domain_A: str,
++        domain_B: str,
++        existing_for_duplicates: Sequence[Act],
++    ) -> Dict[str, Any]:
++        """
++        ToC as LAW for promotion:
++          - Must pass ethics promotion check (deterministic).
++          - Must not be DUPLICATE (exact or near-duplicate).
++          - Must pass ToC in both domains.
++          - GC: after toc_fail_threshold failures, mark DEAD (append-only; never delete).
++        """
++        c = self.define(step=int(step), concept_act=candidate, reason="auto_define")
++
++        # Freeze structural identity (fail-closed on mismatch).
++        iface_sig = interface_sig_from_act(candidate)
++        prog_sha = program_sha256_from_act(candidate)
++        if iface_sig != c.interface_sig or prog_sha != c.program_sha256:
++            c.concept_state = "DEAD"
++            c.dead_reason = "structural_mismatch"
++            c.last_step = int(step)
++            self._append_state(step=int(step), concept=c, event="STATE", reason="structural_mismatch")
++            self._append_evidence(
++                step=int(step),
++                row={
++                    "event": "STRUCTURAL_MISMATCH",
++                    "concept_id": str(c.concept_id),
++                    "want_interface_sig": str(c.interface_sig),
++                    "got_interface_sig": str(iface_sig),
++                    "want_program_sha256": str(c.program_sha256),
++                    "got_program_sha256": str(prog_sha),
++                },
++            )
++            return {"ok": False, "reason": "structural_mismatch", "concept": c.to_dict()}
++
++        eth = validate_act_for_promotion(candidate)
++        if not bool(eth.ok):
++            c.concept_state = "DEAD"
++            c.dead_reason = "ethics_fail_closed_promotion"
++            c.last_step = int(step)
++            self._append_state(step=int(step), concept=c, event="STATE", reason="ethics_fail_closed_promotion")
++            self._append_evidence(
++                step=int(step),
++                row={
++                    "event": "PROMOTION_BLOCKED",
++                    "reason": "ethics_fail_closed_promotion",
++                    "concept_id": str(c.concept_id),
++                    "ethics": eth.to_dict(),
++                },
++            )
++            return {"ok": False, "reason": "ethics_fail_closed_promotion", "concept": c.to_dict()}
++
++        dup = detect_duplicate(candidate, existing=existing_for_duplicates, similarity_threshold=float(self.similarity_threshold))
++        if isinstance(dup, dict):
++            c.duplicate = True
++            c.duplicate_of = str(dup.get("other_id") or "")
++            c.concept_state = "DEAD"
++            c.dead_reason = str(dup.get("reason") or "duplicate")
++            c.last_step = int(step)
++            self._append_state(step=int(step), concept=c, event="STATE", reason="duplicate_block")
++            self._append_evidence(
++                step=int(step),
++                row={
++                    "event": "DUPLICATE_BLOCK",
++                    "concept_id": str(c.concept_id),
++                    "duplicate": dict(dup),
++                },
++            )
++            return {"ok": False, "reason": "duplicate_block", "duplicate": dict(dup), "concept": c.to_dict()}
++
++        # PCC is optional: verify only if a certificate_v2 is present (deterministic).
++        pcc_ok = True
++        pcc_verdict = None
++        ev = candidate.evidence if isinstance(candidate.evidence, dict) else {}
++        cert = ev.get("certificate_v2") if isinstance(ev.get("certificate_v2"), dict) else None
++        if isinstance(cert, dict):
++            pcc_verdict = verify_concept_pcc_v2(candidate, store)
++            pcc_ok = bool(pcc_verdict.ok)
++        if not bool(pcc_ok):
++            c.concept_state = "DEAD"
++            c.dead_reason = "pcc_failed"
++            c.last_step = int(step)
++            self._append_state(step=int(step), concept=c, event="STATE", reason="pcc_failed")
++            self._append_evidence(
++                step=int(step),
++                row={
++                    "event": "PCC_FAILED",
++                    "concept_id": str(c.concept_id),
++                    "pcc": pcc_verdict.to_dict() if pcc_verdict is not None else None,
++                },
++            )
++            return {"ok": False, "reason": "pcc_failed", "concept": c.to_dict(), "pcc": pcc_verdict.to_dict() if pcc_verdict is not None else None}
++
++        c.toc_attempts += 1
++        toc = toc_eval(
++            concept_act=candidate,
++            vectors_A=list(vectors_A),
++            vectors_B=list(vectors_B),
++            store=store,
++            domain_A=str(domain_A),
++            domain_B=str(domain_B),
++            min_vectors_per_domain=3,
++        )
++        details = toc.get("details") if isinstance(toc.get("details"), dict) else {}
++        results_A = details.get("results_A") if isinstance(details.get("results_A"), list) else []
++        results_B = details.get("results_B") if isinstance(details.get("results_B"), list) else []
++        unc_ic = 0
++        for r in list(results_A) + list(results_B):
++            if isinstance(r, dict) and str(r.get("uncertainty_mode_out") or "") == "IC":
++                unc_ic += 1
++
++        self._append_evidence(
++            step=int(step),
++            row={
++                "event": "TOC_ATTEMPT",
++                "concept_id": str(c.concept_id),
++                "toc": dict(toc),
++                "uncertainty_ic_count": int(unc_ic),
++            },
++        )
++
++        pass_A = bool(toc.get("pass_A", False))
++        pass_B = bool(toc.get("pass_B", False))
++        toc_ok = bool(pass_A and pass_B and int(unc_ic) == 0)
++
++        if not toc_ok:
++            c.toc_failures += 1
++            c.last_step = int(step)
++            reason = "toc_failed"
++            if c.toc_failures >= int(self.toc_fail_threshold):
++                c.concept_state = "DEAD"
++                c.dead_reason = "toc_fail_threshold"
++                reason = "gc_dead_toc_fail_threshold"
++            self._append_state(step=int(step), concept=c, event="STATE", reason=str(reason))
++            return {
++                "ok": False,
++                "reason": str(reason),
++                "concept": c.to_dict(),
++                "toc": dict(toc),
++                "uncertainty_ic_count": int(unc_ic),
++            }
++
++        # Promotion: ACTIVE only if ToC OK.
++        c.concept_state = "ACTIVE"
++        c.last_step = int(step)
++        c.evidence_refs.append(
++            {
++                "kind": "toc_v1",
++                "domains": [str(domain_A), str(domain_B)],
++                "toc_sig": sha256_hex(canonical_json_dumps(toc).encode("utf-8")),
++            }
++        )
++        self._append_state(step=int(step), concept=c, event="STATE", reason="promoted_active_toc_ok")
++        return {"ok": True, "reason": "promoted_active_toc_ok", "concept": c.to_dict(), "toc": dict(toc)}
++
++    def verify_chains(self) -> Dict[str, bool]:
++        return {
++            "concept_registry_chain_ok": bool(verify_chained_jsonl(self.registry_path)),
++            "concept_registry_evidence_chain_ok": bool(verify_chained_jsonl(self.evidence_path)),
++        }
++
+--- patches/v70_base/atos_core/engine.py	2026-01-12 00:13:52
++++ atos_core/engine.py	2026-01-12 00:17:55
+@@ -2203,6 +2203,7 @@
+         """
+ 
+         events: List[Dict[str, Any]] = []
++        concept_calls: List[Dict[str, Any]] = []
+ 
+         def _hash_obj(obj: Any) -> str:
+             try:
+@@ -2275,23 +2276,73 @@
+             validator_id = str(iface.get("validator_id") or "")
+             if not isinstance(in_schema, dict) or not isinstance(out_schema, dict):
+                 return None, {"ok": False, "reason": "bad_interface_schema", "concept_id": str(concept_id)}
++
++            iface_sig = _iface_signature(iface)
++            prog_sha256 = _hash_obj([ins.to_dict() for ins in (act.program or [])])
++            concept_sig = _hash_obj(
++                {
++                    "concept_id": str(concept_id),
++                    "interface_sig": str(iface_sig),
++                    "program_sha256": str(prog_sha256),
++                }
++            )
++            try:
++                bindings_snapshot = copy.deepcopy(inps)
++            except Exception:
++                bindings_snapshot = dict(inps)
++            if not isinstance(bindings_snapshot, dict):
++                bindings_snapshot = {}
++            bindings_sig = _hash_obj(bindings_snapshot)
+ 
++            call_rec: Dict[str, Any] = {
++                "concept_id": str(concept_id),
++                "concept_sig": str(concept_sig),
++                "interface_sig": str(iface_sig),
++                "program_sha256": str(prog_sha256),
++                "bindings": bindings_snapshot,
++                "bindings_sig": str(bindings_sig),
++                "call_depth": int(depth),
++                "return": {},
++                "return_sig": "",
++                "ok": False,
++                "cost": float(len(act.program or [])),
++                "evidence_refs": [{"kind": "concept_act", "act_id": str(concept_id)}],
++            }
++            if len(concept_calls) < int(max_events):
++                concept_calls.append(call_rec)
++
++            def _finalize_call(*, out_val: Any, meta: Dict[str, Any]) -> None:
++                ret_snapshot: Dict[str, Any] = {"output": out_val, "meta": dict(meta)}
++                try:
++                    call_rec["return"] = copy.deepcopy(ret_snapshot)
++                except Exception:
++                    call_rec["return"] = dict(ret_snapshot)
++                try:
++                    call_rec["return_sig"] = _hash_obj(call_rec.get("return"))
++                except Exception:
++                    call_rec["return_sig"] = ""
++                call_rec["ok"] = bool(meta.get("ok", False))
++
+             # Structural/ethics validation before any execution (fail-closed).
+             pre = validate_before_execute(act=act, emission_preview=None)
+             if not bool(pre.ok):
+-                return None, {
++                meta = {
+                     "ok": False,
+                     "reason": "ethics_fail_closed_pre",
+                     "concept_id": str(concept_id),
+                     "ethics": pre.to_dict(),
+                 }
++                _finalize_call(out_val=None, meta=meta)
++                return None, meta
+ 
+             # Typed inputs (deterministic).
+             for k, want_t in in_schema.items():
+                 if k not in inps:
+-                    return None, {"ok": False, "reason": "missing_input", "concept_id": str(concept_id), "key": str(k)}
++                    meta = {"ok": False, "reason": "missing_input", "concept_id": str(concept_id), "key": str(k)}
++                    _finalize_call(out_val=None, meta=meta)
++                    return None, meta
+                 if not _type_ok(inps.get(k), str(want_t)):
+-                    return None, {
++                    meta = {
+                         "ok": False,
+                         "reason": "bad_input_type",
+                         "concept_id": str(concept_id),
+@@ -2299,13 +2350,15 @@
+                         "want": str(want_t),
+                         "got": str(type(inps.get(k)).__name__),
+                     }
++                    _finalize_call(out_val=None, meta=meta)
++                    return None, meta
+ 
+             call_event: Dict[str, Any] = {
+                 "t": "CALL",
+                 "step": int(step),
+                 "depth": int(depth),
+                 "concept_id": str(concept_id),
+-                "iface_sig": _iface_signature(iface),
++                "iface_sig": str(iface_sig),
+                 "inputs_sig": _hash_obj(inps),
+             }
+             if len(events) < int(max_events):
+@@ -2360,10 +2413,12 @@
+                     vals = [env.get(str(v)) for v in ins_in]
+                     spec_fn = PRIMITIVE_OPS.get(fn_id)
+                     if spec_fn is None:
+-                        return None, {"ok": False, "reason": "unknown_primitive", "fn": fn_id, "concept_id": str(concept_id)}
++                        meta = {"ok": False, "reason": "unknown_primitive", "fn": fn_id, "concept_id": str(concept_id)}
++                        _finalize_call(out_val=None, meta=meta)
++                        return None, meta
+                     spec, fn = spec_fn
+                     if int(spec.arity) != int(len(vals)):
+-                        return None, {
++                        meta = {
+                             "ok": False,
+                             "reason": "arity_mismatch",
+                             "fn": fn_id,
+@@ -2371,6 +2426,8 @@
+                             "got": int(len(vals)),
+                             "concept_id": str(concept_id),
+                         }
++                        _finalize_call(out_val=None, meta=meta)
++                        return None, meta
+                     out_res = fn(*vals) if int(spec.arity) > 1 else fn(vals[0])
+                     env[out] = out_res
+                 elif op == "CSV_CALL":
+@@ -2390,20 +2447,24 @@
+                         validate_output=False,
+                     )
+                     if not bool(sub_meta.get("ok", False)):
+-                        return None, {
++                        meta = {
+                             "ok": False,
+                             "reason": "callee_failed",
+                             "concept_id": str(concept_id),
+                             "callee": str(callee),
+                             "callee_meta": sub_meta,
+                         }
++                        _finalize_call(out_val=None, meta=meta)
++                        return None, meta
+                     env[out] = sub_out
+                 elif op == "CSV_RETURN":
+                     var = str(args.get("var") or "")
+                     out_val = env.get(var)
+                     break
+                 else:
+-                    return None, {"ok": False, "reason": "unknown_csv_op", "op": op, "concept_id": str(concept_id)}
++                    meta = {"ok": False, "reason": "unknown_csv_op", "op": op, "concept_id": str(concept_id)}
++                    _finalize_call(out_val=None, meta=meta)
++                    return None, meta
+ 
+             out_text = _value_to_text(out_val)
+ 
+@@ -2411,13 +2472,15 @@
+             if len(out_schema) == 1:
+                 want_t = next(iter(out_schema.values()))
+                 if not _type_ok(out_val, str(want_t)):
+-                    return out_val, {
++                    meta = {
+                         "ok": False,
+                         "reason": "bad_output_type",
+                         "concept_id": str(concept_id),
+                         "want": str(want_t),
+                         "got": str(type(out_val).__name__),
+                     }
++                    _finalize_call(out_val=out_val, meta=meta)
++                    return out_val, meta
+ 
+             # Validator (optional, deterministic).
+             vres = ValidatorResult(True, "skipped")
+@@ -2460,6 +2523,7 @@
+                         "output_sig": str(ret_meta["output_sig"]),
+                     }
+                 )
++            _finalize_call(out_val=out_val2, meta=ret_meta)
+             return out_val2, ret_meta
+ 
+         out, meta = _execute(
+@@ -2469,7 +2533,12 @@
+             expected_for_validator=expected,
+             validate_output=bool(validate_output),
+         )
+-        return {"output": out, "meta": meta, "events": events}
++        return {
++            "output": out,
++            "meta": meta,
++            "events": events,
++            "trace": {"concept_calls": list(concept_calls)},
++        }
+ 
+     def execute_goal(
+         self,
+--- /dev/null	2026-01-12 00:21:53
++++ scripts/smoke_concepts_callstack_toc_v70.py	2026-01-12 00:20:48
+@@ -0,0 +1,403 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.concept_registry_v70 import (
++    ConceptRegistryV70,
++    interface_sig_from_act,
++    program_sha256_from_act,
++)
++from atos_core.engine import Engine, EngineConfig
++from atos_core.store import ActStore
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()
++
++
++def sha256_canon(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def ensure_absent(path: str) -> None:
++    if os.path.exists(path):
++        _fail(f"ERROR: path already exists: {path}")
++
++
++def write_json(path: str, obj: Any) -> str:
++    ensure_absent(path)
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(tmp, path)
++    return sha256_file(path)
++
++
++def make_concept_act(
++    *,
++    act_id: str,
++    input_schema: Dict[str, str],
++    output_schema: Dict[str, str],
++    validator_id: str,
++    program: List[Instruction],
++) -> Act:
++    return Act(
++        id=str(act_id),
++        version=1,
++        created_at=deterministic_iso(step=0),
++        kind="concept_csv",
++        match={},
++        program=list(program),
++        evidence={
++            "interface": {
++                "input_schema": dict(input_schema),
++                "output_schema": dict(output_schema),
++                "validator_id": str(validator_id),
++            }
++        },
++        cost={},
++        deps=[],
++        active=True,
++    )
++
++
++def _concept_sig_from_fields(*, concept_id: str, interface_sig: str, program_sha256: str) -> str:
++    return sha256_canon(
++        {"concept_id": str(concept_id), "interface_sig": str(interface_sig), "program_sha256": str(program_sha256)}
++    )
++
++
++def _assert_call_event(event: Dict[str, Any], *, store: ActStore) -> None:
++    for k in (
++        "concept_id",
++        "concept_sig",
++        "interface_sig",
++        "program_sha256",
++        "bindings",
++        "bindings_sig",
++        "call_depth",
++        "return",
++        "return_sig",
++        "ok",
++        "cost",
++        "evidence_refs",
++    ):
++        if k not in event:
++            _fail(f"ERROR: missing concept_call field: {k}")
++
++    if not isinstance(event.get("bindings"), dict):
++        _fail("ERROR: concept_call.bindings_not_dict")
++    if not isinstance(event.get("return"), dict):
++        _fail("ERROR: concept_call.return_not_dict")
++    if not isinstance(event.get("evidence_refs"), list):
++        _fail("ERROR: concept_call.evidence_refs_not_list")
++
++    bindings_sig = str(event.get("bindings_sig") or "")
++    want_bind_sig = sha256_canon(event.get("bindings"))
++    if bindings_sig != want_bind_sig:
++        _fail(f"ERROR: bindings_sig_mismatch: want={want_bind_sig} got={bindings_sig}")
++
++    return_sig = str(event.get("return_sig") or "")
++    want_ret_sig = sha256_canon(event.get("return"))
++    if return_sig != want_ret_sig:
++        _fail(f"ERROR: return_sig_mismatch: want={want_ret_sig} got={return_sig}")
++
++    cid = str(event.get("concept_id") or "")
++    act = store.get_concept_act(cid)
++    if act is None:
++        _fail(f"ERROR: concept_call.concept_act_not_found: {cid}")
++
++    want_iface = interface_sig_from_act(act)
++    want_prog = program_sha256_from_act(act)
++    if str(event.get("interface_sig") or "") != want_iface:
++        _fail("ERROR: interface_sig_mismatch")
++    if str(event.get("program_sha256") or "") != want_prog:
++        _fail("ERROR: program_sha256_mismatch")
++
++    want_csig = _concept_sig_from_fields(concept_id=cid, interface_sig=want_iface, program_sha256=want_prog)
++    if str(event.get("concept_sig") or "") != want_csig:
++        _fail("ERROR: concept_sig_mismatch")
++
++
++def smoke_try(*, out_dir: str, seed: int) -> Dict[str, Any]:
++    # Build a small deterministic store with concept_csv acts only.
++    store = ActStore()
++
++    iface_xy = {"x": "str", "y": "str"}
++    out_schema = {"out": "str"}
++
++    # Callee: normalize a single string number -> canonical digits (no leading zeros).
++    normalize_id = "concept_v70_normalize_x_v0"
++    normalize = make_concept_act(
++        act_id=normalize_id,
++        input_schema={"x": "str"},
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "scan_digits", "in": ["x"], "out": "d"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["d"], "out": "i"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["i"], "out": "out"}),
++            Instruction("CSV_RETURN", {"var": "out"}),
++        ],
++    )
++    store.add(normalize)
++
++    # Candidate that FAILS transfer: ignores y (passes A, fails B).
++    fail_id = "concept_v70_fail_transfer_v0"
++    fail_transfer = make_concept_act(
++        act_id=fail_id,
++        input_schema=iface_xy,
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_CALL", {"concept_id": normalize_id, "bind": {"x": "x"}, "out": "nx"}),
++            Instruction("CSV_RETURN", {"var": "nx"}),
++        ],
++    )
++    store.add(fail_transfer)
++
++    # Candidate that PASSES ToC: add two numbers using nested normalization calls.
++    good_id = "concept_v70_add_xy_v0"
++    good = make_concept_act(
++        act_id=good_id,
++        input_schema=iface_xy,
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=[
++            Instruction("CSV_GET_INPUT", {"name": "x", "out": "x"}),
++            Instruction("CSV_GET_INPUT", {"name": "y", "out": "y"}),
++            Instruction("CSV_CALL", {"concept_id": normalize_id, "bind": {"x": "x"}, "out": "nx"}),
++            Instruction("CSV_CALL", {"concept_id": normalize_id, "bind": {"x": "y"}, "out": "ny"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["nx"], "out": "ix"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "digits_to_int", "in": ["ny"], "out": "iy"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "add_int", "in": ["ix", "iy"], "out": "sum"}),
++            Instruction("CSV_PRIMITIVE", {"fn": "int_to_digits", "in": ["sum"], "out": "out"}),
++            Instruction("CSV_RETURN", {"var": "out"}),
++        ],
++    )
++    store.add(good)
++
++    # Clone twin: same structure/interface, different id.
++    clone_id = "concept_v70_add_xy_clone_v0"
++    clone = make_concept_act(
++        act_id=clone_id,
++        input_schema=iface_xy,
++        output_schema=out_schema,
++        validator_id="text_exact",
++        program=list(good.program),
++    )
++    store.add(clone)
++
++    # Registry (append-only/WORM).
++    registry_dir = os.path.join(out_dir, "registry")
++    reg = ConceptRegistryV70(registry_dir, toc_fail_threshold=2, similarity_threshold=0.95)
++
++    vectors_A = [
++        {"inputs": {"x": "007", "y": "0"}, "expected": "7", "expected_output_text": "7"},
++        {"inputs": {"x": "0004", "y": "0"}, "expected": "4", "expected_output_text": "4"},
++        {"inputs": {"x": "42", "y": "0"}, "expected": "42", "expected_output_text": "42"},
++    ]
++    vectors_B = [
++        {"inputs": {"x": "4", "y": "8"}, "expected": "12", "expected_output_text": "12"},
++        {"inputs": {"x": "09", "y": "1"}, "expected": "10", "expected_output_text": "10"},
++        {"inputs": {"x": "100", "y": "23"}, "expected": "123", "expected_output_text": "123"},
++    ]
++
++    # (1) Pass A, fail B => NOT promoted.
++    r1 = reg.attempt_promote_with_toc(
++        step=1,
++        candidate=fail_transfer,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[good],
++    )
++    toc1 = r1.get("toc") if isinstance(r1.get("toc"), dict) else {}
++    if not bool(toc1.get("pass_A", False)):
++        _fail("ERROR: expected fail_transfer pass_A==True")
++    if bool(toc1.get("pass_B", False)):
++        _fail("ERROR: expected fail_transfer pass_B==False")
++    c1 = r1.get("concept") if isinstance(r1.get("concept"), dict) else {}
++    if str(c1.get("concept_state") or "") == "ACTIVE":
++        _fail("ERROR: fail_transfer_should_not_be_active")
++
++    # (4) GC on repeated transfer failure (threshold=2).
++    r2 = reg.attempt_promote_with_toc(
++        step=2,
++        candidate=fail_transfer,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[good],
++    )
++    c2 = r2.get("concept") if isinstance(r2.get("concept"), dict) else {}
++    if str(c2.get("concept_state") or "") != "DEAD":
++        _fail("ERROR: expected fail_transfer DEAD after toc_fail_threshold")
++
++    # (3) ToC OK => ACTIVE.
++    r_good = reg.attempt_promote_with_toc(
++        step=3,
++        candidate=good,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[],
++    )
++    c_good = r_good.get("concept") if isinstance(r_good.get("concept"), dict) else {}
++    if str(c_good.get("concept_state") or "") != "ACTIVE":
++        _fail("ERROR: expected good concept ACTIVE")
++
++    # (2) Clone detection blocks twin.
++    r_clone = reg.attempt_promote_with_toc(
++        step=4,
++        candidate=clone,
++        store=store,
++        vectors_A=vectors_A,
++        vectors_B=vectors_B,
++        domain_A="A_normalize",
++        domain_B="B_add",
++        existing_for_duplicates=[good],
++    )
++    c_clone = r_clone.get("concept") if isinstance(r_clone.get("concept"), dict) else {}
++    if str(c_clone.get("concept_state") or "") == "ACTIVE":
++        _fail("ERROR: expected clone NOT ACTIVE")
++    dup = r_clone.get("duplicate") if isinstance(r_clone.get("duplicate"), dict) else {}
++    if str(dup.get("reason") or "") not in {"duplicate_exact", "duplicate_similar"}:
++        _fail(f"ERROR: expected duplicate_* reason, got: {dup}")
++    if str(dup.get("other_id") or "") != str(good_id):
++        _fail("ERROR: expected duplicate other_id == good_id")
++
++    chains = reg.verify_chains()
++    if not (bool(chains.get("concept_registry_chain_ok")) and bool(chains.get("concept_registry_evidence_chain_ok"))):
++        _fail(f"ERROR: registry_chain_verify_failed: {chains}")
++
++    # (4) CALL/RETURN semantic trace with call stack, sigs, anti-aliasing.
++    engine = Engine(store, seed=int(seed), config=EngineConfig(enable_contracts=False))
++    bindings = {"x": "0004", "y": "0008"}
++    out = engine.execute_concept_csv(concept_act_id=good_id, inputs=bindings, expected="12", step=5)
++    trace = out.get("trace") if isinstance(out, dict) else None
++    trace = trace if isinstance(trace, dict) else {}
++    calls = trace.get("concept_calls")
++    if not isinstance(calls, list) or not calls:
++        _fail("ERROR: missing trace.concept_calls")
++
++    # anti-aliasing: mutate bindings after execution must not affect snapshots.
++    bindings["x"] = "MUTATED"
++    bindings["y"] = "MUTATED"
++
++    depths: List[int] = []
++    for ev in calls:
++        if not isinstance(ev, dict):
++            _fail("ERROR: concept_calls element not dict")
++        _assert_call_event(ev, store=store)
++        depths.append(int(ev.get("call_depth", -1)))
++
++    if min(depths) != 0:
++        _fail(f"ERROR: expected min call_depth == 0, got {depths}")
++    if max(depths) < 1:
++        _fail(f"ERROR: expected nested call_depth >=1, got {depths}")
++
++    # Anti-aliasing check for bindings snapshot at root call.
++    root = min((ev for ev in calls if isinstance(ev, dict)), key=lambda e: int(e.get("call_depth", 999)))
++    root_bind = root.get("bindings") if isinstance(root.get("bindings"), dict) else {}
++    if str(root_bind.get("x") or "") != "0004" or str(root_bind.get("y") or "") != "0008":
++        _fail("ERROR: bindings_snapshot_mutated_via_aliasing")
++
++    summary = {
++        "seed": int(seed),
++        "registry": {
++            "fail_transfer_state_after_try2": str(c2.get("concept_state") or ""),
++            "good_state": str(c_good.get("concept_state") or ""),
++            "clone_state": str(c_clone.get("concept_state") or ""),
++            "clone_duplicate_reason": str(dup.get("reason") or ""),
++        },
++        "trace": {
++            "concept_calls_total": int(len(calls)),
++            "call_depths": list(depths),
++            "sample_root_bindings_sig": str(root.get("bindings_sig") or ""),
++            "sample_root_return_sig": str(root.get("return_sig") or ""),
++        },
++        "chains": dict(chains),
++    }
++    return summary
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", default="results/run_smoke_concepts_callstack_toc_v70")
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++
++    out_base = str(args.out_base)
++    seed = int(args.seed)
++
++    results: Dict[str, Any] = {"seed": seed, "tries": {}}
++    summary_shas: List[str] = []
++
++    for t in (1, 2):
++        out_dir = f"{out_base}_try{t}"
++        ensure_absent(out_dir)
++        os.makedirs(out_dir, exist_ok=False)
++
++        summ = smoke_try(out_dir=out_dir, seed=seed)
++        eval_path = os.path.join(out_dir, "eval.json")
++        eval_sha = write_json(eval_path, summ)
++
++        core = dict(summ)
++        core["sha256_eval_json"] = str(eval_sha)
++        summary_sha = sha256_text(canonical_json_dumps(core))
++        smoke = {"summary": core, "determinism": {"summary_sha256": str(summary_sha)}}
++        smoke_path = os.path.join(out_dir, "smoke_summary.json")
++        smoke_sha = write_json(smoke_path, smoke)
++
++        summary_shas.append(str(summary_sha))
++        results["tries"][f"try{t}"] = {
++            "out_dir": out_dir,
++            "eval_json": {"path": eval_path, "sha256": eval_sha},
++            "smoke_summary_json": {"path": smoke_path, "sha256": smoke_sha},
++            "summary_sha256": summary_sha,
++        }
++
++    if not (len(summary_shas) == 2 and summary_shas[0] == summary_shas[1]):
++        _fail(f"ERROR: determinism mismatch: {summary_shas}")
++    results["determinism"] = {"ok": True, "summary_sha256": summary_shas[0]}
++    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
++

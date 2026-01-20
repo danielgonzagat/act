@@ -1,0 +1,685 @@
+--- patches/v34_base/engine.py	2026-01-10 18:21:55
++++ atos_core/engine.py	2026-01-10 18:29:27
+@@ -2,14 +2,16 @@
+ 
+ import math
+ import hashlib
++import json
+ import random
++import re
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+ from .act import Act, Instruction
+ from .atolang import AtoLangVM, Candidate
+ from .metrics import detokenize, is_space, tokenize_text
+-from .suite import user_signature_from_prompt, user_signatures_from_prompt
++from .suite import last_user_text_from_prompt, user_signature_from_prompt, user_signatures_from_prompt
+ 
+ SEP = "\u241f"
+ 
+@@ -33,6 +35,8 @@
+     router_live_enabled: bool = False
+     # Proof mode: compute baseline + gate per token, count mismatches, and fall back to baseline.
+     router_live_debug_compare: bool = False
++    # Deterministic instruction contracts (default OFF).
++    enable_contracts: bool = False
+ 
+ 
+ class Engine:
+@@ -53,6 +57,8 @@
+         self._unigram: Optional[Act] = None
+         self._macro_router: Optional[Act] = None
+         self._macro_router_table: Optional[Dict[str, Any]] = None
++        self._instruction_contract: Optional[Act] = None
++        self._fact_memory: Optional[Act] = None
+         self.rebuild_cache()
+ 
+     def rebuild_cache(self) -> None:
+@@ -65,6 +71,8 @@
+         selector: Optional[Act] = None
+         unigram: Optional[Act] = None
+         macro_router: Optional[Act] = None
++        instruction_contract: Optional[Act] = None
++        fact_memory: Optional[Act] = None
+ 
+         for act in acts:
+             if act.kind == "predictor":
+@@ -88,6 +96,14 @@
+                 ev = act.evidence
+                 if isinstance(ev, dict) and str(ev.get("name") or "") == "macro_router_v0":
+                     macro_router = act
++            elif act.kind == "candidate_source" and instruction_contract is None:
++                ev = act.evidence
++                if isinstance(ev, dict) and str(ev.get("name") or "") == "instruction_contract_v0":
++                    instruction_contract = act
++            elif act.kind == "memory_facts" and fact_memory is None:
++                ev = act.evidence
++                if isinstance(ev, dict) and str(ev.get("name") or "") == "fact_memory_v0":
++                    fact_memory = act
+ 
+         def _act_order(a: Act) -> Tuple[int, str]:
+             n = int(a.evidence.get("n", a.match.get("n", 1)))
+@@ -109,6 +125,8 @@
+             ev = macro_router.evidence
+             if isinstance(ev, dict) and isinstance(ev.get("table"), dict):
+                 self._macro_router_table = ev.get("table")
++        self._instruction_contract = instruction_contract
++        self._fact_memory = fact_memory
+ 
+     def vocab(self) -> List[str]:
+         if self._unigram is None:
+@@ -412,6 +430,9 @@
+         trace_router_live_debug_gate_token: List[str] = []
+         trace_rewrite_rule_hit_ids: List[List[str]] = []
+         trace_rewrite_rules_changed_count: List[int] = []
++        trace_instruction_contract_used: List[int] = []
++        trace_instruction_contract_kind: List[str] = []
++        trace_instruction_contract_reason: List[str] = []
+ 
+         mode_state = "default"
+         mode_act_id: Optional[str] = None
+@@ -597,7 +618,320 @@
+             else:
+                 mode_state = str(sel.evidence.get("mode") or "default")
+             mode_act_id = sel.id
++
++        contract_meta: Dict[str, Any] = {
++            "enabled": bool(self.config.enable_contracts),
++            "contract_act_id": self._instruction_contract.id if self._instruction_contract is not None else None,
++            "used": False,
++            "kind": "",
++            "parsed_args": {},
++            "reason": "",
++        }
++        contract_tokens: List[str] = []
++        contract_kind = ""
++        contract_reason = ""
++        contract_act_id = self._instruction_contract.id if self._instruction_contract is not None else ""
++        contract_pos = 0
++
++        did = int(dialogue_id or 0)
++        trn = int(turn or 0)
++
++        def _strip_quotes(s: str) -> str:
++            return (
++                str(s)
++                .strip()
++                .strip("“”")
++                .strip("\"'")
++                .strip("`")
++                .strip()
++            )
++
++        def _strip_edge_punct(s: str) -> str:
++            return str(s).strip().strip(".,;:!?()[]{}").strip()
++
++        def _mem_table() -> Optional[Dict[str, Any]]:
++            act = self._fact_memory
++            if act is None:
++                return None
++            ev = act.evidence
++            if not isinstance(ev, dict) or not bool(ev.get("enabled", True)):
++                return None
++            table = ev.setdefault("table", {})
++            if not isinstance(table, dict):
++                table = {}
++                ev["table"] = table
++            return table
++
++        def _mem_key(kind: str, *parts: str) -> str:
++            suffix = ":".join(str(p) for p in parts if p is not None and str(p) != "")
++            if suffix:
++                return f"contract:{kind}:{did}:{suffix}"
++            return f"contract:{kind}:{did}"
++
++        def _mem_set(key: str, value: str) -> bool:
++            table = _mem_table()
++            if table is None:
++                return False
++            entry = table.get(key)
++            if entry is None or not isinstance(entry, dict):
++                entry = {
++                    "value": str(value),
++                    "confidence": 0.5,
++                    "evidence_turns": [],
++                    "last_seen_step": 0,
++                    "count": 0,
++                }
++                table[key] = entry
++            prev = str(entry.get("value", ""))
++            if prev and prev != str(value):
++                entry["confidence"] = min(1.0, float(entry.get("confidence", 0.0)) + 0.01)
++            entry["value"] = str(value)
++            entry["count"] = int(entry.get("count", 0)) + 1
++            cnt = int(entry["count"])
++            entry["confidence"] = float(1.0 - (0.5**cnt))
++            entry["last_seen_step"] = 0
++            ev_turns = entry.get("evidence_turns")
++            if not isinstance(ev_turns, list):
++                ev_turns = []
++                entry["evidence_turns"] = ev_turns
++            ev_turns.append({"dialogue_id": int(did), "turn": int(trn), "mode": str(mode_state)})
++            while len(ev_turns) > 8:
++                ev_turns.pop(0)
++            return True
+ 
++        def _mem_get(key: str) -> Optional[str]:
++            table = _mem_table()
++            if table is None:
++                return None
++            entry = table.get(key)
++            if not isinstance(entry, dict):
++                return None
++            val = str(entry.get("value", ""))
++            return val if val else None
++
++        if bool(self.config.enable_contracts):
++            act = self._instruction_contract
++            if act is None:
++                contract_meta["reason"] = "contract_missing"
++            elif not isinstance(act.evidence, dict) or not bool(act.evidence.get("enabled", True)):
++                contract_meta["reason"] = "contract_disabled"
++            else:
++                user_txt = str(last_user_text_from_prompt(prompt) or "").strip()
++                if not user_txt:
++                    contract_meta["reason"] = "empty_user_text"
++                else:
++                    u = user_txt
++
++                    exact_pats = [
++                        re.compile(r"(?is)^\s*responda\s+exatamente\s*:\s*(.+?)\s*$"),
++                        re.compile(r"(?is)^\s*retorne\s+exatamente\s+a\s+string\s*:\s*(.+?)\s*$"),
++                    ]
++                    for pat in exact_pats:
++                        m = pat.match(u)
++                        if m:
++                            ans = _strip_quotes(m.group(1))
++                            if ans:
++                                contract_tokens = tokenize_text(ans)
++                                contract_kind = "exact"
++                                contract_reason = "instruction_exact"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"text": ans}
++                                contract_meta["reason"] = contract_reason
++                            break
++
++                    if not contract_tokens and re.search(r"(?i)\bjson\b", u) and re.search(r"(?i)\bapenas\b", u):
++                        required_keys: List[str] = []
++                        m_keys = re.search(r'(?i)chaves\s+"([^"]+)"\s+e\s+"([^"]+)"', u)
++                        if m_keys:
++                            required_keys = [str(m_keys.group(1)), str(m_keys.group(2))]
++
++                        obj: Dict[str, Any] = {}
++                        for m in re.finditer(
++                            r'(?i)"(?P<key>[^"]+)"\s+deve\s+ser\s+a\s+string\s+"(?P<val>[^"]*)"',
++                            u,
++                        ):
++                            obj[str(m.group("key"))] = str(m.group("val"))
++                        for m in re.finditer(
++                            r'(?i)"(?P<key>[^"]+)"\s+deve\s+ser\s+(?:o\s+n[úu]mero\s+)?(?P<val>-?\d+)\b',
++                            u,
++                        ):
++                            obj[str(m.group("key"))] = int(m.group("val"))
++                        for m in re.finditer(
++                            r'(?i)"(?P<key>[^"]+)"\s+deve\s+ser\s+(?P<val>true|false)\b',
++                            u,
++                        ):
++                            obj[str(m.group("key"))] = bool(str(m.group("val")).lower() == "true")
++
++                        if required_keys and any(k not in obj for k in required_keys):
++                            contract_meta["reason"] = "json_parse_incomplete"
++                        elif not obj:
++                            contract_meta["reason"] = "json_parse_empty"
++                        else:
++                            ans = json.dumps(
++                                obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
++                            )
++                            contract_tokens = tokenize_text(ans)
++                            contract_kind = "json"
++                            contract_reason = "instruction_json"
++                            contract_meta["used"] = True
++                            contract_meta["kind"] = contract_kind
++                            contract_meta["parsed_args"] = {
++                                "obj": obj,
++                                "required_keys": required_keys,
++                            }
++                            contract_meta["reason"] = contract_reason
++
++                    if (
++                        not contract_tokens
++                        and re.search(r"(?i)n[úu]mero\s+inteiro", u)
++                        and re.search(r"(?i)\bapenas\b", u)
++                    ):
++                        m = re.search(r"(-?\d+)\s*([+\-*/])\s*(-?\d+)", u)
++                        if not m:
++                            contract_meta["reason"] = "math_parse_missing"
++                        else:
++                            a = int(m.group(1))
++                            op = str(m.group(2))
++                            b = int(m.group(3))
++                            if op == "+":
++                                val = a + b
++                            elif op == "-":
++                                val = a - b
++                            elif op == "*":
++                                val = a * b
++                            else:
++                                if b == 0:
++                                    contract_meta["reason"] = "math_div_zero"
++                                    val = None
++                                else:
++                                    val = int(a / b)
++                            if val is not None:
++                                contract_tokens = tokenize_text(str(val))
++                                contract_kind = "math_int"
++                                contract_reason = "instruction_math"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"a": a, "op": op, "b": b, "value": int(val)}
++                                contract_meta["reason"] = contract_reason
++
++                    if not contract_tokens:
++                        m = re.search(r"(?i)\bsenha\s+é\s+([A-Za-z0-9_-]+)", u)
++                        if m:
++                            pw = _strip_edge_punct(m.group(1))
++                            key = _mem_key("senha")
++                            ok = _mem_set(key, pw)
++                            if ok:
++                                contract_tokens = tokenize_text("OK")
++                                contract_kind = "memory_store"
++                                contract_reason = "store_password"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": pw}
++                                contract_meta["reason"] = contract_reason
++
++                    if not contract_tokens:
++                        m = re.search(
++                            r"(?i)\b([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\s+nasceu\s+em\s+(\d{4})\b",
++                            u,
++                        )
++                        if m:
++                            ent = str(m.group(1))
++                            year = str(m.group(2))
++                            key = _mem_key("born_year", ent.lower())
++                            ok = _mem_set(key, year)
++                            if ok:
++                                contract_tokens = tokenize_text("OK")
++                                contract_kind = "memory_store"
++                                contract_reason = "store_birth_year"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": year, "entity": ent}
++                                contract_meta["reason"] = contract_reason
++
++                    if not contract_tokens:
++                        m = re.search(r"(?i)palavra[- ]c[óo]digo\s*:\s*([A-Za-z0-9_-]+)", u)
++                        if m:
++                            code = _strip_edge_punct(m.group(1))
++                            key = _mem_key("code")
++                            ok = _mem_set(key, code)
++                            if ok:
++                                contract_tokens = tokenize_text("OK")
++                                contract_kind = "memory_store"
++                                contract_reason = "store_code"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": code}
++                                contract_meta["reason"] = contract_reason
++
++                    if not contract_tokens:
++                        m = re.search(r"(?i)qual\s+é\s+a\s+senha\b", u) or re.search(
++                            r"(?i)repita\s+a\s+senha\b", u
++                        )
++                        if m:
++                            key = _mem_key("senha")
++                            pw = _mem_get(key)
++                            if pw is not None:
++                                contract_tokens = tokenize_text(pw)
++                                contract_kind = "memory_query"
++                                contract_reason = "recall_password"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": pw}
++                                contract_meta["reason"] = contract_reason
++                            else:
++                                contract_meta["reason"] = "missing_password"
++
++                    if not contract_tokens:
++                        m = re.search(
++                            r"(?i)em\s+que\s+ano\s+([A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+)\s+nasceu\b",
++                            u,
++                        )
++                        if m:
++                            ent = str(m.group(1))
++                            key = _mem_key("born_year", ent.lower())
++                            year = _mem_get(key)
++                            if year is not None:
++                                contract_tokens = tokenize_text(year)
++                                contract_kind = "memory_query"
++                                contract_reason = "recall_birth_year"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": year, "entity": ent}
++                                contract_meta["reason"] = contract_reason
++                            else:
++                                contract_meta["reason"] = "missing_birth_year"
++
++                    if not contract_tokens:
++                        if re.search(r"(?i)repita\s+a\s+palavra[- ]c[óo]digo\b", u):
++                            key = _mem_key("code")
++                            code = _mem_get(key)
++                            if code is not None:
++                                contract_tokens = tokenize_text(code)
++                                contract_kind = "memory_query"
++                                contract_reason = "recall_code"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"fact_key": key, "value": code}
++                                contract_meta["reason"] = contract_reason
++                            else:
++                                contract_meta["reason"] = "missing_code"
++
++                    if not contract_tokens:
++                        m = re.search(r"(?i)\binclua\s+([A-Za-z0-9_-]+)\b", u)
++                        if m:
++                            tok = _strip_edge_punct(m.group(1))
++                            if tok:
++                                contract_tokens = tokenize_text(tok)
++                                contract_kind = "contains_token"
++                                contract_reason = "include_token"
++                                contract_meta["used"] = True
++                                contract_meta["kind"] = contract_kind
++                                contract_meta["parsed_args"] = {"token": tok}
++                                contract_meta["reason"] = contract_reason
++
++        contract_active = bool(contract_tokens)
++
+         def penalty_view(tokens: List[str], gen: List[str]) -> Dict[str, Any]:
+             filtered = [x for x in tokens if x not in {"<BOS>"}]
+             recent = filtered[-self.config.repetition_recent :]
+@@ -693,6 +1027,61 @@
+             ck = ctx_key(context)
+             penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+ 
++            if contract_active and contract_pos < len(contract_tokens):
++                nxt = str(contract_tokens[contract_pos])
++                contract_pos += 1
++
++                trace_context_keys.append(ck)
++                trace_executed_predictor_ids.append([])
++                trace_rewrite_rule_hit_ids.append([])
++                trace_rewrite_rules_changed_count.append(0)
++
++                trace_predictor_iterated.append(0)
++                trace_predictor_matched.append(0)
++                trace_predictor_emitted.append(0)
++                trace_candidates_pre.append(1)
++                trace_candidates_post.append(1)
++
++                trace_router_live_used.append(0)
++                trace_router_live_fallback.append(0)
++                trace_router_live_fallback_reason.append("")
++                trace_router_live_allowed_predictor_ids.append([])
++                trace_router_live_predictors_iterated.append(0)
++                trace_router_live_predictors_matched.append(0)
++                trace_router_live_predictors_emitted.append(0)
++                trace_baseline_predictors_iterated.append(0)
++                trace_baseline_predictors_matched.append(0)
++                trace_baseline_predictors_emitted.append(0)
++                trace_router_live_mismatch.append(0)
++                trace_router_live_debug_baseline_token.append("")
++                trace_router_live_debug_gate_token.append("")
++
++                trace_instruction_contract_used.append(1)
++                trace_instruction_contract_kind.append(str(contract_kind))
++                trace_instruction_contract_reason.append(str(contract_reason))
++
++                trace_selected_act_ids.append(str(contract_act_id or "__contract__"))
++                trace_selected_tokens.append(str(nxt))
++
++                gen_tokens.append(nxt)
++                filtered = [x for x in (out_tokens + gen_tokens) if x not in {"<BOS>"}]
++                n = self.config.cycle_ngram
++                if len(filtered) >= n:
++                    ng = tuple(filtered[-n:])
++                    history_ngrams.append(ng)
++                    history_ngram_set.add(ng)
++                    if len(history_ngrams) > self.config.cycle_history:
++                        old = history_ngrams.pop(0)
++                        if old not in history_ngrams:
++                            history_ngram_set.discard(old)
++
++                context.append(nxt)
++                context = context[-(self.config.max_order - 1) :]
++
++                if contract_pos >= len(contract_tokens):
++                    break
++                continue
++
+             router_live_enabled = bool(self.config.router_live_enabled)
+             router_debug = bool(self.config.router_live_debug_compare)
+ 
+@@ -817,7 +1206,7 @@
+             )
+ 
+             # EOS guardrail
+-            if i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
++            if (not contract_active) and i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
+                 candidates["<EOS>"].score -= 1e6
+ 
+             if not candidates:
+@@ -855,6 +1244,10 @@
+             trace_router_live_debug_baseline_token.append(baseline_tok)
+             trace_router_live_debug_gate_token.append(gate_tok)
+ 
++            trace_instruction_contract_used.append(0)
++            trace_instruction_contract_kind.append("")
++            trace_instruction_contract_reason.append("")
++
+             trace_selected_act_ids.append(str(src_act))
+             trace_selected_tokens.append(str(nxt))
+ 
+@@ -911,6 +1304,10 @@
+                 "router_live_mismatch": trace_router_live_mismatch,
+                 "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
+                 "router_live_debug_gate_token": trace_router_live_debug_gate_token,
++                "instruction_contract": contract_meta,
++                "instruction_contract_used": trace_instruction_contract_used,
++                "instruction_contract_kind": trace_instruction_contract_kind,
++                "instruction_contract_reason": trace_instruction_contract_reason,
+             },
+             "mode": mode_state,
+             "mode_act_id": mode_act_id,
+--- patches/v34_base/learn.py	2026-01-10 18:21:55
++++ atos_core/learn.py	2026-01-10 18:26:30
+@@ -469,6 +469,24 @@
+             "top_k": 2,
+             # ctx_sig -> {"predictors": [...], "counts": {...}, "total": int}
+             "table": {},
++        },
++        cost={"overhead_bits": 512},
++        deps=[],
++    )
++
++
++def _make_instruction_contract_act(*, act_id: str, created_at: str) -> Act:
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=created_at,
++        kind="candidate_source",
++        match={"type": "always"},
++        program=[],
++        evidence={
++            "name": "instruction_contract_v0",
++            "enabled": True,
++            "shadow_mode": True,
+         },
+         cost={"overhead_bits": 512},
+         deps=[],
+@@ -750,6 +768,8 @@
+     utility_weight: float = 0.0
+     # Utility suite token budget during training (evaluation scripts use their own max_new_tokens).
+     skill_suite_max_new_tokens: int = 128
++    # Enable deterministic instruction contracts during generation (default OFF).
++    enable_contracts: bool = False
+ 
+ 
+ class KAAbsoluteTrainer:
+@@ -842,6 +862,12 @@
+                 created_at=deterministic_iso(step=0, offset_us=10),
+             )
+         )
++        self.store.add(
++            _make_instruction_contract_act(
++                act_id=det_act_id(step=0, name="instruction_contract_v0", idx=0),
++                created_at=deterministic_iso(step=0, offset_us=11),
++            )
++        )
+ 
+     def _load_tokens(self) -> List[str]:
+         with open(self.data_path, "r", encoding="utf-8") as f:
+@@ -2721,7 +2747,11 @@
+         self._init_acts()
+         tokens = self._load_tokens()
+ 
+-        engine = Engine(self.store, seed=self.config.seed, config=EngineConfig())
++        engine = Engine(
++            self.store,
++            seed=self.config.seed,
++            config=EngineConfig(enable_contracts=bool(self.config.enable_contracts)),
++        )
+ 
+         report: List[Dict[str, Any]] = []
+         nll_sum_bits = 0.0
+--- patches/v34_base/suite.py	2026-01-10 18:21:55
++++ atos_core/suite.py	2026-01-10 18:26:19
+@@ -764,6 +764,9 @@
+ 
+             tr = dict(out.get("trace") or {})
+             plan_trace = _plan_trace_for_task(task, turn_idx=int(j))
++            contract_meta = tr.get("instruction_contract")
++            if isinstance(contract_meta, dict):
++                plan_trace["contract"] = contract_meta
+             tr["plan_trace"] = plan_trace
+             history[-1]["trace"] = tr
+ 
+--- patches/v34_base/train.py	2026-01-10 18:21:55
++++ scripts/train.py	2026-01-10 18:26:39
+@@ -63,6 +63,11 @@
+         default=128,
+         help="Max new tokens for the utility suite during training (eval scripts remain canonical).",
+     )
++    ap.add_argument(
++        "--enable_contracts",
++        action="store_true",
++        help="Enable deterministic instruction contracts during generation (default OFF).",
++    )
+     args = ap.parse_args()
+ 
+     ensure_sample_dataset(args.data)
+@@ -76,6 +81,7 @@
+         mode=args.mode,
+         utility_weight=float(args.utility_weight),
+         skill_suite_max_new_tokens=int(args.skill_suite_max_new_tokens),
++        enable_contracts=bool(args.enable_contracts),
+     )
+     trainer = KAAbsoluteTrainer(data_path=args.data, out_dir=args.out, config=cfg)
+     trainer.train()
+--- patches/v34_base/eval.py	2026-01-10 18:21:55
++++ scripts/eval.py	2026-01-10 18:26:46
+@@ -10,7 +10,7 @@
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from atos_core.act import estimate_act_cost_bits
+-from atos_core.engine import Engine
++from atos_core.engine import Engine, EngineConfig
+ from atos_core.ledger import Ledger
+ from atos_core.metrics import tokenize_text
+ from atos_core.store import ActStore
+@@ -35,6 +35,7 @@
+     ap.add_argument("--data", default="data/sample_text.txt")
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--max_new_tokens", type=int, default=200)
++    ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
+     args = ap.parse_args()
+ 
+     acts_path = os.path.join(args.run, "acts.jsonl")
+@@ -43,7 +44,7 @@
+     ledger_path = os.path.join(args.run, "ledger.jsonl")
+ 
+     store = ActStore.load_jsonl(acts_path)
+-    engine = Engine(store, seed=args.seed)
++    engine = Engine(store, seed=args.seed, config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
+ 
+     with open(args.data, "r", encoding="utf-8") as f:
+         tokens = tokenize_text(f.read())
+--- patches/v34_base/eval_skill_suite.py	2026-01-10 18:21:55
++++ scripts/eval_skill_suite.py	2026-01-10 18:26:52
+@@ -10,7 +10,7 @@
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+-from atos_core.engine import Engine
++from atos_core.engine import Engine, EngineConfig
+ from atos_core.store import ActStore
+ from atos_core.suite import SKILL_DIALOGUES_V0, run_skill_suite
+ 
+@@ -45,11 +45,12 @@
+     ap.add_argument("--run", required=True, help="Run dir containing acts.jsonl (read-only)")
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--max_new_tokens", type=int, default=200)
++    ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
+     args = ap.parse_args()
+ 
+     acts_path = os.path.join(args.run, "acts.jsonl")
+     store = ActStore.load_jsonl(acts_path)
+-    engine = Engine(store, seed=args.seed)
++    engine = Engine(store, seed=args.seed, config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
+ 
+     transcripts, metrics = run_skill_suite(
+         engine, tasks=SKILL_DIALOGUES_V0, max_new_tokens=args.max_new_tokens
+@@ -68,4 +69,3 @@
+ 
+ if __name__ == "__main__":
+     main()
+-
+--- patches/v34_base/eval_gate_compare.py	2026-01-10 18:21:55
++++ scripts/eval_gate_compare.py	2026-01-10 18:27:01
+@@ -280,17 +280,30 @@
+     ap.add_argument("--run", required=True, help="Run dir containing acts.jsonl (read-only)")
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--max_new_tokens", type=int, default=200)
++    ap.add_argument("--enable_contracts", action="store_true", help="Enable deterministic instruction contracts.")
+     args = ap.parse_args()
+ 
+     acts_path = os.path.join(args.run, "acts.jsonl")
+     store = ActStore.load_jsonl(acts_path)
+ 
+-    base_engine = Engine(store, seed=args.seed, config=EngineConfig())
++    base_engine = Engine(store, seed=args.seed, config=EngineConfig(enable_contracts=bool(args.enable_contracts)))
+     gate_proof_engine = Engine(
+-        store, seed=args.seed, config=EngineConfig(router_live_enabled=True, router_live_debug_compare=True)
++        store,
++        seed=args.seed,
++        config=EngineConfig(
++            router_live_enabled=True,
++            router_live_debug_compare=True,
++            enable_contracts=bool(args.enable_contracts),
++        ),
+     )
+     gate_live_engine = Engine(
+-        store, seed=args.seed, config=EngineConfig(router_live_enabled=True, router_live_debug_compare=False)
++        store,
++        seed=args.seed,
++        config=EngineConfig(
++            router_live_enabled=True,
++            router_live_debug_compare=False,
++            enable_contracts=bool(args.enable_contracts),
++        ),
+     )
+ 
+     base_transcripts, _ = run_chat_suite(

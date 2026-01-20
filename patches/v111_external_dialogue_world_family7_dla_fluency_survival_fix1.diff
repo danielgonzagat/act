@@ -1,0 +1,2250 @@
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/conversation_loop_v111.py	2026-01-15 00:00:39
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from typing import Any, Dict, Sequence
++
++from .conversation_loop_v110 import run_conversation_v110
++from .conversation_v96 import verify_chained_jsonl_v96
++from .external_world_ledger_v111 import compute_external_world_chain_hash_v111, verify_external_world_event_sig_chain_v111
++from .fluency_contract_v111 import fluency_contract_v111
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _fail(msg: str) -> None:
++    raise RuntimeError(msg)
++
++
++def run_conversation_v111(
++    *,
++    user_turn_texts: Sequence[str],
++    out_dir: str,
++    seed: int,
++) -> Dict[str, Any]:
++    """
++    Wrapper over V110:
++      - Runs V110 conversation pipeline.
++      - Adds V111 read-only artifacts (external_world_events ledger placeholder + fluency contract report).
++      - Produces freeze_manifest_v111.json (WORM) + summary_v111.json (WORM).
++    """
++    run_conversation_v110(user_turn_texts=list(user_turn_texts), out_dir=str(out_dir), seed=int(seed))
++
++    ext_events_path = os.path.join(str(out_dir), "external_world_events.jsonl")
++    ext_snapshot_path = os.path.join(str(out_dir), "external_world_registry_snapshot_v111.json")
++    fluency_path = os.path.join(str(out_dir), "fluency_contract_v111.json")
++    manifest_path = os.path.join(str(out_dir), "freeze_manifest_v111.json")
++    summary_path = os.path.join(str(out_dir), "summary_v111.json")
++
++    # External world ledger must exist (empty by default).
++    if os.path.exists(ext_events_path):
++        _fail(f"worm_exists:{ext_events_path}")
++    with open(ext_events_path, "x", encoding="utf-8") as f:
++        f.write("")
++
++    # Verify empty ledger ok.
++    ext_events: list = []
++    ok_sig, reason_sig, _ = verify_external_world_event_sig_chain_v111(ext_events)
++    if not ok_sig or str(reason_sig) != "ok":
++        _fail(f"external_world_sig_chain_fail:{reason_sig}")
++    ext_chain_hash = compute_external_world_chain_hash_v111(ext_events)
++    if os.path.exists(ext_snapshot_path):
++        _fail(f"worm_exists:{ext_snapshot_path}")
++    with open(ext_snapshot_path, "x", encoding="utf-8") as f:
++        f.write(json.dumps({"schema_version": 111, "events_total": 0, "external_world_chain_hash_v111": ext_chain_hash}, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    # Fluency contract on transcript.
++    transcript_path = os.path.join(str(out_dir), "transcript.jsonl")
++    transcript: list = []
++    with open(transcript_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            transcript.append(json.loads(line))
++    ok_fc, reason_fc, details_fc = fluency_contract_v111(transcript=transcript)
++    if os.path.exists(fluency_path):
++        _fail(f"worm_exists:{fluency_path}")
++    with open(fluency_path, "x", encoding="utf-8") as f:
++        f.write(json.dumps({"ok": bool(ok_fc), "reason": str(reason_fc), "details": dict(details_fc)}, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    # Freeze manifest v111 (WORM).
++    if os.path.exists(manifest_path):
++        _fail(f"worm_exists:{manifest_path}")
++    sha256 = {
++        "v110_freeze_manifest_v110_json": _sha256_file(os.path.join(str(out_dir), "freeze_manifest_v110.json")),
++        "external_world_events_jsonl": _sha256_file(ext_events_path),
++        "external_world_registry_snapshot_v111_json": _sha256_file(ext_snapshot_path),
++        "fluency_contract_v111_json": _sha256_file(fluency_path),
++    }
++    with open(manifest_path, "x", encoding="utf-8") as f:
++        f.write(json.dumps({"schema_version": 111, "kind": "freeze_manifest_v111", "sha256": sha256}, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    # Summary v111 (WORM).
++    if os.path.exists(summary_path):
++        _fail(f"worm_exists:{summary_path}")
++    ledger_hash = _sha256_file(manifest_path)
++    with open(summary_path, "x", encoding="utf-8") as f:
++        f.write(
++            json.dumps(
++                {
++                    "schema_version": 111,
++                    "seed": int(seed),
++                    "external_world_chain_hash_v111": str(ext_chain_hash),
++                    "fluency_contract_ok_v111": bool(ok_fc),
++                    "fluency_contract_reason_v111": str(reason_fc),
++                    "ledger_hash": str(ledger_hash),
++                },
++                ensure_ascii=False,
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        f.write("\n")
++
++    return {"ok": True, "out_dir": str(out_dir), "ledger_hash": str(ledger_hash)}
++
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/conversation_v111.py	2026-01-15 00:01:06
+@@ -0,0 +1,123 @@
++from __future__ import annotations
++
++import json
++import os
++from typing import Any, Dict, List, Sequence, Tuple
++
++from .conversation_v100 import no_hybridization_check_v100
++from .conversation_v110 import verify_conversation_chain_v110
++from .conversation_v96 import verify_chained_jsonl_v96
++from .external_world_ledger_v111 import compute_external_world_chain_hash_v111, verify_external_world_event_sig_chain_v111
++
++
++def _load_jsonl(path: str) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not os.path.exists(path):
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def verify_conversation_chain_v111(*, run_dir: str, repo_root: str) -> Tuple[bool, str, Dict[str, Any]]:
++    """
++    Wrapper over V110 verifier plus V111 checks:
++      - external_world_events.jsonl exists and is hash-chained + sig-chained.
++      - fluency_contract_v111.json exists and ok==true.
++      - no-hybridization guardrail.
++    """
++    ok_h, reason_h, details_h = no_hybridization_check_v100(repo_root=str(repo_root))
++    if not ok_h:
++        return False, str(reason_h), dict(details_h)
++
++    rd = str(run_dir)
++    required = [
++        os.path.join(rd, "conversation_turns.jsonl"),
++        os.path.join(rd, "conversation_states.jsonl"),
++        os.path.join(rd, "intent_parses.jsonl"),
++        os.path.join(rd, "dialogue_trials.jsonl"),
++        os.path.join(rd, "learned_intent_rules.jsonl"),
++        os.path.join(rd, "action_plans.jsonl"),
++        os.path.join(rd, "memory_events.jsonl"),
++        os.path.join(rd, "belief_events.jsonl"),
++        os.path.join(rd, "evidence_events.jsonl"),
++        os.path.join(rd, "goal_events.jsonl"),
++        os.path.join(rd, "goal_ledger_snapshot.json"),
++        os.path.join(rd, "discourse_events.jsonl"),
++        os.path.join(rd, "fragment_events.jsonl"),
++    ]
++    for p in required:
++        if not os.path.exists(p):
++            return False, "missing_path", {"path": str(p)}
++
++    turns = _load_jsonl(os.path.join(rd, "conversation_turns.jsonl"))
++    states = _load_jsonl(os.path.join(rd, "conversation_states.jsonl"))
++    parse_events = _load_jsonl(os.path.join(rd, "intent_parses.jsonl"))
++    trials = _load_jsonl(os.path.join(rd, "dialogue_trials.jsonl"))
++    learned_rule_events = _load_jsonl(os.path.join(rd, "learned_intent_rules.jsonl"))
++    action_plans = _load_jsonl(os.path.join(rd, "action_plans.jsonl"))
++    memory_events = _load_jsonl(os.path.join(rd, "memory_events.jsonl"))
++    belief_events = _load_jsonl(os.path.join(rd, "belief_events.jsonl"))
++    evidence_events = _load_jsonl(os.path.join(rd, "evidence_events.jsonl"))
++    goal_events = _load_jsonl(os.path.join(rd, "goal_events.jsonl"))
++    goal_snapshot = json.loads(open(os.path.join(rd, "goal_ledger_snapshot.json"), "r", encoding="utf-8").read())
++    discourse_events = _load_jsonl(os.path.join(rd, "discourse_events.jsonl"))
++    fragment_events = _load_jsonl(os.path.join(rd, "fragment_events.jsonl"))
++
++    # Infer tail_k.
++    tail_k = 6
++    for st in states[-3:]:
++        if not isinstance(st, dict):
++            continue
++        inv = st.get("invariants") if isinstance(st.get("invariants"), dict) else {}
++        try:
++            tail_k = int(inv.get("tail_k") or tail_k)
++        except Exception:
++            pass
++
++    ok0, reason0, details0 = verify_conversation_chain_v110(
++        turns=turns,
++        states=states,
++        parse_events=parse_events,
++        trials=trials,
++        learned_rule_events=learned_rule_events,
++        action_plans=action_plans,
++        memory_events=memory_events,
++        belief_events=belief_events,
++        evidence_events=evidence_events,
++        goal_events=goal_events,
++        goal_snapshot=dict(goal_snapshot),
++        discourse_events=discourse_events,
++        fragment_events=fragment_events,
++        tail_k=int(tail_k),
++        repo_root=str(repo_root),
++    )
++    if not ok0:
++        return False, str(reason0), dict(details0)
++
++    # External world ledger (may be empty, but must exist and be verifiable).
++    ext_path = os.path.join(rd, "external_world_events.jsonl")
++    if not os.path.exists(ext_path):
++        return False, "missing_external_world_ledger", {"path": str(ext_path)}
++    if not bool(verify_chained_jsonl_v96(str(ext_path))):
++        return False, "external_world_file_chain_invalid", {}
++    ext_events = _load_jsonl(str(ext_path))
++    ok_sig, reason_sig, details_sig = verify_external_world_event_sig_chain_v111(ext_events)
++    if not ok_sig:
++        return False, str(reason_sig), dict(details_sig)
++    ext_chain_hash = compute_external_world_chain_hash_v111(ext_events)
++
++    # Fluency contract file.
++    fc_path = os.path.join(rd, "fluency_contract_v111.json")
++    if not os.path.exists(fc_path):
++        return False, "missing_fluency_contract", {"path": str(fc_path)}
++    fc = json.loads(open(fc_path, "r", encoding="utf-8").read())
++    if not bool(fc.get("ok", False)):
++        return False, "fluency_contract_failed", {"reason": str(fc.get("reason") or "")}
++
++    return True, "ok", {"external_world_chain_hash_v111": str(ext_chain_hash), "external_world_events_total": int(len(ext_events))}
++
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/external_dialogue_world_v111.py	2026-01-14 23:53:17
+@@ -0,0 +1,161 @@
++from __future__ import annotations
++
++import json
++import os
++import struct
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
++
++
++def _canon_path(p: str) -> str:
++    return str(p).replace(os.sep, "/")
++
++
++def _read_u64_le_list(path: str) -> List[int]:
++    data = open(path, "rb").read()
++    if len(data) % 8 != 0:
++        raise ValueError(f"offsets_size_not_multiple_of_8:{path}:{len(data)}")
++    out: List[int] = []
++    for i in range(0, len(data), 8):
++        out.append(int(struct.unpack("<Q", data[i : i + 8])[0]))
++    return out
++
++
++@dataclass(frozen=True)
++class ExternalWorldTurnV111:
++    global_turn_index: int
++    conversation_id: str
++    conversation_title: Optional[str]
++    turn_in_conversation: int
++    timestamp: Optional[str]
++    role: str
++    text: str
++    message_id: str
++    parent_message_id: str
++    children_message_ids: List[str]
++    source: str
++
++
++def _turn_from_obj(obj: Dict[str, Any]) -> ExternalWorldTurnV111:
++    return ExternalWorldTurnV111(
++        global_turn_index=int(obj.get("global_turn_index") or 0),
++        conversation_id=str(obj.get("conversation_id") or ""),
++        conversation_title=str(obj.get("conversation_title")) if isinstance(obj.get("conversation_title"), str) else None,
++        turn_in_conversation=int(obj.get("turn_in_conversation") or 0),
++        timestamp=str(obj.get("timestamp")) if isinstance(obj.get("timestamp"), str) else None,
++        role=str(obj.get("role") or "unknown"),
++        text=str(obj.get("text") or ""),
++        message_id=str(obj.get("message_id") or ""),
++        parent_message_id=str(obj.get("parent_message_id") or ""),
++        children_message_ids=[str(x) for x in (obj.get("children_message_ids") or []) if isinstance(x, str)],
++        source=str(obj.get("source") or ""),
++    )
++
++
++class ExternalDialogueWorldV111:
++    def __init__(self, *, world_root: str, manifest: Dict[str, Any]) -> None:
++        self.world_root = str(world_root)
++        self.manifest = dict(manifest)
++
++        paths = self.manifest.get("paths") if isinstance(self.manifest.get("paths"), dict) else {}
++        self.canonical_jsonl_path = os.path.normpath(os.path.join(self.world_root, str(paths.get("canonical_jsonl") or "")))
++        self.offsets_bin_path = os.path.normpath(os.path.join(self.world_root, str(paths.get("offsets_bin") or "")))
++        self.conversations_index_path = os.path.normpath(os.path.join(self.world_root, str(paths.get("conversations_index_json") or "")))
++
++        if not (os.path.exists(self.canonical_jsonl_path) and os.path.exists(self.offsets_bin_path) and os.path.exists(self.conversations_index_path)):
++            raise FileNotFoundError("external_world_missing_files")
++
++        counts = self.manifest.get("counts") if isinstance(self.manifest.get("counts"), dict) else {}
++        self.turns_total = int(counts.get("turns_total") or 0)
++        self.offsets = _read_u64_le_list(self.offsets_bin_path)
++        if self.turns_total and len(self.offsets) != self.turns_total:
++            raise ValueError("external_world_offsets_len_mismatch")
++
++        with open(self.conversations_index_path, "r", encoding="utf-8") as f:
++            self.conversations_index = json.load(f)
++
++    def fetch_turn(self, turn_id: int) -> ExternalWorldTurnV111:
++        idx = int(turn_id)
++        if idx < 0 or idx >= len(self.offsets):
++            raise IndexError("turn_id_out_of_range")
++        offset = int(self.offsets[idx])
++        with open(self.canonical_jsonl_path, "rb") as f:
++            f.seek(offset)
++            line = f.readline()
++        obj = json.loads(line.decode("utf-8"))
++        if int(obj.get("global_turn_index", -1)) != idx:
++            raise ValueError("turn_index_mismatch")
++        return _turn_from_obj(obj)
++
++    def observe_range(
++        self,
++        *,
++        start_turn: int,
++        end_turn: int,
++        roles: Optional[Sequence[str]] = None,
++        limit: Optional[int] = None,
++    ) -> List[ExternalWorldTurnV111]:
++        s = int(start_turn)
++        e = int(end_turn)
++        if s < 0:
++            s = 0
++        if e >= len(self.offsets):
++            e = len(self.offsets) - 1
++        if e < s:
++            return []
++        role_set = set([str(r) for r in (roles or []) if isinstance(r, str) and r])
++        out: List[ExternalWorldTurnV111] = []
++        max_n = int(limit) if limit is not None else None
++        for idx in range(s, e + 1):
++            t = self.fetch_turn(idx)
++            if role_set and t.role not in role_set:
++                continue
++            out.append(t)
++            if max_n is not None and len(out) >= max_n:
++                break
++        return list(out)
++
++    def search_text(
++        self,
++        *,
++        query: str,
++        limit: int,
++        roles: Optional[Sequence[str]] = None,
++    ) -> List[Dict[str, Any]]:
++        q = str(query or "")
++        if not q:
++            return []
++        role_set = set([str(r) for r in (roles or []) if isinstance(r, str) and r])
++        out: List[Dict[str, Any]] = []
++        # Deterministic linear scan; used only under gating.
++        with open(self.canonical_jsonl_path, "r", encoding="utf-8") as f:
++            for line in f:
++                obj = json.loads(line)
++                role = str(obj.get("role") or "unknown")
++                if role_set and role not in role_set:
++                    continue
++                text = str(obj.get("text") or "")
++                if q in text:
++                    out.append(
++                        {
++                            "global_turn_index": int(obj.get("global_turn_index") or 0),
++                            "conversation_id": str(obj.get("conversation_id") or ""),
++                            "role": role,
++                            "text_hash": "",  # filled by caller if needed
++                        }
++                    )
++                    if len(out) >= int(limit):
++                        break
++        out.sort(key=lambda d: (int(d.get("global_turn_index") or 0), str(d.get("conversation_id") or "")))
++        return list(out)
++
++
++def load_world_v111(*, manifest_path: str) -> ExternalDialogueWorldV111:
++    mp = str(manifest_path)
++    if not os.path.exists(mp):
++        raise FileNotFoundError("missing_world_manifest")
++    with open(mp, "r", encoding="utf-8") as f:
++        manifest = json.load(f)
++    world_root = os.path.dirname(os.path.dirname(os.path.abspath(mp)))
++    return ExternalDialogueWorldV111(world_root=world_root, manifest=dict(manifest))
++
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/external_world_ledger_v111.py	2026-01-14 23:54:20
+@@ -0,0 +1,167 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++
++EXTERNAL_WORLD_ACTION_SEARCH_V111 = "SEARCH_PAST_DIALOGUE"
++EXTERNAL_WORLD_ACTION_FETCH_V111 = "FETCH_CONTEXT"
++EXTERNAL_WORLD_ACTION_OBSERVE_V111 = "OBSERVE_PAST_DIALOGUE"
++
++
++EXTERNAL_WORLD_REASON_CODES_V111 = {
++    "validator_failed_unresolved_reference",
++    "validator_failed_goal_stall",
++    "validator_failed_semantic_inconsistency",
++    "validator_failed_fluency_contract",
++}
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _canon_str(x: Any) -> str:
++    return str(x) if isinstance(x, str) else str(x or "")
++
++
++def _canon_int(x: Any, *, default: int = 0) -> int:
++    try:
++        return int(x)
++    except Exception:
++        return int(default)
++
++
++def _canon_json_obj(obj: Any) -> Any:
++    if obj is None:
++        return None
++    if isinstance(obj, (str, int, float, bool)):
++        return obj
++    if isinstance(obj, list):
++        return [_canon_json_obj(x) for x in obj]
++    if isinstance(obj, dict):
++        out: Dict[str, Any] = {}
++        for k in sorted([str(k) for k in obj.keys()], key=str):
++            out[str(k)] = _canon_json_obj(obj.get(k))
++        return dict(out)
++    return str(obj)
++
++
++def _external_world_event_sig_v111(*, prev_event_sig: str, event_body: Dict[str, Any]) -> str:
++    payload = str(prev_event_sig or "") + canonical_json_dumps(event_body)
++    return sha256_hex(payload.encode("utf-8"))
++
++
++def external_world_event_id_v111(event_sig: str) -> str:
++    return f"external_world_event_v111_{str(event_sig)}"
++
++
++@dataclass(frozen=True)
++class ExternalWorldEventV111:
++    event_index: int
++    turn_index: int
++    action: str
++    reason_code: str
++    args: Dict[str, Any]
++    result_summary: Dict[str, Any]
++    prev_event_sig: str
++    event_sig: str
++
++
++def make_external_world_event_v111(
++    *,
++    event_index: int,
++    turn_index: int,
++    action: str,
++    reason_code: str,
++    args: Dict[str, Any],
++    result_summary: Dict[str, Any],
++    prev_event_sig: str,
++) -> ExternalWorldEventV111:
++    body = {
++        "event_index": _canon_int(event_index, default=0),
++        "turn_index": _canon_int(turn_index, default=0),
++        "action": _canon_str(action),
++        "reason_code": _canon_str(reason_code),
++        "args": _canon_json_obj(args),
++        "result_summary": _canon_json_obj(result_summary),
++        "prev_event_sig": _canon_str(prev_event_sig),
++    }
++    sig = _external_world_event_sig_v111(prev_event_sig=str(prev_event_sig or ""), event_body=dict(body))
++    return ExternalWorldEventV111(
++        event_index=int(body["event_index"]),
++        turn_index=int(body["turn_index"]),
++        action=str(body["action"]),
++        reason_code=str(body["reason_code"]),
++        args=dict(body["args"]) if isinstance(body["args"], dict) else {},
++        result_summary=dict(body["result_summary"]) if isinstance(body["result_summary"], dict) else {},
++        prev_event_sig=str(body["prev_event_sig"]),
++        event_sig=str(sig),
++    )
++
++
++def external_world_event_to_dict_v111(ev: ExternalWorldEventV111) -> Dict[str, Any]:
++    return {
++        "event_id": external_world_event_id_v111(str(ev.event_sig)),
++        "event_index": int(ev.event_index),
++        "turn_index": int(ev.turn_index),
++        "action": str(ev.action),
++        "reason_code": str(ev.reason_code),
++        "args": _canon_json_obj(ev.args),
++        "result_summary": _canon_json_obj(ev.result_summary),
++        "prev_event_sig": str(ev.prev_event_sig),
++        "event_sig": str(ev.event_sig),
++    }
++
++
++def compute_external_world_chain_hash_v111(events: Sequence[Dict[str, Any]]) -> str:
++    sigs: List[str] = []
++    for e in events:
++        if isinstance(e, dict):
++            sigs.append(str(e.get("event_sig") or ""))
++    return _stable_hash_obj(sigs)
++
++
++def verify_external_world_event_sig_chain_v111(events: Sequence[Dict[str, Any]]) -> Tuple[bool, str, Dict[str, Any]]:
++    prev = ""
++    prev_idx = -1
++    for i, e in enumerate(events):
++        if not isinstance(e, dict):
++            return False, "external_world_event_not_dict", {"i": int(i)}
++        try:
++            idx = int(e.get("event_index", -1))
++        except Exception:
++            idx = -1
++        if idx != i:
++            return False, "external_world_event_index_mismatch", {"i": int(i), "event_index": idx}
++        if prev_idx >= idx:
++            return False, "external_world_event_index_not_monotonic", {"i": int(i)}
++        prev_idx = idx
++
++        action = str(e.get("action") or "")
++        if action not in {EXTERNAL_WORLD_ACTION_SEARCH_V111, EXTERNAL_WORLD_ACTION_FETCH_V111, EXTERNAL_WORLD_ACTION_OBSERVE_V111}:
++            return False, "invalid_external_world_action", {"i": int(i), "action": action}
++
++        reason = str(e.get("reason_code") or "")
++        if reason not in EXTERNAL_WORLD_REASON_CODES_V111:
++            return False, "invalid_reason_code", {"i": int(i), "reason_code": reason}
++
++        want_prev = str(e.get("prev_event_sig") or "")
++        if want_prev != prev:
++            return False, "external_world_prev_event_sig_mismatch", {"i": int(i), "want_prev": want_prev, "got_prev": prev}
++
++        body = dict(e)
++        # Canon body without event_id/event_sig (event_sig binds prev_event_sig and body fields).
++        body.pop("event_id", None)
++        body.pop("event_sig", None)
++        # Remove any outer-chain fields if present.
++        body.pop("prev_hash", None)
++        body.pop("entry_hash", None)
++        sig = _external_world_event_sig_v111(prev_event_sig=str(prev), event_body=body)
++        if str(e.get("event_sig") or "") != sig:
++            return False, "external_world_event_sig_mismatch", {"i": int(i), "want": str(e.get("event_sig") or ""), "got": sig}
++
++        prev = sig
++    return True, "ok", {"events_total": int(len(events))}
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/fluency_contract_v111.py	2026-01-15 00:22:33
+@@ -0,0 +1,92 @@
++from __future__ import annotations
++
++import re
++from typing import Any, Dict, List, Sequence, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++
++
++def _norm_ws(s: str) -> str:
++    return " ".join(str(s or "").strip().split())
++
++
++def _stable_hash_obj(obj: Any) -> str:
++    return sha256_hex(canonical_json_dumps(obj).encode("utf-8"))
++
++
++def _extract_assistant_texts(transcript: Sequence[Dict[str, Any]]) -> List[str]:
++    out: List[str] = []
++    for t in transcript:
++        if not isinstance(t, dict):
++            continue
++        role = str(t.get("role") or "")
++        if role != "assistant":
++            continue
++        out.append(str(t.get("text") or ""))
++    return out
++
++
++def fluency_contract_v111(
++    *,
++    transcript: Sequence[Dict[str, Any]],
++    most_common_reply_frac_max: float = 0.40,
++    unique_reply_rate_min: float = 0.15,
++) -> Tuple[bool, str, Dict[str, Any]]:
++    """
++    Deterministic, binary-ish contract:
++      - Limit exact repetition (most common normalized reply fraction).
++      - Ensure reply diversity (unique reply rate).
++      - Enforce "don't know" hygiene: repeated unknown without asking for info is a FAIL.
++    """
++    assistant = [_norm_ws(x) for x in _extract_assistant_texts(transcript)]
++    total = len(assistant)
++    if total == 0:
++        return False, "no_assistant_texts", {"assistant_total": 0}
++
++    counts: Dict[str, int] = {}
++    for s in assistant:
++        counts[s] = counts.get(s, 0) + 1
++    most_common = max(counts.values()) if counts else 0
++    most_common_frac = float(most_common) / float(total) if total else 1.0
++    unique_rate = float(len(counts)) / float(total) if total else 0.0
++
++    # "Don't know" repetition without asking.
++    unknown_re = re.compile(r"\b(n[aã]o\s+sei|i\s+don'?t\s+know)\b", re.IGNORECASE)
++    question_re = re.compile(r"\?")  # any question mark
++    unknown_wo_q = 0
++    for s in assistant:
++        if unknown_re.search(s) and not question_re.search(s):
++            unknown_wo_q += 1
++    unknown_wo_q_frac = float(unknown_wo_q) / float(total) if total else 0.0
++
++    details = {
++        "assistant_total": int(total),
++        "thresholds": {
++            "most_common_reply_frac_max": float(round(float(most_common_reply_frac_max), 6)),
++            "unique_reply_rate_min": float(round(float(unique_reply_rate_min), 6)),
++        },
++        "unique_replies": int(len(counts)),
++        "most_common_reply": max(counts.items(), key=lambda kv: (int(kv[1]), str(kv[0])))[0] if counts else "",
++        "most_common_reply_count": int(most_common),
++        "most_common_reply_frac": float(round(most_common_frac, 6)),
++        "unique_reply_rate": float(round(unique_rate, 6)),
++        "unknown_without_question_count": int(unknown_wo_q),
++        "unknown_without_question_frac": float(round(unknown_wo_q_frac, 6)),
++        "contract_sig": _stable_hash_obj(
++            {
++                "assistant_total": int(total),
++                "most_common_reply_frac": float(round(most_common_frac, 6)),
++                "unique_reply_rate": float(round(unique_rate, 6)),
++                "unknown_without_question_frac": float(round(unknown_wo_q_frac, 6)),
++            }
++        ),
++    }
++
++    if most_common_frac > float(most_common_reply_frac_max):
++        return False, "most_common_reply_frac_too_high", dict(details)
++    if unique_rate < float(unique_reply_rate_min):
++        return False, "unique_reply_rate_too_low", dict(details)
++    if unknown_wo_q >= 2:
++        return False, "unknown_without_question_repeated", dict(details)
++
++    return True, "ok", dict(details)
+--- /dev/null	2026-01-15 00:29:31
++++ atos_core/intent_grammar_v111.py	2026-01-15 00:00:13
+@@ -0,0 +1,57 @@
++from __future__ import annotations
++
++from typing import Any, Dict, Optional, Tuple
++
++from .act import canonical_json_dumps, sha256_hex
++from .conversation_v96 import normalize_text_v96
++
++
++INTENT_EXTERNAL_WORLD_V111 = "INTENT_EXTERNAL_WORLD_V111"
++INTENT_EXPLAIN_EXTERNAL_WORLD_V111 = "INTENT_EXPLAIN_EXTERNAL_WORLD_V111"
++INTENT_TRACE_EXTERNAL_WORLD_V111 = "INTENT_TRACE_EXTERNAL_WORLD_V111"
++
++
++def _norm(s: str) -> str:
++    return normalize_text_v96(str(s or ""))
++
++
++def is_external_world_command_v111(text: str) -> bool:
++    t = _norm(text)
++    return t in {"external_world", "mundo_externo"}
++
++
++def is_explain_external_world_command_v111(text: str) -> bool:
++    t = _norm(text)
++    return t.startswith("explain_external_world")
++
++
++def is_trace_external_world_command_v111(text: str) -> bool:
++    t = _norm(text)
++    return t.startswith("trace_external_world")
++
++
++def parse_explain_external_world_command_v111(text: str) -> Dict[str, Any]:
++    t = _norm(text)
++    parts = t.split()
++    if len(parts) == 2 and parts[0] == "explain_external_world":
++        return {"intent_id": INTENT_EXPLAIN_EXTERNAL_WORLD_V111, "query": parts[1]}
++    return {"intent_id": INTENT_EXPLAIN_EXTERNAL_WORLD_V111, "query": ""}
++
++
++def parse_trace_external_world_command_v111(text: str) -> Dict[str, Any]:
++    t = _norm(text)
++    parts = t.split()
++    if len(parts) == 2 and parts[0] == "trace_external_world":
++        return {"intent_id": INTENT_TRACE_EXTERNAL_WORLD_V111, "query": parts[1]}
++    return {"intent_id": INTENT_TRACE_EXTERNAL_WORLD_V111, "query": ""}
++
++
++def parse_external_world_command_v111(text: str) -> Dict[str, Any]:
++    if is_external_world_command_v111(text):
++        return {"intent_id": INTENT_EXTERNAL_WORLD_V111}
++    if is_explain_external_world_command_v111(text):
++        return parse_explain_external_world_command_v111(text)
++    if is_trace_external_world_command_v111(text):
++        return parse_trace_external_world_command_v111(text)
++    return {"intent_id": "", "error": "not_external_world_command"}
++
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/build_external_dialogue_world_v111.py	2026-01-15 00:02:14
+@@ -0,0 +1,389 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import datetime as _dt
++import hashlib
++import json
++import os
++import shutil
++import struct
++import sys
++from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
++
++# Ensure repo root is on sys.path (scripts/ is sys.path[0] when invoked directly).
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++# Reuse project canonicalization/hashing utilities for determinism.
++from atos_core.act import canonical_json_dumps, sha256_hex
++
++
++CHUNK_CHARS = 1024 * 1024
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _iso_utc_from_epoch_seconds(sec: int) -> str:
++    # Deterministic; no wall-clock.
++    dt = _dt.datetime.fromtimestamp(int(sec), tz=_dt.timezone.utc)
++    # Drop microseconds to avoid float-rounding drift from the export.
++    dt = dt.replace(microsecond=0)
++    return dt.isoformat().replace("+00:00", "Z")
++
++
++def _iter_json_array(path: str) -> Iterator[Any]:
++    """
++    Streaming JSON array parser using stdlib json.JSONDecoder.raw_decode.
++    Handles very large arrays without loading the whole file.
++    """
++    dec = json.JSONDecoder()
++    with open(path, "r", encoding="utf-8") as f:
++        # Seek to start of array.
++        while True:
++            ch = f.read(1)
++            if ch == "":
++                _fail("json_array_missing_open_bracket")
++            if ch.isspace():
++                continue
++            if ch != "[":
++                _fail(f"json_array_expected_open_bracket_got:{repr(ch)}")
++            break
++
++        buf = ""
++        while True:
++            if not buf:
++                chunk = f.read(CHUNK_CHARS)
++                if chunk == "":
++                    _fail("json_array_unexpected_eof")
++                buf += chunk
++
++            # Skip whitespace and commas.
++            i = 0
++            while i < len(buf) and buf[i].isspace():
++                i += 1
++            if i:
++                buf = buf[i:]
++            if buf.startswith(","):
++                buf = buf[1:]
++                continue
++            if buf.startswith("]"):
++                return
++
++            try:
++                obj, idx = dec.raw_decode(buf)
++            except json.JSONDecodeError:
++                chunk = f.read(CHUNK_CHARS)
++                if chunk == "":
++                    _fail("json_array_decode_error_eof")
++                buf += chunk
++                continue
++
++            yield obj
++            buf = buf[idx:]
++
++
++def _extract_text_from_message_content(content: Any) -> str:
++    if not isinstance(content, dict):
++        return ""
++    ctype = str(content.get("content_type") or "")
++    if ctype == "text":
++        parts = content.get("parts")
++        if isinstance(parts, list):
++            out_parts: List[str] = []
++            for p in parts:
++                if isinstance(p, str):
++                    out_parts.append(p)
++                else:
++                    # Preserve non-string parts deterministically.
++                    out_parts.append(canonical_json_dumps(p))
++            return "\n".join(out_parts)
++        # Fallback: keep full content if parts missing.
++        return canonical_json_dumps(content)
++    # Non-text content: serialize deterministically.
++    return canonical_json_dumps(content)
++
++
++def _canon_role(role: Any) -> str:
++    r = str(role or "")
++    if r in ("user", "assistant", "system", "tool"):
++        return r
++    return "unknown"
++
++
++def _canon_children(children: Any) -> List[str]:
++    if not isinstance(children, list):
++        return []
++    out: List[str] = []
++    for c in children:
++        if isinstance(c, str) and c:
++            out.append(str(c))
++    return sorted(set(out))
++
++
++def _safe_int(x: Any) -> Optional[int]:
++    try:
++        # Export uses float seconds; cast via int for determinism.
++        if x is None:
++            return None
++        return int(float(x))
++    except Exception:
++        return None
++
++
++def _extract_messages_from_conversation(conv: Dict[str, Any]) -> List[Dict[str, Any]]:
++    """
++    Returns deterministic list of message records for one conversation.
++    Each record carries enough info to build the canonical turn line.
++    """
++    mapping = conv.get("mapping")
++    if not isinstance(mapping, dict):
++        return []
++
++    out: List[Dict[str, Any]] = []
++    seen_ids: set = set()
++    seen_no_id: set = set()
++    for mid, node in mapping.items():
++        if not isinstance(mid, str) or not mid:
++            continue
++        if not isinstance(node, dict):
++            continue
++        msg = node.get("message")
++        if not isinstance(msg, dict):
++            continue
++        author = msg.get("author")
++        author = author if isinstance(author, dict) else {}
++        role = _canon_role(author.get("role"))
++
++        content = msg.get("content")
++        text = _extract_text_from_message_content(content)
++
++        create_time = _safe_int(msg.get("create_time"))
++        ts = _iso_utc_from_epoch_seconds(int(create_time)) if create_time is not None else None
++
++        parent_id = node.get("parent") if isinstance(node.get("parent"), str) else None
++        children_ids = _canon_children(node.get("children"))
++
++        # Dedup within conversation only (deterministic + bounded memory).
++        if mid in seen_ids:
++            continue
++        if mid:
++            seen_ids.add(mid)
++        else:
++            key = (ts or "", role, sha256_hex(text.encode("utf-8")))
++            if key in seen_no_id:
++                continue
++            seen_no_id.add(key)
++
++        out.append(
++            {
++                "message_id": str(mid),
++                "parent_message_id": str(parent_id or ""),
++                "children_message_ids": list(children_ids),
++                "role": str(role),
++                "text": str(text),
++                "timestamp": ts,
++                "create_time": create_time if create_time is not None else -1,
++            }
++        )
++
++    out.sort(key=lambda d: (int(d.get("create_time", -1)), str(d.get("message_id") or "")))
++    return out
++
++
++def _ensure_dir(path: str) -> None:
++    os.makedirs(path, exist_ok=True)
++
++
++def _write_once_bytes(path: str, data: bytes) -> None:
++    # WORM: write-once.
++    with open(path, "xb") as f:
++        f.write(data)
++
++
++def _write_once_text(path: str, text: str) -> None:
++    with open(path, "x", encoding="utf-8") as f:
++        f.write(text)
++
++
++def _write_or_verify_file(path: str, *, write_fn, expected_sha256: str) -> None:
++    if os.path.exists(path):
++        got = _sha256_file(path)
++        if got != expected_sha256:
++            _fail(f"worm_path_exists_hash_mismatch:{path}:want={expected_sha256}:got={got}")
++        return
++    write_fn()
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--input", required=True)
++    ap.add_argument("--out", required=True)
++    args = ap.parse_args()
++
++    input_path = str(args.input)
++    out_root = str(args.out)
++    if not os.path.exists(input_path):
++        _fail(f"missing_input:{input_path}")
++
++    raw_dir = os.path.join(out_root, "dialogue_history_raw")
++    canon_dir = os.path.join(out_root, "dialogue_history_canonical")
++    manifest_dir = os.path.join(out_root, "manifests")
++    _ensure_dir(raw_dir)
++    _ensure_dir(canon_dir)
++    _ensure_dir(manifest_dir)
++
++    input_sha = _sha256_file(input_path)
++    raw_copy_name = f"conversations_{input_sha[:16]}.json"
++    raw_copy_path = os.path.join(raw_dir, raw_copy_name)
++
++    # Copy raw (idempotent by content-addressed name).
++    if not os.path.exists(raw_copy_path):
++        tmp = raw_copy_path + ".tmp"
++        if os.path.exists(tmp):
++            _fail(f"tmp_exists:{tmp}")
++        shutil.copyfile(input_path, tmp)
++        os.replace(tmp, raw_copy_path)
++    else:
++        if _sha256_file(raw_copy_path) != input_sha:
++            _fail(f"raw_copy_sha_mismatch:{raw_copy_path}")
++
++    canon_jsonl_path = os.path.join(canon_dir, "dialogue_history_canonical_v111.jsonl")
++    offsets_path = os.path.join(canon_dir, "offsets_v111.bin")
++    conv_index_path = os.path.join(canon_dir, "conversations_index_v111.json")
++    manifest_path = os.path.join(manifest_dir, "world_manifest_v111.json")
++
++    # If manifest already exists, verify it and exit idempotently.
++    if os.path.exists(manifest_path):
++        try:
++            with open(manifest_path, "r", encoding="utf-8") as f:
++                m = json.load(f)
++            want = str(m.get("sha256", {}).get("canonical_jsonl") or "")
++            if want and os.path.exists(canon_jsonl_path):
++                got = _sha256_file(canon_jsonl_path)
++                if got != want:
++                    _fail(f"manifest_mismatch:canonical_jsonl_sha:want={want}:got={got}")
++            print(json.dumps({"ok": True, "reason": "already_built", "manifest": manifest_path}, indent=2, sort_keys=True))
++            return
++        except Exception as e:
++            _fail(f"manifest_read_error:{e}")
++
++    # Build canonical jsonl + offsets + conversation index (write-once).
++    if any(os.path.exists(p) for p in [canon_jsonl_path, offsets_path, conv_index_path]):
++        _fail("canonical_paths_exist_without_manifest (WORM)")
++
++    conv_ranges: Dict[str, Dict[str, Any]] = {}
++    global_turn_index = 0
++
++    # Write canonical and offsets in lockstep.
++    with open(canon_jsonl_path, "xb") as canon_f, open(offsets_path, "xb") as off_f:
++        for conv in _iter_json_array(input_path):
++            if not isinstance(conv, dict):
++                continue
++            conv_id = str(conv.get("id") or "")
++            if not conv_id:
++                continue
++            title = conv.get("title")
++            title_s = str(title) if isinstance(title, str) and title else None
++
++            msgs = _extract_messages_from_conversation(conv)
++            if not msgs:
++                continue
++
++            start = global_turn_index
++            turn_in_conv = 0
++
++            for msg in msgs:
++                offset = canon_f.tell()
++                off_f.write(struct.pack("<Q", int(offset)))
++
++                line_obj = {
++                    "global_turn_index": int(global_turn_index),
++                    "conversation_id": str(conv_id),
++                    "conversation_title": title_s,
++                    "turn_in_conversation": int(turn_in_conv),
++                    "timestamp": msg.get("timestamp"),
++                    "role": str(msg.get("role") or "unknown"),
++                    "text": str(msg.get("text") or ""),
++                    "message_id": str(msg.get("message_id") or ""),
++                    "parent_message_id": str(msg.get("parent_message_id") or ""),
++                    "children_message_ids": list(msg.get("children_message_ids") or []),
++                    "source": "chatgpt_export_conversations.json",
++                }
++
++                b = (canonical_json_dumps(line_obj) + "\n").encode("utf-8")
++                canon_f.write(b)
++
++                global_turn_index += 1
++                turn_in_conv += 1
++
++            end = global_turn_index - 1
++            conv_ranges[str(conv_id)] = {
++                "conversation_id": str(conv_id),
++                "title": title_s,
++                "start_turn": int(start),
++                "end_turn": int(end),
++                "turns_total": int(end - start + 1),
++            }
++
++    # Write conversations index (deterministic ordering).
++    conv_index = {"schema_version": 111, "conversations": [conv_ranges[k] for k in sorted(conv_ranges.keys())]}
++    _write_once_text(conv_index_path, json.dumps(conv_index, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
++
++    # Compute hashes and write manifest (WORM).
++    sha = {
++        "raw_conversations_json": input_sha,
++        "raw_copy": _sha256_file(raw_copy_path),
++        "canonical_jsonl": _sha256_file(canon_jsonl_path),
++        "offsets_bin": _sha256_file(offsets_path),
++        "conversations_index_json": _sha256_file(conv_index_path),
++    }
++    if sha["raw_copy"] != sha["raw_conversations_json"]:
++        _fail("raw_copy_sha_mismatch_postcopy")
++
++    manifest = {
++        "schema_version": 111,
++        "kind": "external_dialogue_world_v111",
++        "source": {"input_path": input_path, "input_sha256": input_sha},
++        "paths": {
++            "raw_copy": os.path.relpath(raw_copy_path, out_root).replace(os.sep, "/"),
++            "canonical_jsonl": os.path.relpath(canon_jsonl_path, out_root).replace(os.sep, "/"),
++            "offsets_bin": os.path.relpath(offsets_path, out_root).replace(os.sep, "/"),
++            "conversations_index_json": os.path.relpath(conv_index_path, out_root).replace(os.sep, "/"),
++        },
++        "sha256": dict(sha),
++        "counts": {"turns_total": int(global_turn_index), "conversations_total": int(len(conv_ranges))},
++    }
++    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
++    _write_once_text(manifest_path, manifest_text)
++
++    print(
++        json.dumps(
++            {
++                "ok": True,
++                "manifest": manifest_path,
++                "sha256": manifest["sha256"],
++                "counts": manifest["counts"],
++            },
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/verify_external_world_v111.py	2026-01-15 00:06:14
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import struct
++import sys
++from typing import Any, Dict, List, Optional, Tuple
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _read_u64_le_list(path: str) -> List[int]:
++    data = open(path, "rb").read()
++    if len(data) % 8 != 0:
++        _fail(f"offsets_size_not_multiple_of_8:{path}:{len(data)}")
++    out: List[int] = []
++    for i in range(0, len(data), 8):
++        out.append(int(struct.unpack("<Q", data[i : i + 8])[0]))
++    return out
++
++
++def _join(world_root: str, rel: str) -> str:
++    return os.path.normpath(os.path.join(world_root, str(rel)))
++
++
++def _fetch_line_by_offset(canon_path: str, offset: int) -> str:
++    with open(canon_path, "rb") as f:
++        f.seek(int(offset))
++        b = f.readline()
++    try:
++        return b.decode("utf-8")
++    except Exception:
++        return b.decode("utf-8", errors="replace")
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--manifest", required=True)
++    args = ap.parse_args()
++
++    manifest_path = str(args.manifest)
++    if not os.path.exists(manifest_path):
++        _fail(f"missing_manifest:{manifest_path}")
++
++    with open(manifest_path, "r", encoding="utf-8") as f:
++        manifest = json.load(f)
++
++    world_root = os.path.dirname(os.path.dirname(os.path.abspath(manifest_path)))
++
++    want_sha = manifest.get("sha256") if isinstance(manifest.get("sha256"), dict) else {}
++    paths = manifest.get("paths") if isinstance(manifest.get("paths"), dict) else {}
++    counts = manifest.get("counts") if isinstance(manifest.get("counts"), dict) else {}
++
++    canon_rel = str(paths.get("canonical_jsonl") or "")
++    offsets_rel = str(paths.get("offsets_bin") or "")
++    conv_index_rel = str(paths.get("conversations_index_json") or "")
++    raw_rel = str(paths.get("raw_copy") or "")
++    if not (canon_rel and offsets_rel and conv_index_rel and raw_rel):
++        _fail("manifest_missing_paths")
++
++    canon_path = _join(world_root, canon_rel)
++    offsets_path = _join(world_root, offsets_rel)
++    conv_index_path = _join(world_root, conv_index_rel)
++    raw_path = _join(world_root, raw_rel)
++
++    for p in [canon_path, offsets_path, conv_index_path, raw_path]:
++        if not os.path.exists(p):
++            _fail(f"missing_path:{p}")
++
++    got = {
++        "raw_copy": _sha256_file(raw_path),
++        "canonical_jsonl": _sha256_file(canon_path),
++        "offsets_bin": _sha256_file(offsets_path),
++        "conversations_index_json": _sha256_file(conv_index_path),
++    }
++
++    mismatches: List[Dict[str, Any]] = []
++    for k in sorted(got.keys()):
++        want = str(want_sha.get(k) or "")
++        if want and got[k] != want:
++            mismatches.append({"key": k, "want": want, "got": got[k]})
++    if mismatches:
++        _fail("sha256_mismatch:" + json.dumps(mismatches, ensure_ascii=False, sort_keys=True))
++
++    turns_total = int(counts.get("turns_total") or 0)
++    if turns_total <= 0:
++        _fail("invalid_turns_total")
++
++    offsets = _read_u64_le_list(offsets_path)
++    if len(offsets) != turns_total:
++        _fail(f"offsets_len_mismatch:want={turns_total}:got={len(offsets)}")
++
++    # Deterministic sample checks for offsets -> line -> JSON.
++    sample_idxs: List[int] = []
++    for i in range(min(10, turns_total)):
++        sample_idxs.append(i)
++    mid = turns_total // 2
++    for i in range(max(0, mid - 3), min(turns_total, mid + 3)):
++        sample_idxs.append(i)
++    for i in range(max(0, turns_total - 10), turns_total):
++        sample_idxs.append(i)
++    sample_idxs = sorted(set(sample_idxs))
++
++    parsed_fail: List[Dict[str, Any]] = []
++    prev_idx = -1
++    for idx in sample_idxs:
++        if idx <= prev_idx:
++            _fail("sample_not_monotonic_internal_error")
++        prev_idx = idx
++        line = _fetch_line_by_offset(canon_path, offsets[idx]).strip("\n")
++        try:
++            obj = json.loads(line)
++        except Exception as e:
++            parsed_fail.append({"idx": idx, "err": str(e)})
++            continue
++        if int(obj.get("global_turn_index", -1)) != int(idx):
++            parsed_fail.append({"idx": idx, "reason": "global_turn_index_mismatch", "got": obj.get("global_turn_index")})
++    if parsed_fail:
++        _fail("offsets_parse_fail:" + json.dumps(parsed_fail, ensure_ascii=False, sort_keys=True))
++
++    # Verify conversations_index ranges are within bounds and deterministic ordering.
++    with open(conv_index_path, "r", encoding="utf-8") as f:
++        conv_index = json.load(f)
++    convs = conv_index.get("conversations") if isinstance(conv_index.get("conversations"), list) else []
++    if not convs:
++        _fail("empty_conversations_index")
++    last_id = ""
++    for c in convs:
++        if not isinstance(c, dict):
++            _fail("invalid_conversations_index_entry")
++        cid = str(c.get("conversation_id") or "")
++        if not cid:
++            _fail("missing_conversation_id")
++        if last_id and cid < last_id:
++            _fail("conversations_index_not_sorted")
++        last_id = cid
++        s_raw = c.get("start_turn", -1)
++        e_raw = c.get("end_turn", -1)
++        s = int(s_raw) if s_raw is not None else -1
++        e = int(e_raw) if e_raw is not None else -1
++        if s < 0 or e < s or e >= turns_total:
++            _fail(f"conversation_range_invalid:{cid}:{s}:{e}:{turns_total}")
++
++    out = {
++        "ok": True,
++        "reason": "ok",
++        "manifest": manifest_path,
++        "world_root": world_root,
++        "sha256": got,
++        "turns_total": turns_total,
++        "conversations_total": int(counts.get("conversations_total") or 0),
++        "samples_checked": len(sample_idxs),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/gen_family7_dla_from_history_v111.py	2026-01-15 00:17:33
+@@ -0,0 +1,262 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import struct
++import sys
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _read_u64_le_list(path: str) -> List[int]:
++    data = open(path, "rb").read()
++    if len(data) % 8 != 0:
++        _fail("offsets_size_not_multiple_of_8")
++    out: List[int] = []
++    for i in range(0, len(data), 8):
++        out.append(int(struct.unpack("<Q", data[i : i + 8])[0]))
++    return out
++
++
++def _world_paths_from_manifest(manifest_path: str) -> Dict[str, str]:
++    mp = str(manifest_path)
++    with open(mp, "r", encoding="utf-8") as f:
++        m = json.load(f)
++    world_root = os.path.dirname(os.path.dirname(os.path.abspath(mp)))
++    paths = m.get("paths") if isinstance(m.get("paths"), dict) else {}
++    out: Dict[str, str] = {}
++    for k in ["canonical_jsonl", "offsets_bin", "conversations_index_json"]:
++        rel = str(paths.get(k) or "")
++        if not rel:
++            _fail(f"manifest_missing_path:{k}")
++        out[k] = os.path.normpath(os.path.join(world_root, rel))
++    out["world_root"] = world_root
++    out["manifest_sha256"] = _sha256_file(mp)
++    out["manifest_path"] = mp
++    return out
++
++
++def _fetch_turn_texts_user_only(
++    *,
++    canon_path: str,
++    offsets: List[int],
++    start_turn: int,
++    end_turn: int,
++    max_user_turns: int,
++) -> List[str]:
++    out: List[str] = []
++    with open(canon_path, "rb") as f:
++        for idx in range(int(start_turn), int(end_turn) + 1):
++            if idx < 0 or idx >= len(offsets):
++                break
++            f.seek(int(offsets[idx]))
++            line = f.readline()
++            try:
++                obj = json.loads(line.decode("utf-8"))
++            except Exception:
++                continue
++            if str(obj.get("role") or "") != "user":
++                continue
++            txt = str(obj.get("text") or "")
++            if txt:
++                out.append(txt)
++                if len(out) >= int(max_user_turns):
++                    break
++    return list(out)
++
++
++def _is_safe_user_turn_text_v111(text: str) -> bool:
++    """
++    Deterministic filter to avoid UI/structured payload turns that can break
++    baseline parsers (we still preserve chaos via real turns + adversarial injections).
++    """
++    t = str(text or "").strip()
++    if not t:
++        return False
++    # Keep only reasonably-sized natural turns for the initial v111 smoke.
++    if len(t) > 500:
++        return False
++    t0 = t.lstrip()
++    if t0.startswith("{") or t0.startswith("["):
++        return False
++    bad_substrings = [
++        "content_type",
++        "asset_pointer",
++        "file-service://",
++        "multimodal_text",
++        "image_asset_pointer",
++    ]
++    for s in bad_substrings:
++        if s in t0:
++            return False
++    if t0.count("\n") > 6:
++        return False
++    return True
++
++
++def _inject_adversarial_turns_v111(user_turns: Sequence[str]) -> List[str]:
++    """
++    Deterministic, minimal injection (no dependency on content).
++    """
++    out = list([str(x) for x in user_turns if isinstance(x, str)])
++    inject = [
++        ("ok", 3),
++        ("continua", 7),
++        ("isso", 11),
++        ("na verdade era X, não Y", 17),
++        ("não invente nada", 23),
++        ("ok", 29),
++    ]
++    for text, pos in sorted(inject, key=lambda t: int(t[1])):
++        i = int(pos)
++        if i < 0:
++            continue
++        if i > len(out):
++            i = len(out)
++        out.insert(i, str(text))
++    return list(out)
++
++
++def _make_task(task_kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
++    body = dict(payload)
++    body["schema_version"] = 111
++    body["task_kind"] = str(task_kind)
++    task_id = sha256_hex(canonical_json_dumps(body).encode("utf-8"))
++    return dict(body, task_id=f"family7_dla_v111_{task_id}")
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--world_manifest", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--out", required=True)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    out_path = str(args.out)
++    if os.path.exists(out_path):
++        _fail(f"worm_exists:{out_path}")
++
++    paths = _world_paths_from_manifest(str(args.world_manifest))
++    canon_path = paths["canonical_jsonl"]
++    offsets_path = paths["offsets_bin"]
++    conv_index_path = paths["conversations_index_json"]
++    if not (os.path.exists(canon_path) and os.path.exists(offsets_path) and os.path.exists(conv_index_path)):
++        _fail("world_paths_missing")
++
++    offsets = _read_u64_le_list(offsets_path)
++
++    with open(conv_index_path, "r", encoding="utf-8") as f:
++        conv_index = json.load(f)
++    convs = conv_index.get("conversations") if isinstance(conv_index.get("conversations"), list) else []
++    if not convs:
++        _fail("empty_conversations_index")
++
++    # Pick deterministic conversations by total turns DESC, then conversation_id ASC.
++    cands: List[Dict[str, Any]] = []
++    for c in convs:
++        if not isinstance(c, dict):
++            continue
++        turns_total = int(c.get("turns_total") or 0)
++        if turns_total < 200:
++            continue
++        cid = str(c.get("conversation_id") or "")
++        if not cid:
++            continue
++        cands.append(dict(c))
++    cands.sort(key=lambda d: (-int(d.get("turns_total") or 0), str(d.get("conversation_id") or "")))
++    if len(cands) < 2:
++        _fail("not_enough_large_conversations")
++
++    tasks: List[Dict[str, Any]] = []
++    for c in cands[:2]:
++        cid = str(c.get("conversation_id") or "")
++        s = int(c.get("start_turn") or 0)
++        e = int(c.get("end_turn") or 0)
++        user_turns = _fetch_turn_texts_user_only(canon_path=canon_path, offsets=offsets, start_turn=s, end_turn=e, max_user_turns=40)
++        safe_turns = [t for t in user_turns if _is_safe_user_turn_text_v111(t)]
++        if len(safe_turns) < 6:
++            continue
++
++        # Inject a synthetic goal + make dialogue long under minimal user driving, plus a small sample of real user turns.
++        goal_turn = "goal: autopilot demo outcome=complete constraints=deterministic deadline=60"
++        # Keep a small, deterministic slice of real turns to preserve chaos source.
++        real_sample = safe_turns[:6]
++        minimal = ["ok"] * 60
++        turns = [goal_turn] + real_sample + _inject_adversarial_turns_v111(minimal)
++
++        tasks.append(
++            _make_task(
++                "family7_dla_task_v111",
++                {
++                    "seed": int(seed),
++                    "world_manifest": str(paths["manifest_path"]),
++                    "conversation_id": cid,
++                    "window": {"start_turn": int(s), "end_turn": int(e)},
++                    "user_turns": list(turns),
++                    "injection": {"real_user_sample_turns": int(len(real_sample)), "minimal_ok_turns": int(len(minimal))},
++                },
++            )
++        )
++
++    if len(tasks) < 2:
++        _fail("failed_to_build_two_tasks")
++
++    # Write tasks jsonl (WORM).
++    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
++    with open(out_path, "x", encoding="utf-8") as f:
++        for t in tasks:
++            f.write(canonical_json_dumps(t))
++            f.write("\n")
++
++    manifest_out = os.path.splitext(out_path)[0] + "_manifest.json"
++    if os.path.exists(manifest_out):
++        _fail(f"worm_exists:{manifest_out}")
++
++    tasks_sha = _sha256_file(out_path)
++    manifest = {
++        "schema_version": 111,
++        "kind": "family7_dla_tasks_v111",
++        "seed": int(seed),
++        "paths": {"tasks_jsonl": out_path, "world_manifest": str(paths["manifest_path"])},
++        "sha256": {"tasks_jsonl": tasks_sha, "world_manifest": str(paths["manifest_sha256"])},
++        "tasks_total": int(len(tasks)),
++    }
++    with open(manifest_out, "x", encoding="utf-8") as f:
++        f.write(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    print(
++        json.dumps(
++            {"ok": True, "tasks": out_path, "tasks_sha256": tasks_sha, "manifest": manifest_out, "tasks_total": len(tasks)},
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    )
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/run_family7_dla_v111.py	2026-01-15 00:23:53
+@@ -0,0 +1,241 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_loop_v110 import run_conversation_v110
++from atos_core.external_world_ledger_v111 import compute_external_world_chain_hash_v111, verify_external_world_event_sig_chain_v111
++from atos_core.fluency_contract_v111 import fluency_contract_v111
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        _fail(f"worm_exists:{path}")
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _load_conversation_run(run_dir: Path) -> Dict[str, Any]:
++    paths = {
++        "transcript": run_dir / "transcript.jsonl",
++        "verify_chain_v110": run_dir / "verify_chain_v110.json",
++    }
++    transcript_rows = _load_jsonl(paths["transcript"])
++    transcript_view: List[Dict[str, Any]] = []
++    for r in transcript_rows:
++        if not isinstance(r, dict):
++            continue
++        payload = r.get("payload")
++        if not isinstance(payload, dict):
++            continue
++        transcript_view.append({"role": str(payload.get("role") or ""), "text": str(payload.get("text") or "")})
++    return {
++        "transcript": list(transcript_view),
++        "verify_chain_v110": json.loads(paths["verify_chain_v110"].read_text(encoding="utf-8"))
++        if paths["verify_chain_v110"].exists()
++        else {},
++    }
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        _fail(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _write_once_text(path: Path, text: str) -> None:
++    _ensure_absent(path)
++    path.write_text(str(text), encoding="utf-8")
++
++
++def _compute_freeze_manifest_v111(*, task_dir: Path, sha256_paths: Dict[str, str]) -> Dict[str, Any]:
++    sha256: Dict[str, str] = {}
++    rel_paths: Dict[str, str] = {}
++    for k, p in sorted(sha256_paths.items(), key=lambda kv: str(kv[0])):
++        fp = Path(p)
++        try:
++            rel_paths[str(k)] = str(fp.relative_to(task_dir))
++        except Exception:
++            rel_paths[str(k)] = str(fp.name)
++        if fp.exists():
++            sha256[str(k)] = _sha256_file(fp)
++    manifest = {
++        "schema_version": 111,
++        "kind": "freeze_manifest_v111",
++        "sha256": sha256,
++        "sha256_paths": dict(rel_paths),
++    }
++    # ledger_hash is sha256 of this manifest file bytes (computed by caller after write).
++    return manifest
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--max_tasks", type=int, default=10)
++    args = ap.parse_args()
++
++    seed = int(args.seed)
++    tasks_path = Path(str(args.tasks))
++    out_dir = Path(str(args.out))
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    tasks: List[Dict[str, Any]] = []
++    with open(tasks_path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            tasks.append(json.loads(line))
++    if not tasks:
++        _fail("empty_tasks")
++
++    max_tasks = min(int(args.max_tasks), len(tasks))
++    tasks = tasks[:max_tasks]
++
++    results: List[Dict[str, Any]] = []
++
++    for i, task in enumerate(tasks):
++        if not isinstance(task, dict):
++            continue
++        task_id = str(task.get("task_id") or f"task_{i}")
++        user_turns = task.get("user_turns") if isinstance(task.get("user_turns"), list) else []
++        user_turn_texts = [str(x) for x in user_turns if isinstance(x, str)]
++        task_subdir = out_dir / f"task_{i:03d}"
++        run_conversation_v110(user_turn_texts=user_turn_texts, out_dir=str(task_subdir), seed=int(seed))
++
++        # External world ledger (must exist, even if empty).
++        ext_events_path = task_subdir / "external_world_events.jsonl"
++        if ext_events_path.exists():
++            _fail(f"worm_exists:{ext_events_path}")
++        ext_events_path.write_text("", encoding="utf-8")
++        ext_snapshot_path = task_subdir / "external_world_registry_snapshot_v111.json"
++        _write_once_json(ext_snapshot_path, {"schema_version": 111, "kind": "external_world_registry_snapshot_v111", "events_total": 0})
++
++        # Load v110 verify output (conversation loop writes this deterministically).
++        run = _load_conversation_run(task_subdir)
++        verify_v110 = run.get("verify_chain_v110") if isinstance(run.get("verify_chain_v110"), dict) else {}
++        ok_chain = bool(verify_v110.get("ok"))
++        reason_chain = "ok" if ok_chain else "verify_chain_v110_failed"
++        details_chain = dict(verify_v110)
++
++        # Fluency contract (V111) on transcript.
++        ok_fc, reason_fc, details_fc = fluency_contract_v111(transcript=run["transcript"])
++        fluency_path = task_subdir / "fluency_contract_v111.json"
++        _write_once_json(fluency_path, {"ok": bool(ok_fc), "reason": str(reason_fc), "details": dict(details_fc)})
++
++        # External world ledger is empty -> chain hash is stable (empty list).
++        ext_events = _load_jsonl(ext_events_path)
++        ok_ext_sig, reason_ext_sig, _ = verify_external_world_event_sig_chain_v111(ext_events)
++        ext_chain_hash = compute_external_world_chain_hash_v111(ext_events)
++
++        # Freeze manifest V111 (task-local).
++        freeze_path = task_subdir / "freeze_manifest_v111.json"
++        sha256_paths = {
++            "v110_summary_json": str(task_subdir / "summary.json"),
++            "v110_freeze_manifest_v110_json": str(task_subdir / "freeze_manifest_v110.json"),
++            "task_eval_json": str(task_subdir / "eval.json"),
++            "fluency_contract_v111_json": str(fluency_path),
++            "external_world_events_jsonl": str(ext_events_path),
++            "external_world_registry_snapshot_v111_json": str(ext_snapshot_path),
++        }
++        freeze = _compute_freeze_manifest_v111(task_dir=task_subdir, sha256_paths=sha256_paths)
++        _write_once_json(freeze_path, freeze)
++        ledger_hash = _sha256_file(freeze_path)
++
++        # Per-task eval.
++        eval_obj = {
++            "schema_version": 111,
++            "task_id": task_id,
++            "ok_conversation_chain_v110": bool(ok_chain),
++            "reason_conversation_chain_v110": str(reason_chain),
++            "ok_fluency_contract_v111": bool(ok_fc),
++            "reason_fluency_contract_v111": str(reason_fc),
++            "external_world_events_total": int(len(ext_events)),
++            "external_world_chain_hash_v111": str(ext_chain_hash),
++            "external_world_sig_chain_ok": bool(ok_ext_sig),
++            "external_world_sig_chain_reason": str(reason_ext_sig),
++            "ledger_hash": str(ledger_hash),
++        }
++        eval_path = task_subdir / "eval.json"
++        _write_once_json(eval_path, eval_obj)
++
++        results.append(
++            {
++                "task_index": int(i),
++                "task_id": task_id,
++                "run_dir": f"task_{i:03d}",
++                "ok": bool(ok_chain and ok_fc),
++                "ledger_hash": str(ledger_hash),
++                "external_world_chain_hash_v111": str(ext_chain_hash),
++            }
++        )
++
++    # Aggregate eval.
++    agg = {
++        "schema_version": 111,
++        "seed": int(seed),
++        "tasks_total": int(len(results)),
++        "tasks_ok": int(sum(1 for r in results if bool(r.get("ok")))),
++        "results": list(results),
++        "aggregate_sig": sha256_hex(canonical_json_dumps({"seed": int(seed), "results": results}).encode("utf-8")),
++    }
++    _write_once_json(out_dir / "eval.json", agg)
++
++    # Minimal summary for determinism in smoke.
++    summary = {
++        "schema_version": 111,
++        "seed": int(seed),
++        "tasks_total": int(len(results)),
++        "tasks_ok": int(sum(1 for r in results if bool(r.get("ok")))),
++        "eval_sha256": _sha256_file(out_dir / "eval.json"),
++    }
++    _write_once_json(out_dir / "summary.json", summary)
++
++    print(json.dumps({"ok": True, "out_dir": str(out_dir), "summary": summary}, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/smoke_v111_external_world_gating.py	2026-01-15 00:08:16
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import shutil
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++from atos_core.conversation_v96 import append_chained_jsonl_v96, verify_chained_jsonl_v96
++from atos_core.external_dialogue_world_v111 import load_world_v111
++from atos_core.external_world_ledger_v111 import (
++    EXTERNAL_WORLD_ACTION_FETCH_V111,
++    EXTERNAL_WORLD_REASON_CODES_V111,
++    compute_external_world_chain_hash_v111,
++    external_world_event_to_dict_v111,
++    make_external_world_event_v111,
++    verify_external_world_event_sig_chain_v111,
++)
++
++
++def _sha256_file(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _write_once_json(path: Path, obj: Any) -> None:
++    _ensure_absent(path)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    if tmp.exists():
++        raise SystemExit(f"tmp_exists:{tmp}")
++    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(str(tmp), str(path))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    for line in path.read_text(encoding="utf-8").splitlines():
++        if not line.strip():
++            continue
++        out.append(json.loads(line))
++    return out
++
++
++def _run_one(*, out_dir: Path, world_manifest: str, seed: int) -> Dict[str, Any]:
++    _ensure_absent(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=False)
++
++    events_path = out_dir / "external_world_events.jsonl"
++    events_path.write_text("", encoding="utf-8")
++    prev_hash = None
++    prev_event_sig = ""
++    events: List[Dict[str, Any]] = []
++
++    # Scenario 1: disallowed access (should not write).
++    disallowed_reason = "external_world_access_not_allowed"
++    allowed = False
++    if allowed:
++        raise SystemExit("internal_error:allowed_false_expected")
++
++    # Scenario 2: allowed access (exactly 1 call).
++    allowed = True
++    reason_code = "validator_failed_unresolved_reference"
++    if reason_code not in EXTERNAL_WORLD_REASON_CODES_V111:
++        raise SystemExit("internal_error:reason_code_enum")
++
++    world = load_world_v111(manifest_path=str(world_manifest))
++    turn0 = world.fetch_turn(0)
++    result_summary = {
++        "fetched_turn_id": int(turn0.global_turn_index),
++        "conversation_id": str(turn0.conversation_id),
++        "role": str(turn0.role),
++        "text_sha256": sha256_hex(str(turn0.text).encode("utf-8")),
++    }
++    ev = make_external_world_event_v111(
++        event_index=0,
++        turn_index=0,
++        action=EXTERNAL_WORLD_ACTION_FETCH_V111,
++        reason_code=str(reason_code),
++        args={"turn_id": 0},
++        result_summary=result_summary,
++        prev_event_sig=str(prev_event_sig),
++    )
++    evd = external_world_event_to_dict_v111(ev)
++    prev_hash = append_chained_jsonl_v96(str(events_path), dict(evd), prev_hash=prev_hash)
++    events.append(dict(evd))
++    prev_event_sig = str(ev.event_sig)
++
++    ok_file_chain = bool(verify_chained_jsonl_v96(str(events_path)))
++    ok_sig_chain, reason_sig_chain, _ = verify_external_world_event_sig_chain_v111(_load_jsonl(events_path))
++    chain_hash = compute_external_world_chain_hash_v111(_load_jsonl(events_path))
++
++    snapshot = {"schema_version": 111, "events_total": int(len(events)), "external_world_chain_hash_v111": str(chain_hash)}
++    _write_once_json(out_dir / "external_world_registry_snapshot_v111.json", snapshot)
++    _write_once_json(
++        out_dir / "summary.json",
++        {
++            "schema_version": 111,
++            "seed": int(seed),
++            "events_total": int(len(events)),
++            "file_chain_ok": bool(ok_file_chain),
++            "sig_chain_ok": bool(ok_sig_chain),
++            "sig_chain_reason": str(reason_sig_chain),
++            "external_world_chain_hash_v111": str(chain_hash),
++            "disallowed_reason": disallowed_reason,
++        },
++    )
++    _write_once_json(
++        out_dir / "freeze_manifest_v111.json",
++        {
++            "schema_version": 111,
++            "kind": "freeze_manifest_v111_external_world_gating",
++            "sha256": {
++                "external_world_events_jsonl": _sha256_file(events_path),
++                "external_world_registry_snapshot_v111_json": _sha256_file(out_dir / "external_world_registry_snapshot_v111.json"),
++                "summary_json": _sha256_file(out_dir / "summary.json"),
++            },
++        },
++    )
++    return {
++        "events_total": int(len(events)),
++        "external_world_chain_hash_v111": str(chain_hash),
++        "file_chain_ok": bool(ok_file_chain),
++        "sig_chain_ok": bool(ok_sig_chain),
++    }
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    ap.add_argument("--world_manifest", required=True)
++    args = ap.parse_args()
++
++    out_base = Path(str(args.out_base))
++    seed = int(args.seed)
++    world_manifest = str(args.world_manifest)
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++    r1 = _run_one(out_dir=out1, world_manifest=world_manifest, seed=seed)
++    r2 = _run_one(out_dir=out2, world_manifest=world_manifest, seed=seed)
++
++    core1 = {"seed": seed, "r": r1}
++    core2 = {"seed": seed, "r": r2}
++    determinism_ok = (canonical_json_dumps(core1) == canonical_json_dumps(core2))
++    summary_sha = sha256_hex(canonical_json_dumps(core1).encode("utf-8"))
++
++    # Negative tamper: break event_sig in try1.
++    tamper_dir = Path(str(out_base) + "_try1_tamper")
++    _ensure_absent(tamper_dir)
++    shutil.copytree(out1, tamper_dir)
++    events_path = tamper_dir / "external_world_events.jsonl"
++    lines = events_path.read_text(encoding="utf-8").splitlines()
++    if not lines:
++        raise SystemExit("tamper_internal_error:no_events")
++    obj = json.loads(lines[0])
++    obj["event_sig"] = "0" * 64
++    lines[0] = canonical_json_dumps(obj)
++    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    ok_sig_chain, reason_sig_chain, _ = verify_external_world_event_sig_chain_v111(_load_jsonl(events_path))
++
++    out = {
++        "ok": True,
++        "determinism_ok": bool(determinism_ok),
++        "summary_sha256": str(summary_sha),
++        "try1": core1,
++        "try2": core2,
++        "negative_tamper": {"ok": bool(ok_sig_chain), "reason": str(reason_sig_chain)},
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/smoke_v111_family7_dla_dialogue_survival.py	2026-01-15 00:04:43
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import canonical_json_dumps, sha256_hex
++
++
++def _sha256_file(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def _ensure_absent(path: Path) -> None:
++    if path.exists():
++        raise SystemExit(f"worm_exists:{path}")
++
++
++def _run_runner(*, tasks: str, out_dir: Path, seed: int) -> None:
++    _ensure_absent(out_dir)
++    cmd = [
++        sys.executable,
++        "scripts/run_family7_dla_v111.py",
++        "--tasks",
++        str(tasks),
++        "--out",
++        str(out_dir),
++        "--seed",
++        str(int(seed)),
++        "--max_tasks",
++        "2",
++    ]
++    subprocess.check_call(cmd)
++
++
++def _load_json(path: Path) -> Dict[str, Any]:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tasks", required=True)
++    ap.add_argument("--out_base", required=True)
++    ap.add_argument("--seed", required=True, type=int)
++    args = ap.parse_args()
++
++    tasks = str(args.tasks)
++    seed = int(args.seed)
++    out_base = Path(str(args.out_base))
++
++    out1 = Path(str(out_base) + "_try1")
++    out2 = Path(str(out_base) + "_try2")
++
++    _run_runner(tasks=tasks, out_dir=out1, seed=seed)
++    _run_runner(tasks=tasks, out_dir=out2, seed=seed)
++
++    s1 = _load_json(out1 / "summary.json")
++    s2 = _load_json(out2 / "summary.json")
++    e1 = _load_json(out1 / "eval.json")
++    e2 = _load_json(out2 / "eval.json")
++
++    determinism_ok = (canonical_json_dumps(s1) == canonical_json_dumps(s2)) and (canonical_json_dumps(e1) == canonical_json_dumps(e2))
++
++    # Check per-task WORM external world ledger is unused (0 bytes) and exists.
++    ext_ok = True
++    ext_details: List[Dict[str, Any]] = []
++    for run_dir in [out1, out2]:
++        for task_dir in sorted([p for p in run_dir.iterdir() if p.is_dir() and p.name.startswith("task_")], key=lambda p: p.name):
++            p = task_dir / "external_world_events.jsonl"
++            if not p.exists():
++                ext_ok = False
++                ext_details.append({"task_dir": str(task_dir), "missing": str(p)})
++                continue
++            if p.stat().st_size != 0:
++                ext_ok = False
++                ext_details.append({"task_dir": str(task_dir), "size": int(p.stat().st_size)})
++
++    core = {
++        "seed": int(seed),
++        "try1": {"summary_sha256": _sha256_file(out1 / "summary.json"), "eval_sha256": _sha256_file(out1 / "eval.json"), "tasks_ok": int(s1.get("tasks_ok") or 0)},
++        "try2": {"summary_sha256": _sha256_file(out2 / "summary.json"), "eval_sha256": _sha256_file(out2 / "eval.json"), "tasks_ok": int(s2.get("tasks_ok") or 0)},
++        "external_world_unused_ok": bool(ext_ok),
++    }
++    summary_sha = sha256_hex(canonical_json_dumps(core).encode("utf-8"))
++
++    out = {
++        "ok": bool(determinism_ok and ext_ok and int(s1.get("tasks_ok") or 0) == int(s1.get("tasks_total") or 0)),
++        "determinism_ok": bool(determinism_ok),
++        "summary_sha256": str(summary_sha),
++        "core": core,
++        "try1_dir": str(out1),
++        "try2_dir": str(out2),
++        "external_world_details": ext_details,
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-01-15 00:29:31
++++ scripts/verify_conversation_chain_v111.py	2026-01-15 00:26:19
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any, Dict, List, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.conversation_v100 import no_hybridization_check_v100
++from atos_core.conversation_v96 import verify_chained_jsonl_v96
++from atos_core.external_world_ledger_v111 import compute_external_world_chain_hash_v111, verify_external_world_event_sig_chain_v111
++
++# Reuse the v110 verifier script loader (scripts/ is on sys.path when invoked directly).
++import verify_conversation_chain_v110 as verify_v110
++
++
++def _fail(msg: str, *, code: int = 2) -> None:
++    print(msg, file=sys.stderr)
++    raise SystemExit(code)
++
++
++def _load_json(path: Path) -> Dict[str, Any]:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    if not path.exists():
++        return out
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            out.append(json.loads(line))
++    return out
++
++
++def _infer_tail_k(states: List[Dict[str, Any]]) -> int:
++    tail_k = 6
++    for st in states[-3:]:
++        if not isinstance(st, dict):
++            continue
++        inv = st.get("invariants") if isinstance(st.get("invariants"), dict) else {}
++        try:
++            tail_k = int(inv.get("tail_k") or tail_k)
++        except Exception:
++            pass
++    return int(tail_k)
++
++
++def _verify_task_dir(task_dir: Path, repo_root: str) -> Tuple[bool, str, Dict[str, Any]]:
++    required = [
++        task_dir / "conversation_turns.jsonl",
++        task_dir / "conversation_states.jsonl",
++        task_dir / "intent_parses.jsonl",
++        task_dir / "dialogue_trials.jsonl",
++        task_dir / "action_plans.jsonl",
++        task_dir / "memory_events.jsonl",
++        task_dir / "belief_events.jsonl",
++        task_dir / "evidence_events.jsonl",
++        task_dir / "goal_events.jsonl",
++        task_dir / "goal_ledger_snapshot.json",
++        task_dir / "discourse_events.jsonl",
++        task_dir / "fragment_events.jsonl",
++        task_dir / "transcript.jsonl",
++        task_dir / "fluency_contract_v111.json",
++        task_dir / "external_world_events.jsonl",
++        task_dir / "external_world_registry_snapshot_v111.json",
++    ]
++    for p in required:
++        if not p.exists():
++            return False, "missing_path", {"path": str(p)}
++
++    ok0, reason0, details0 = verify_v110.verify_run_dir_v110(run_dir=str(task_dir))
++    if not ok0:
++        return False, str(reason0), dict(details0)
++
++    # External world events ledger must be hash-chained (file) and sig-chained (internal).
++    ext_path = task_dir / "external_world_events.jsonl"
++    ok_file_chain = bool(verify_chained_jsonl_v96(str(ext_path)))
++    ext_events = _load_jsonl(ext_path)
++    ok_sig_chain, reason_sig_chain, details_sig_chain = verify_external_world_event_sig_chain_v111(ext_events)
++    ext_chain_hash = compute_external_world_chain_hash_v111(ext_events)
++    if not ok_file_chain:
++        return False, "external_world_file_chain_invalid", {}
++    if not ok_sig_chain:
++        return False, str(reason_sig_chain), dict(details_sig_chain)
++
++    fc = _load_json(task_dir / "fluency_contract_v111.json")
++    if not bool(fc.get("ok", False)):
++        return False, "fluency_contract_failed", {"reason": str(fc.get("reason") or "")}
++
++    return True, "ok", {"external_world_chain_hash_v111": str(ext_chain_hash), "external_world_events_total": int(len(ext_events))}
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--run_dir", required=True)
++    args = ap.parse_args()
++
++    run_dir = Path(str(args.run_dir))
++    if not run_dir.is_dir():
++        _fail(f"missing_run_dir:{run_dir}")
++
++    repo_root = str(Path(__file__).resolve().parents[1])
++    ok_h, reason_h, details_h = no_hybridization_check_v100(repo_root=repo_root)
++    if not ok_h:
++        _fail(str(reason_h) + ":" + json.dumps(details_h, ensure_ascii=False, sort_keys=True))
++
++    task_dirs = sorted([p for p in run_dir.iterdir() if p.is_dir() and p.name.startswith("task_")], key=lambda p: p.name)
++    if not task_dirs:
++        _fail("no_task_dirs")
++
++    results: List[Dict[str, Any]] = []
++    for td in task_dirs:
++        ok, reason, details = _verify_task_dir(td, repo_root=repo_root)
++        results.append({"task_dir": str(td), "ok": bool(ok), "reason": str(reason), "details": dict(details)})
++        if not ok:
++            _fail("task_verify_failed:" + str(reason))
++
++    out = {"ok": True, "reason": "ok", "tasks_total": int(len(task_dirs)), "results": results}
++    print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()

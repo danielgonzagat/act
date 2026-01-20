@@ -1,0 +1,1199 @@
+--- patches/v58_autogate_end2end_base/engine.py	2026-01-11 14:13:16
++++ atos_core/engine.py	2026-01-11 14:16:32
+@@ -165,6 +165,8 @@
+             "builder": "",
+             "top_k": 0,
+             "table_ctx_sigs": 0,
++            "rejected_count": 0,
++            "rejected_candidates": [],
+         }
+         base_hash = ""
+         try:
+@@ -200,8 +202,55 @@
+             except Exception:
+                 selected = None
+             if selected is None:
+-                status["reason"] = "no_compatible_act"
++                rejected: List[Dict[str, Any]] = []
++                try:
++                    for act in self.store.by_kind("gate_table_ctxsig"):
++                        ev = act.evidence if isinstance(act.evidence, dict) else {}
++                        meta = ev.get("meta") if isinstance(ev, dict) else {}
++                        if not isinstance(meta, dict):
++                            meta = {}
++                        trained = str(
++                            meta.get("trained_on_store_content_hash")
++                            or meta.get("trained_on_store_hash")
++                            or ""
++                        )
++                        builder = str(meta.get("builder") or "")
++                        try:
++                            pct_real = float(meta.get("pct_saved_real") or 0.0)
++                        except Exception:
++                            pct_real = 0.0
++                        try:
++                            pct_any = float(meta.get("pct_saved") or 0.0)
++                        except Exception:
++                            pct_any = 0.0
++                        try:
++                            ctx_sigs = int(meta.get("table_ctx_sigs") or 0)
++                        except Exception:
++                            ctx_sigs = 0
++                        rejected.append(
++                            {
++                                "act_id": str(act.id),
++                                "trained_on_store_content_hash": str(trained),
++                                "builder": str(builder),
++                                "pct_saved_real": float(pct_real),
++                                "pct_saved": float(pct_any),
++                                "table_ctx_sigs": int(ctx_sigs),
++                            }
++                        )
++                except Exception:
++                    rejected = []
+ 
++                rejected.sort(
++                    key=lambda r: (
++                        -float(r.get("pct_saved_real") or 0.0),
++                        -float(r.get("pct_saved") or 0.0),
++                        str(r.get("act_id") or ""),
++                    )
++                )
++                status["rejected_count"] = int(len(rejected))
++                status["rejected_candidates"] = rejected[:10]
++                status["reason"] = "hash_mismatch_auto" if rejected else "no_gate_table_act"
++
+         if selected is not None:
+             ev = selected.evidence if isinstance(selected.evidence, dict) else {}
+             meta = ev.get("meta") if isinstance(ev, dict) else {}
+@@ -609,6 +658,8 @@
+         trace_force_gate_mismatch: List[int] = []
+         trace_force_gate_debug_baseline_token: List[str] = []
+         trace_force_gate_debug_gate_token: List[str] = []
++        trace_gate_table_hit: List[int] = []
++        trace_gate_table_allowed_k: List[int] = []
+         force_gate_mismatch_examples: List[Dict[str, Any]] = []
+         force_gate_mismatch_capture_topn = max(
+             0, int(getattr(self.config, "force_gate_debug_capture_mismatch_topn", 0) or 0)
+@@ -1385,6 +1436,8 @@
+                 trace_force_gate_mismatch.append(0)
+                 trace_force_gate_debug_baseline_token.append("")
+                 trace_force_gate_debug_gate_token.append("")
++                trace_gate_table_hit.append(0)
++                trace_gate_table_allowed_k.append(0)
+ 
+                 trace_selected_act_ids.append(str(contract_act_id or "__contract__"))
+                 trace_selected_tokens.append(str(nxt))
+@@ -1616,6 +1669,21 @@
+                 trace_force_gate_debug_baseline_token.append(str(b_nxt or ""))
+                 trace_force_gate_debug_gate_token.append(str(g_nxt or ""))
+ 
++                gate_hit = 0
++                gate_k = 0
++                try:
++                    table = self._gate_table_ctxsig_table
++                    if isinstance(table, dict) and table:
++                        ids = table.get(f"{mode_state}{SEP}{ck}")
++                        if isinstance(ids, list) and ids:
++                            gate_hit = 1
++                            gate_k = int(len(ids))
++                except Exception:
++                    gate_hit = 0
++                    gate_k = 0
++                trace_gate_table_hit.append(int(gate_hit))
++                trace_gate_table_allowed_k.append(int(gate_k))
++
+                 trace_selected_act_ids.append(str(src_act))
+                 trace_selected_tokens.append(str(nxt))
+ 
+@@ -1892,6 +1960,21 @@
+             trace_force_gate_debug_baseline_token.append("")
+             trace_force_gate_debug_gate_token.append("")
+ 
++            gate_hit = 0
++            gate_k = 0
++            try:
++                table = self._gate_table_ctxsig_table
++                if isinstance(table, dict) and table:
++                    ids = table.get(f"{mode_state}{SEP}{ck}")
++                    if isinstance(ids, list) and ids:
++                        gate_hit = 1
++                        gate_k = int(len(ids))
++            except Exception:
++                gate_hit = 0
++                gate_k = 0
++            trace_gate_table_hit.append(int(gate_hit))
++            trace_gate_table_allowed_k.append(int(gate_k))
++
+             trace_selected_act_ids.append(str(src_act))
+             trace_selected_tokens.append(str(nxt))
+ 
+@@ -1971,6 +2054,8 @@
+                 "router_live_debug_baseline_token": trace_router_live_debug_baseline_token,
+                 "router_live_debug_gate_token": trace_router_live_debug_gate_token,
+                 "gate_table_act": dict(self._gate_table_act_status),
++                "gate_table_hit": trace_gate_table_hit,
++                "gate_table_allowed_k": trace_gate_table_allowed_k,
+                 "instruction_contract": contract_meta,
+                 "instruction_contract_used": trace_instruction_contract_used,
+                 "instruction_contract_kind": trace_instruction_contract_kind,
+--- patches/v58_autogate_end2end_base/promote_gate_table_to_act.py	2026-01-11 14:13:16
++++ scripts/promote_gate_table_to_act.py	2026-01-11 14:17:03
+@@ -209,7 +209,17 @@
+     store.add(gate_act)
+ 
+     out_acts_jsonl = os.path.join(out_dir, "acts.jsonl")
+-    store.save_jsonl(out_acts_jsonl)
++    # Preserve base file order for auditability: copy base acts.jsonl as-is and append the new ACT.
++    with open(acts_jsonl, "rb") as f:
++        base_bytes = f.read()
++    if base_bytes and not base_bytes.endswith(b"\n"):
++        base_bytes += b"\n"
++    gate_line = canonical_json_dumps(gate_act.to_dict()).encode("utf-8") + b"\n"
++    tmp = out_acts_jsonl + ".tmp"
++    with open(tmp, "wb") as f:
++        f.write(base_bytes)
++        f.write(gate_line)
++    os.replace(tmp, out_acts_jsonl)
+     out_acts_sha256 = sha256_file(out_acts_jsonl)
+ 
+     promotion_ledger_path = os.path.join(out_dir, "promotion_ledger.jsonl")
+@@ -248,6 +258,7 @@
+         "source_acts_run": str(acts_run),
+         "source_gate_table_json": str(gate_table_json_path),
+         "gate_table_act_id": str(gate_act.id),
++        "store_content_hash_excluding_gate_tables": str(store_hash_excl),
+         "verify_chain": bool(ok),
+         "promotion_ledger_last_hash": str(entry.get("entry_hash") or ""),
+         "sha256": {
+@@ -279,4 +290,3 @@
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+-
+--- patches/v58_autogate_end2end_base/smoke_gate_table_act.py	2026-01-11 14:18:28
++++ scripts/smoke_gate_table_act.py	2026-01-11 14:18:49
+@@ -185,6 +185,28 @@
+     if bool(meta_bad.get("used")):
+         raise SystemExit("FAIL: incompatible gate-table act should not be used")
+ 
++    # Incompatible act (auto selection): must NO-OP and provide explicit diagnostics.
++    auto_store = ActStore.load_jsonl(acts_jsonl)
++    auto_store.add(gate_act_bad)
++    eng_auto = Engine(
++        auto_store,
++        seed=int(args.seed),
++        config=EngineConfig(use_gate_table_act=True),
++    )
++    tx_auto, _m_auto = run_chat_suite(
++        eng_auto, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens)
++    )
++    h_auto = sha256_text(transcripts_text(tx_auto))
++    if h_auto != h_base:
++        raise SystemExit("FAIL: hash_mismatch_auto changed output hash")
++    meta_auto = extract_gate_meta(tx_auto)
++    if str(meta_auto.get("reason") or "") != "hash_mismatch_auto":
++        raise SystemExit(f"FAIL: expected reason=hash_mismatch_auto, got {meta_auto}")
++    if bool(meta_auto.get("used")):
++        raise SystemExit("FAIL: hash_mismatch_auto should not be used")
++    if int(meta_auto.get("rejected_count") or 0) < 1:
++        raise SystemExit(f"FAIL: expected rejected_count>=1, got {meta_auto}")
++
+     print(
+         canonical_json_dumps(
+             {
+@@ -193,9 +215,11 @@
+                 "sha256_baseline": str(h_base),
+                 "sha256_gate_ok": str(h_gate),
+                 "sha256_gate_bad": str(h_bad),
++                "sha256_gate_auto_bad": str(h_auto),
+                 "scan_cost_baseline": float(cost_base),
+                 "scan_cost_gate_ok": float(cost_gate),
+                 "gate_bad_trace": meta_bad,
++                "gate_auto_bad_trace": meta_auto,
+             }
+         )
+     )
+@@ -204,4 +228,3 @@
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+-
+--- /dev/null	2026-01-11 14:22:09
++++ scripts/autogate_end2end_v58.py	2026-01-11 14:22:37
+@@ -0,0 +1,975 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import os
++import sys
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from atos_core.act import Act, Patch, canonical_json_dumps, deterministic_iso, sha256_hex
++from atos_core.engine import Engine, EngineConfig
++from atos_core.ledger import Ledger
++from atos_core.store import ActStore
++from atos_core.suite import CHAT_DIALOGUES_20X3, run_chat_suite
++
++SEP = "\u241f"
++
++
++def sha256_text(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()
++
++
++def sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(1024 * 1024)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def ensure_absent(path: str, *, what: str) -> None:
++    if os.path.exists(path):
++        raise SystemExit(f"ERROR: {what} already exists: {path}")
++
++
++def transcripts_text(transcripts: Sequence[Dict[str, Any]]) -> str:
++    return "\n".join(str(r.get("full_text", "")) for r in transcripts)
++
++
++def compare_transcripts_by_full_text(
++    a: Sequence[Dict[str, Any]], b: Sequence[Dict[str, Any]]
++) -> Tuple[int, int, List[Dict[str, Any]]]:
++    total = min(len(a), len(b))
++    mismatches = 0
++    examples: List[Dict[str, Any]] = []
++    for i in range(total):
++        ta = str(a[i].get("full_text", ""))
++        tb = str(b[i].get("full_text", ""))
++        if ta != tb:
++            mismatches += 1
++            if len(examples) < 3:
++                examples.append(
++                    {
++                        "index": int(i),
++                        "a_sha256": sha256_text(ta),
++                        "b_sha256": sha256_text(tb),
++                        "a_snip": ta[:120],
++                        "b_snip": tb[:120],
++                    }
++                )
++    return mismatches, total, examples
++
++
++def expand_dialogues(
++    dialogues: Sequence[Sequence[str]], *, repeats: int
++) -> Tuple[Tuple[str, ...], ...]:
++    r = max(1, int(repeats))
++    base: List[Tuple[str, ...]] = [tuple(d) for d in dialogues]
++    out: List[Tuple[str, ...]] = []
++    for _ in range(r):
++        out.extend(base)
++    return tuple(out)
++
++
++def _iter_ctx_sig_winners_chat(
++    transcripts: Sequence[Dict[str, Any]],
++) -> List[Tuple[str, str]]:
++    out: List[Tuple[str, str]] = []
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            mode = str(t.get("mode") or "default")
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            cks = tr.get("context_keys") or []
++            winners = tr.get("selected_source_act_ids") or []
++            if not isinstance(cks, list) or not isinstance(winners, list):
++                continue
++            n = min(len(cks), len(winners))
++            for i in range(n):
++                ck = cks[i]
++                win = winners[i]
++                if not isinstance(ck, str) or not ck:
++                    continue
++                if not isinstance(win, str) or not win:
++                    continue
++                if win in {"__engine__", "__unknown__", "__contract__"}:
++                    continue
++                out.append((f"{mode}{SEP}{ck}", str(win)))
++    return out
++
++
++def collect_ctx_sig_winner_counts_chat(
++    transcripts: Sequence[Dict[str, Any]],
++    *,
++    predictor_ids: set,
++) -> Tuple[Dict[str, Dict[str, int]], Dict[str, int]]:
++    counts: Dict[str, Dict[str, int]] = {}
++    occ: Dict[str, int] = {}
++    for ctx_sig, win in _iter_ctx_sig_winners_chat(transcripts):
++        if win not in predictor_ids:
++            continue
++        occ[ctx_sig] = int(occ.get(ctx_sig, 0) + 1)
++        row = counts.get(ctx_sig)
++        if row is None:
++            row = {}
++            counts[ctx_sig] = row
++        row[str(win)] = int(row.get(str(win), 0)) + 1
++    return counts, occ
++
++
++def build_winners_table(
++    *,
++    winner_counts_by_ctx_sig: Dict[str, Dict[str, int]],
++    occ_by_ctx_sig: Dict[str, int],
++    top_k: int,
++    min_ctx_occ: int,
++    min_winner_rate: float,
++    predictor_ids: set,
++) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
++    top_k = max(1, int(top_k))
++    min_ctx_occ = max(1, int(min_ctx_occ))
++    min_winner_rate = float(min_winner_rate)
++
++    kept: Dict[str, List[str]] = {}
++    removed_occ = 0
++    removed_rate = 0
++    removed_empty = 0
++    total_ctx = 0
++
++    for ctx_sig, win_row in winner_counts_by_ctx_sig.items():
++        total_ctx += 1
++        occ = int(occ_by_ctx_sig.get(ctx_sig, 0) or 0)
++        if occ < min_ctx_occ:
++            removed_occ += 1
++            continue
++        items = [
++            (str(k), int(v))
++            for k, v in win_row.items()
++            if isinstance(k, str) and str(k) in predictor_ids
++        ]
++        items.sort(key=lambda kv: (-int(kv[1]), str(kv[0])))
++        allowed = [str(k) for k, _v in items[:top_k]]
++        if not allowed:
++            removed_empty += 1
++            continue
++        total = int(sum(int(v) for _k, v in items))
++        cov = float(sum(int(win_row.get(a, 0)) for a in allowed)) / float(max(1, total))
++        if cov < min_winner_rate:
++            removed_rate += 1
++            continue
++        kept[str(ctx_sig)] = allowed
++
++    meta = {
++        "builder": "winners",
++        "top_k": int(top_k),
++        "min_ctx_occ": int(min_ctx_occ),
++        "min_winner_rate": float(min_winner_rate),
++        "ctx_sigs_total": int(total_ctx),
++        "ctx_sigs_kept": int(len(kept)),
++        "ctx_sigs_removed_min_occ": int(removed_occ),
++        "ctx_sigs_removed_min_winner_rate": int(removed_rate),
++        "ctx_sigs_removed_empty": int(removed_empty),
++    }
++    return kept, meta
++
++
++def extract_mismatch_examples(
++    transcripts: Sequence[Dict[str, Any]], *, limit: int
++) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    for d in transcripts:
++        did = int(d.get("prompt_id", -1) or -1)
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for tidx, t in enumerate(turns):
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            exs = tr.get("force_gate_mismatch_examples") or []
++            if not isinstance(exs, list) or not exs:
++                continue
++            sel_toks = tr.get("selected_tokens") or []
++            for ex in exs:
++                if not isinstance(ex, dict):
++                    continue
++                idx = int(ex.get("token_index", 0) or 0)
++                prev: List[str] = []
++                if isinstance(sel_toks, list) and idx > 0:
++                    prev = [
++                        str(x)
++                        for x in sel_toks[max(0, idx - 10) : idx]
++                        if isinstance(x, str)
++                    ]
++                out.append(
++                    {
++                        "dialogue_id": int(did),
++                        "turn": int(tidx),
++                        "token_index": int(idx),
++                        "ctx_sig": str(ex.get("ctx_sig") or ""),
++                        "baseline_token": str(ex.get("baseline_token") or ""),
++                        "gate_token": str(ex.get("gate_token") or ""),
++                        "allowed_size": int(ex.get("allowed_size") or 0),
++                        "baseline_predictors_iterated": int(ex.get("baseline_predictors_iterated") or 0),
++                        "gate_predictors_iterated": int(ex.get("gate_predictors_iterated") or 0),
++                        "fingerprint_prev_tokens": prev,
++                        "debug": ex,
++                    }
++                )
++                if len(out) >= int(limit):
++                    return out
++    return out
++
++
++def classify_mismatch(ex: Dict[str, Any]) -> str:
++    dbg = ex.get("debug") or {}
++    if not isinstance(dbg, dict):
++        return "unknown"
++    if list(dbg.get("rewrite_rule_hits_baseline") or []) != list(dbg.get("rewrite_rule_hits_gate") or []):
++        return "rewrite_rule_delta"
++    base_exec = set(
++        str(x) for x in (dbg.get("baseline_executed_predictor_ids") or []) if isinstance(x, str)
++    )
++    gate_exec = set(
++        str(x) for x in (dbg.get("gate_executed_predictor_ids") or []) if isinstance(x, str)
++    )
++    if base_exec - gate_exec:
++        return "missing_competitor_exec"
++    base_tok = str(dbg.get("baseline_token") or "")
++    gate_top = dbg.get("gate_top_candidates") or []
++    if base_tok and isinstance(gate_top, list):
++        if any(isinstance(c, dict) and str(c.get("token") or "") == base_tok for c in gate_top):
++            return "present_but_loses"
++    return "missing_candidate"
++
++
++def build_hybrid_default_table(
++    *,
++    winner_counts_by_ctx_sig: Dict[str, Dict[str, int]],
++    occ_by_ctx_sig: Dict[str, int],
++    topcand_counts_by_ctx_sig: Dict[str, Dict[str, int]],
++    top_k: int,
++    min_ctx_occ: int,
++    min_winner_rate: float,
++    predictor_ids: set,
++) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
++    top_k = max(1, int(top_k))
++    min_ctx_occ = max(1, int(min_ctx_occ))
++    min_winner_rate = float(min_winner_rate)
++
++    kept: Dict[str, List[str]] = {}
++    removed_occ = 0
++    removed_rate = 0
++    removed_empty = 0
++    total_ctx = 0
++
++    for ctx_sig, win_row in winner_counts_by_ctx_sig.items():
++        total_ctx += 1
++        occ = int(occ_by_ctx_sig.get(ctx_sig, 0) or 0)
++        if occ < min_ctx_occ:
++            removed_occ += 1
++            continue
++
++        winners = [
++            (str(k), int(v))
++            for k, v in win_row.items()
++            if isinstance(k, str) and str(k) in predictor_ids
++        ]
++        winners.sort(key=lambda kv: (-int(kv[1]), str(kv[0])))
++        topcand_row = topcand_counts_by_ctx_sig.get(ctx_sig) or {}
++        topcands = [
++            (str(k), int(v))
++            for k, v in topcand_row.items()
++            if isinstance(k, str) and str(k) in predictor_ids
++        ]
++        topcands.sort(key=lambda kv: (-int(kv[1]), str(kv[0])))
++
++        allowed: List[str] = []
++        if winners:
++            allowed.append(str(winners[0][0]))
++        if topcands:
++            pid = str(topcands[0][0])
++            if pid and pid not in set(allowed):
++                allowed.append(pid)
++        for pid, _v in winners:
++            if len(allowed) >= top_k:
++                break
++            if pid not in set(allowed):
++                allowed.append(pid)
++        for pid, _v in topcands:
++            if len(allowed) >= top_k:
++                break
++            if pid not in set(allowed):
++                allowed.append(pid)
++
++        allowed = allowed[:top_k]
++        if not allowed:
++            removed_empty += 1
++            continue
++
++        total = int(sum(int(v) for _k, v in winners))
++        cov = float(sum(int(win_row.get(a, 0)) for a in allowed)) / float(max(1, total))
++        if cov < min_winner_rate:
++            removed_rate += 1
++            continue
++        kept[str(ctx_sig)] = list(allowed)
++
++    meta = {
++        "builder": "hybrid",
++        "top_k": int(top_k),
++        "min_ctx_occ": int(min_ctx_occ),
++        "min_winner_rate": float(min_winner_rate),
++        "ctx_sigs_total": int(total_ctx),
++        "ctx_sigs_kept": int(len(kept)),
++        "ctx_sigs_removed_min_occ": int(removed_occ),
++        "ctx_sigs_removed_min_winner_rate": int(removed_rate),
++        "ctx_sigs_removed_empty": int(removed_empty),
++    }
++    return kept, meta
++
++
++def normalize_gate_table(table: Any) -> Dict[str, List[str]]:
++    if not isinstance(table, dict):
++        return {}
++    out: Dict[str, List[str]] = {}
++    for ctx_sig, ids in table.items():
++        if not isinstance(ctx_sig, str) or not ctx_sig:
++            continue
++        if not isinstance(ids, list) or not ids:
++            continue
++        cleaned: List[str] = []
++        for x in ids:
++            if not isinstance(x, str):
++                continue
++            x = str(x)
++            if not x:
++                continue
++            cleaned.append(x)
++        if not cleaned:
++            continue
++        out[str(ctx_sig)] = sorted(set(cleaned))
++    return out
++
++
++def make_gate_table_act(
++    *,
++    store_hash_excluding_gate_tables: str,
++    base_acts_sha256: str,
++    gate_table_json_relpath: str,
++    gate_table_json_sha256: str,
++    gate_table_meta: Dict[str, Any],
++    gate_table: Dict[str, List[str]],
++) -> Act:
++    meta: Dict[str, Any] = {}
++    meta.update({k: gate_table_meta.get(k) for k in sorted(gate_table_meta.keys())})
++    meta.update(
++        {
++            "builder": str(gate_table_meta.get("builder") or ""),
++            "top_k": int(gate_table_meta.get("top_k", 0) or 0),
++            "min_ctx_occ": int(gate_table_meta.get("min_ctx_occ", 0) or 0),
++            "min_winner_rate": float(gate_table_meta.get("min_winner_rate", 0.0) or 0.0),
++            "topcand_n": int(gate_table_meta.get("topcand_n", 0) or 0),
++            "trained_on_store_content_hash": str(store_hash_excluding_gate_tables),
++            "trained_on_store_content_hash_excluding_kinds": ["gate_table_ctxsig"],
++            "trained_on_acts_jsonl_sha256": str(base_acts_sha256),
++            "gate_table_json_relpath": str(gate_table_json_relpath),
++            "gate_table_json_sha256": str(gate_table_json_sha256),
++            "table_ctx_sigs": int(len(gate_table)),
++            "table_edges": int(sum(len(v) for v in gate_table.values())),
++        }
++    )
++    evidence = {"name": "gate_table_ctxsig_v0", "meta": meta, "table": gate_table}
++
++    body = {
++        "kind": "gate_table_ctxsig",
++        "match": {"type": "always"},
++        "program": [],
++        "evidence": evidence,
++        "deps": [],
++        "active": True,
++    }
++    act_id = "act_gate_table_ctxsig_" + sha256_hex(canonical_json_dumps(body).encode("utf-8"))[:12]
++    return Act(
++        id=act_id,
++        version=1,
++        created_at=deterministic_iso(step=0, offset_us=580000),
++        kind="gate_table_ctxsig",
++        match={"type": "always"},
++        program=[],
++        evidence=evidence,
++        cost={"overhead_bits": 512},
++        deps=[],
++        active=True,
++    )
++
++
++def write_promoted_acts_preserve_order(
++    *, base_acts_jsonl: str, out_acts_promoted_jsonl: str, gate_act: Act
++) -> None:
++    with open(base_acts_jsonl, "rb") as f:
++        base_bytes = f.read()
++    if base_bytes and not base_bytes.endswith(b"\n"):
++        base_bytes += b"\n"
++    gate_line = canonical_json_dumps(gate_act.to_dict()).encode("utf-8") + b"\n"
++    tmp = out_acts_promoted_jsonl + ".tmp"
++    with open(tmp, "wb") as f:
++        f.write(base_bytes)
++        f.write(gate_line)
++    os.replace(tmp, out_acts_promoted_jsonl)
++
++
++def extract_gate_table_act_trace_meta(transcripts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            meta = tr.get("gate_table_act")
++            if isinstance(meta, dict):
++                return dict(meta)
++    return {}
++
++
++def gate_table_token_stats(transcripts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
++    tokens_total = 0
++    hit_tokens = 0
++    allowed_k_sum = 0
++    allowed_k_hit_sum = 0
++    hit_turns = 0
++    turns_total = 0
++    for d in transcripts:
++        turns = d.get("turns") or []
++        if not isinstance(turns, list):
++            continue
++        for t in turns:
++            if not isinstance(t, dict):
++                continue
++            turns_total += 1
++            tr = t.get("trace") or {}
++            if not isinstance(tr, dict):
++                continue
++            hits = tr.get("gate_table_hit") or []
++            ks = tr.get("gate_table_allowed_k") or []
++            if not isinstance(hits, list) or not isinstance(ks, list):
++                continue
++            n = min(len(hits), len(ks))
++            if n <= 0:
++                continue
++            if any(int(bool(hits[i])) for i in range(n)):
++                hit_turns += 1
++            for i in range(n):
++                h = int(bool(hits[i]))
++                k = int(ks[i] or 0)
++                tokens_total += 1
++                hit_tokens += h
++                allowed_k_sum += k
++                if h:
++                    allowed_k_hit_sum += k
++    return {
++        "tokens_total": int(tokens_total),
++        "hit_tokens": int(hit_tokens),
++        "hit_rate": float(hit_tokens / max(1, tokens_total)),
++        "allowed_k_mean": float(allowed_k_sum / max(1, tokens_total)),
++        "allowed_k_mean_on_hit": float(allowed_k_hit_sum / max(1, hit_tokens)),
++        "turns_total": int(turns_total),
++        "hit_turns": int(hit_turns),
++        "hit_turn_rate": float(hit_turns / max(1, turns_total)),
++    }
++
++
++def parse_csv_list(s: str) -> List[str]:
++    return [p.strip() for p in str(s).split(",") if p.strip()]
++
++
++def parse_gate_config(s: str) -> Dict[str, Any]:
++    s = str(s or "").strip()
++    if not s:
++        return {}
++    if s.startswith("{"):
++        try:
++            obj = json.loads(s)
++            return obj if isinstance(obj, dict) else {}
++        except Exception:
++            return {}
++    out: Dict[str, Any] = {}
++    for part in s.split(","):
++        part = part.strip()
++        if not part or "=" not in part:
++            continue
++        k, v = part.split("=", 1)
++        k = k.strip()
++        v = v.strip()
++        if not k:
++            continue
++        out[k] = v
++    return out
++
++
++@dataclass
++class GateCfg:
++    top_k: int = 2
++    min_ctx_occ: int = 2
++    min_winner_rate: float = 0.99
++    topcand_n: int = 5
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--acts_run", required=True, help="Base run dir containing acts.jsonl.")
++    ap.add_argument("--out", required=True, help="WORM output dir under results/.")
++    ap.add_argument("--seeds", default="0,1")
++    ap.add_argument("--router_modes", default="off,on")
++    ap.add_argument("--suite_repeats", type=int, default=5)
++    ap.add_argument("--max_new_tokens", type=int, default=80)
++    ap.add_argument(
++        "--gate_config",
++        default="top_k=2,min_ctx_occ=2,min_winner_rate=0.99,topcand_n=5",
++        help="Either JSON or comma key=val (top_k,min_ctx_occ,min_winner_rate,topcand_n).",
++    )
++    ap.add_argument("--diag_mismatch_cap", type=int, default=200)
++    ap.add_argument("--freeze_path", default="LEDGER_ATOLANG_V0_2_18_BASELINE_V58_AUTOGATE_END2END.json")
++    ap.add_argument("--patch_diff", default="")
++    args = ap.parse_args()
++
++    out_dir = str(args.out)
++    freeze_path = str(args.freeze_path)
++    ensure_absent(out_dir, what="--out")
++    ensure_absent(freeze_path, what="--freeze_path")
++
++    acts_run = str(args.acts_run)
++    base_acts_jsonl = os.path.join(acts_run, "acts.jsonl")
++    if not os.path.exists(base_acts_jsonl):
++        raise SystemExit(f"ERROR: acts.jsonl not found: {base_acts_jsonl}")
++
++    patch_diff_path = str(args.patch_diff or "")
++    if patch_diff_path:
++        if not os.path.exists(patch_diff_path):
++            raise SystemExit(f"ERROR: --patch_diff not found: {patch_diff_path}")
++
++    os.makedirs(out_dir, exist_ok=False)
++
++    cfg_raw = parse_gate_config(str(args.gate_config))
++    gate_cfg = GateCfg()
++    if "top_k" in cfg_raw:
++        gate_cfg.top_k = int(cfg_raw["top_k"])
++    if "min_ctx_occ" in cfg_raw:
++        gate_cfg.min_ctx_occ = int(cfg_raw["min_ctx_occ"])
++    if "min_winner_rate" in cfg_raw:
++        gate_cfg.min_winner_rate = float(cfg_raw["min_winner_rate"])
++    if "topcand_n" in cfg_raw:
++        gate_cfg.topcand_n = int(cfg_raw["topcand_n"])
++
++    seeds = [int(x) for x in parse_csv_list(str(args.seeds))]
++    router_modes = [m.lower() for m in parse_csv_list(str(args.router_modes)) if m.lower() in {"off", "on"}]
++    if not seeds:
++        raise SystemExit("ERROR: empty --seeds")
++    if not router_modes:
++        raise SystemExit("ERROR: empty --router_modes (expected off,on)")
++
++    dialogues = expand_dialogues(CHAT_DIALOGUES_20X3, repeats=int(args.suite_repeats))
++
++    base_acts_sha256 = sha256_file(base_acts_jsonl)
++
++    summary_rows: List[Dict[str, Any]] = []
++    scenario_dirs: List[str] = []
++
++    for seed in seeds:
++        for rm in router_modes:
++            router_on = True if rm == "on" else False
++            scenario_name = f"seed{int(seed)}_router_{rm}"
++            scenario_dir = os.path.join(out_dir, scenario_name)
++            os.makedirs(scenario_dir, exist_ok=False)
++            scenario_dirs.append(scenario_dir)
++
++            store = ActStore.load_jsonl(base_acts_jsonl)
++            predictor_ids = {str(a.id) for a in store.by_kind("predictor")}
++            store_hash_excl = store.content_hash(exclude_kinds=["gate_table_ctxsig"])
++
++            base_cfg = EngineConfig(router_live_enabled=bool(router_on))
++            eng0 = Engine(store, seed=int(seed), config=base_cfg)
++            base_transcripts, base_metrics = run_chat_suite(
++                eng0, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens), csv=None
++            )
++            base_text = transcripts_text(base_transcripts)
++            base_hash = sha256_text(base_text)
++            base_cost = float(base_metrics.get("scan_acts_considered_per_token_mean") or 0.0)
++            tokens_total = int(base_metrics.get("trace_tokens_total") or 0)
++
++            winner_counts, occ_by_ctx_sig = collect_ctx_sig_winner_counts_chat(
++                base_transcripts, predictor_ids=predictor_ids
++            )
++            winners_table, winners_meta = build_winners_table(
++                winner_counts_by_ctx_sig=winner_counts,
++                occ_by_ctx_sig=occ_by_ctx_sig,
++                top_k=int(gate_cfg.top_k),
++                min_ctx_occ=int(gate_cfg.min_ctx_occ),
++                min_winner_rate=float(gate_cfg.min_winner_rate),
++                predictor_ids=predictor_ids,
++            )
++
++            diag_cfg = EngineConfig(
++                router_live_enabled=bool(router_on),
++                force_predictor_ids_by_ctx_sig=winners_table if winners_table else None,
++                force_gate_debug_compare=True,
++                force_gate_debug_capture_mismatch_topn=int(gate_cfg.topcand_n),
++                force_gate_debug_capture_mismatch_cap=int(args.diag_mismatch_cap),
++            )
++            eng_diag = Engine(store, seed=int(seed), config=diag_cfg)
++            diag_transcripts, diag_metrics = run_chat_suite(
++                eng_diag, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens), csv=None
++            )
++            diag_hash = sha256_text(transcripts_text(diag_transcripts))
++            if diag_hash != base_hash:
++                raise SystemExit(f"DIAG_INVARIANCE_FAILED: baseline!=diag (scenario={scenario_name})")
++
++            mismatch_examples = extract_mismatch_examples(diag_transcripts, limit=200)
++            cats: Dict[str, int] = {}
++            topcand_counts: Dict[str, Dict[str, int]] = {}
++            for ex in mismatch_examples:
++                c = classify_mismatch(ex)
++                cats[c] = int(cats.get(c, 0) + 1)
++                dbg = ex.get("debug") or {}
++                if not isinstance(dbg, dict):
++                    continue
++                ctx_sig = str(ex.get("ctx_sig") or "")
++                if not ctx_sig:
++                    continue
++                tops = dbg.get("baseline_top_candidates") or []
++                if not isinstance(tops, list):
++                    continue
++                row = topcand_counts.get(ctx_sig)
++                if row is None:
++                    row = {}
++                    topcand_counts[ctx_sig] = row
++                for cnd in tops[: max(0, int(gate_cfg.topcand_n))]:
++                    if not isinstance(cnd, dict):
++                        continue
++                    src = str(cnd.get("source_act") or "")
++                    if not src or src not in predictor_ids:
++                        continue
++                    row[src] = int(row.get(src, 0) + 1)
++
++            mismatch_report = {
++                "scenario": scenario_name,
++                "sha256_transcript_text": str(diag_hash),
++                "winners_table_meta": dict(winners_meta),
++                "diag_suite_metrics": dict(diag_metrics),
++                "category_counts": dict(sorted((k, int(v)) for k, v in cats.items())),
++                "examples": mismatch_examples[:50],
++            }
++            with open(os.path.join(scenario_dir, "mismatch_report.json"), "w", encoding="utf-8") as f:
++                f.write(json.dumps(mismatch_report, ensure_ascii=False, indent=2, sort_keys=True))
++                f.write("\n")
++
++            gate_table, gate_meta = build_hybrid_default_table(
++                winner_counts_by_ctx_sig=winner_counts,
++                occ_by_ctx_sig=occ_by_ctx_sig,
++                topcand_counts_by_ctx_sig=topcand_counts,
++                top_k=int(gate_cfg.top_k),
++                min_ctx_occ=int(gate_cfg.min_ctx_occ),
++                min_winner_rate=float(gate_cfg.min_winner_rate),
++                predictor_ids=predictor_ids,
++            )
++            gate_meta["topcand_n"] = int(gate_cfg.topcand_n)
++            gate_meta["diag_winners_meta"] = dict(winners_meta)
++            gate_meta["diag_mismatch_category_counts"] = mismatch_report["category_counts"]
++            gate_meta["trained_on_store_content_hash_excluding_gate_tables"] = str(store_hash_excl)
++            gate_meta["trained_on_acts_jsonl_sha256"] = str(base_acts_sha256)
++
++            gate_table_obj = {"meta": gate_meta, "table": gate_table}
++            gate_table_path = os.path.join(
++                scenario_dir,
++                "active_gate_table_ctxsig_default_hybrid_top2_minocc2_minwin0p99.json",
++            )
++            with open(gate_table_path, "w", encoding="utf-8") as f:
++                f.write(json.dumps(gate_table_obj, ensure_ascii=False, indent=2, sort_keys=True))
++                f.write("\n")
++            gate_table_sha256 = sha256_file(gate_table_path)
++
++            gate_table_norm = normalize_gate_table(gate_table)
++            gate_act = make_gate_table_act(
++                store_hash_excluding_gate_tables=str(store_hash_excl),
++                base_acts_sha256=str(base_acts_sha256),
++                gate_table_json_relpath=os.path.relpath(gate_table_path, out_dir),
++                gate_table_json_sha256=str(gate_table_sha256),
++                gate_table_meta=gate_meta,
++                gate_table=gate_table_norm,
++            )
++
++            promoted_acts_path = os.path.join(scenario_dir, "acts_promoted.jsonl")
++            write_promoted_acts_preserve_order(
++                base_acts_jsonl=base_acts_jsonl,
++                out_acts_promoted_jsonl=promoted_acts_path,
++                gate_act=gate_act,
++            )
++            promoted_acts_sha256 = sha256_file(promoted_acts_path)
++
++            # WORM promotion ledger (hash-chained).
++            promotion_ledger_path = os.path.join(scenario_dir, "promotion_ledger.jsonl")
++            ledger = Ledger(path=promotion_ledger_path)
++            patch = Patch(
++                kind="ADD_ACT",
++                payload={
++                    "act_id": str(gate_act.id),
++                    "act_kind": str(gate_act.kind),
++                    "trained_on_store_content_hash": str(store_hash_excl),
++                    "source_acts_run": str(acts_run),
++                    "source_acts_jsonl_sha256": str(base_acts_sha256),
++                    "source_gate_table_json_relpath": os.path.relpath(gate_table_path, out_dir),
++                    "source_gate_table_json_sha256": str(gate_table_sha256),
++                },
++            )
++
++            store_with_gate = ActStore.load_jsonl(promoted_acts_path)
++            acts_hash_with_gate = store_with_gate.content_hash()
++            entry = ledger.append(
++                step=0,
++                patch=patch,
++                acts_hash=str(acts_hash_with_gate),
++                metrics={
++                    "promotion": {
++                        "store_content_hash_excluding_gate_tables": str(store_hash_excl),
++                        "source_acts_jsonl_sha256": str(base_acts_sha256),
++                        "promoted_acts_jsonl_sha256": str(promoted_acts_sha256),
++                        "gate_table_json_sha256": str(gate_table_sha256),
++                    }
++                },
++                snapshot_path=os.path.relpath(promoted_acts_path, scenario_dir),
++            )
++            chain_ok = bool(ledger.verify_chain())
++
++            promotion_manifest = {
++                "name": "V58_PROMOTION",
++                "scenario": scenario_name,
++                "gate_table_act_id": str(gate_act.id),
++                "verify_chain": bool(chain_ok),
++                "promotion_ledger_last_hash": str(entry.get("entry_hash") or ""),
++                "store_content_hash_excluding_gate_tables": str(store_hash_excl),
++                "sha256": {
++                    "acts_base_jsonl": str(base_acts_sha256),
++                    "gate_table_json": str(gate_table_sha256),
++                    "acts_promoted_jsonl": str(promoted_acts_sha256),
++                    "promotion_ledger_jsonl": str(sha256_file(promotion_ledger_path)),
++                },
++            }
++            with open(os.path.join(scenario_dir, "promotion_manifest.json"), "w", encoding="utf-8") as f:
++                f.write(json.dumps(promotion_manifest, ensure_ascii=False, indent=2, sort_keys=True))
++                f.write("\n")
++
++            # Evaluate gated(from-store) on promoted acts.
++            store_gated = ActStore.load_jsonl(promoted_acts_path)
++            gated_cfg = EngineConfig(
++                router_live_enabled=bool(router_on),
++                use_gate_table_act=True,
++            )
++            eng_gate = Engine(store_gated, seed=int(seed), config=gated_cfg)
++            gate_transcripts, gate_metrics = run_chat_suite(
++                eng_gate, dialogues=dialogues, max_new_tokens=int(args.max_new_tokens), csv=None
++            )
++            gate_text = transcripts_text(gate_transcripts)
++            gate_hash = sha256_text(gate_text)
++
++            mism, total, exs = compare_transcripts_by_full_text(base_transcripts, gate_transcripts)
++            divergence_rate = float(mism / max(1, total))
++            if gate_hash != base_hash or divergence_rate != 0.0:
++                raise SystemExit(f"INVARIANCE_FAILED: baseline!=from_store (scenario={scenario_name})")
++
++            gate_cost = float(gate_metrics.get("scan_acts_considered_per_token_mean") or 0.0)
++            pct_saved_real = float((base_cost - gate_cost) / base_cost) if base_cost > 0 else 0.0
++            if pct_saved_real < 0.25:
++                raise SystemExit(
++                    f"SAVINGS_FAILED: pct_saved_real={pct_saved_real:.4f} < 0.25 (scenario={scenario_name})"
++                )
++
++            gate_trace_meta = extract_gate_table_act_trace_meta(gate_transcripts)
++            token_stats = gate_table_token_stats(gate_transcripts)
++
++            scenario_summary = {
++                "scenario": scenario_name,
++                "seed": int(seed),
++                "router_mode": str(rm),
++                "tokens_total": int(tokens_total),
++                "hash_baseline": str(base_hash),
++                "hash_from_store": str(gate_hash),
++                "divergence_rate_full_text": float(divergence_rate),
++                "mismatch_dialogues": int(mism),
++                "total_dialogues": int(total),
++                "mismatch_examples": exs,
++                "cost": {
++                    "avg_scan_cost_baseline_per_token_mean": float(base_cost),
++                    "avg_scan_cost_gate_per_token_mean": float(gate_cost),
++                    "pct_saved_real": float(pct_saved_real),
++                },
++                "gate_table_json": {
++                    "relpath": os.path.relpath(gate_table_path, out_dir),
++                    "sha256": str(gate_table_sha256),
++                    "meta": dict(gate_meta),
++                },
++                "promotion": {
++                    "gate_act_id": str(gate_act.id),
++                    "acts_promoted_relpath": os.path.relpath(promoted_acts_path, out_dir),
++                    "sha256_acts_promoted": str(promoted_acts_sha256),
++                    "sha256_acts_base": str(base_acts_sha256),
++                    "verify_chain": bool(chain_ok),
++                },
++                "gate_table_act_trace": dict(gate_trace_meta),
++                "gate_table_token_stats": dict(token_stats),
++            }
++            with open(os.path.join(scenario_dir, "scenario_summary.json"), "w", encoding="utf-8") as f:
++                f.write(json.dumps(scenario_summary, ensure_ascii=False, indent=2, sort_keys=True))
++                f.write("\n")
++
++            summary_rows.append(
++                {
++                    "seed": int(seed),
++                    "router_mode": str(rm),
++                    "tokens_total": int(tokens_total),
++                    "divergence_rate_full_text": float(divergence_rate),
++                    "pct_saved_real": float(pct_saved_real),
++                    "avg_scan_cost_baseline_per_token_mean": float(base_cost),
++                    "avg_scan_cost_gate_per_token_mean": float(gate_cost),
++                    "gate_act_used": bool(gate_trace_meta.get("used")),
++                    "gate_act_id": str(gate_trace_meta.get("act_id") or gate_act.id),
++                    "acts_hash_match": bool(
++                        str(gate_trace_meta.get("reason") or "") == "ok"
++                        and str(gate_trace_meta.get("trained_on_store_content_hash") or "")
++                        and str(gate_trace_meta.get("trained_on_store_content_hash") or "")
++                        == str(gate_trace_meta.get("store_content_hash") or "")
++                    ),
++                    "gate_hit_rate": float(token_stats.get("hit_rate") or 0.0),
++                    "gate_allowed_k_mean_on_hit": float(token_stats.get("allowed_k_mean_on_hit") or 0.0),
++                    "hash_baseline": str(base_hash),
++                    "hash_from_store": str(gate_hash),
++                }
++            )
++
++    # Write consolidated summary.
++    summary_json_path = os.path.join(out_dir, "summary.json")
++    with open(summary_json_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps({"rows": summary_rows}, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++
++    summary_csv_path = os.path.join(out_dir, "summary.csv")
++    fields = [
++        "seed",
++        "router_mode",
++        "tokens_total",
++        "divergence_rate_full_text",
++        "pct_saved_real",
++        "avg_scan_cost_baseline_per_token_mean",
++        "avg_scan_cost_gate_per_token_mean",
++        "gate_act_used",
++        "gate_act_id",
++        "acts_hash_match",
++        "gate_hit_rate",
++        "gate_allowed_k_mean_on_hit",
++        "hash_baseline",
++        "hash_from_store",
++    ]
++    with open(summary_csv_path, "w", encoding="utf-8", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=fields)
++        w.writeheader()
++        for row in summary_rows:
++            w.writerow({k: row.get(k) for k in fields})
++
++    # Freeze ledger (WORM) in repo root.
++    sha_code: Dict[str, str] = {}
++    for p in [
++        "atos_core/engine.py",
++        "atos_core/store.py",
++        "atos_core/act.py",
++        "scripts/promote_gate_table_to_act.py",
++        "scripts/smoke_gate_table_act.py",
++        "scripts/autogate_end2end_v58.py",
++    ]:
++        if os.path.exists(p):
++            sha_code[p] = sha256_file(p)
++
++    sha_outputs: Dict[str, str] = {}
++    for rel in [
++        summary_json_path,
++        summary_csv_path,
++    ]:
++        sha_outputs[os.path.relpath(rel, ".")] = sha256_file(rel)
++    for sd in scenario_dirs:
++        for fn in [
++            "mismatch_report.json",
++            "scenario_summary.json",
++            "promotion_manifest.json",
++            "promotion_ledger.jsonl",
++            "acts_promoted.jsonl",
++            "active_gate_table_ctxsig_default_hybrid_top2_minocc2_minwin0p99.json",
++        ]:
++            p = os.path.join(sd, fn)
++            if os.path.exists(p):
++                sha_outputs[os.path.relpath(p, ".")] = sha256_file(p)
++
++    sha_patches: Dict[str, str] = {}
++    if patch_diff_path:
++        sha_patches[patch_diff_path] = sha256_file(patch_diff_path)
++
++    freeze = {
++        "name": "V58_AUTOGATE_END2END",
++        "acts_source_run": str(acts_run),
++        "run_dirs": [str(out_dir)],
++        "commands": [
++            "cd act && python3 scripts/autogate_end2end_v58.py "
++            + " ".join(
++                [
++                    f"--acts_run {acts_run}",
++                    f"--out {out_dir}",
++                    f"--seeds {args.seeds}",
++                    f"--router_modes {args.router_modes}",
++                    f"--suite_repeats {int(args.suite_repeats)}",
++                    f"--max_new_tokens {int(args.max_new_tokens)}",
++                    f"--gate_config {str(args.gate_config)}",
++                    f"--diag_mismatch_cap {int(args.diag_mismatch_cap)}",
++                ]
++                + ([f"--patch_diff {patch_diff_path}"] if patch_diff_path else [])
++                + ([f"--freeze_path {freeze_path}"] if freeze_path else [])
++            ),
++        ],
++        "verify_chain": True,
++        "sha256": {
++            "acts_jsonl": {
++                os.path.join(acts_run, "acts.jsonl"): sha256_file(os.path.join(acts_run, "acts.jsonl"))
++            },
++            "code": sha_code,
++            "outputs": sha_outputs,
++            "patches": sha_patches,
++        },
++        "summary_rows": summary_rows,
++    }
++    with open(freeze_path + ".tmp", "w", encoding="utf-8") as f:
++        f.write(json.dumps(freeze, ensure_ascii=False, indent=2, sort_keys=True))
++        f.write("\n")
++    os.replace(freeze_path + ".tmp", freeze_path)
++
++    print(canonical_json_dumps({"out_dir": out_dir, "summary_csv": summary_csv_path, "freeze": freeze_path}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
