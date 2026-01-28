@@ -164,3 +164,12 @@ class ActStore:
 
     def goal_acts(self) -> List[Act]:
         return self.by_kind("goal")
+
+    def plan_acts(self) -> List[Act]:
+        return self.by_kind("plan")
+
+    def hypothesis_acts(self) -> List[Act]:
+        return self.by_kind("hypothesis")
+
+    def reference_acts(self) -> List[Act]:
+        return self.by_kind("reference")

@@ -150,6 +150,27 @@ def validate_act_for_load(act: Act) -> EthicsVerdict:
         goal = ev.get("goal")
         if not isinstance(goal, dict):
             return EthicsVerdict(False, "goal_missing_spec", ["LO-05"], [])
+    if kind == "plan":
+        ev = act.evidence if isinstance(act.evidence, dict) else {}
+        plan = ev.get("plan")
+        if not isinstance(plan, dict):
+            return EthicsVerdict(False, "plan_missing_spec", ["LO-05"], [])
+        if not str(plan.get("goal_id") or ""):
+            return EthicsVerdict(False, "plan_missing_goal_id", ["LO-05"], [])
+    if kind == "hypothesis":
+        ev = act.evidence if isinstance(act.evidence, dict) else {}
+        hyp = ev.get("hypothesis")
+        if not isinstance(hyp, dict):
+            return EthicsVerdict(False, "hypothesis_missing_spec", ["LO-05"], [])
+    if kind == "reference":
+        ev = act.evidence if isinstance(act.evidence, dict) else {}
+        ref = ev.get("reference")
+        if not isinstance(ref, dict):
+            return EthicsVerdict(False, "reference_missing_spec", ["LO-05"], [])
+        if not str(ref.get("token") or ""):
+            return EthicsVerdict(False, "reference_missing_token", ["LO-05"], [])
+        if not str(ref.get("target_id") or ""):
+            return EthicsVerdict(False, "reference_missing_target_id", ["LO-05"], [])
 
     return EthicsVerdict(True, "ok", [], [])
 

@@ -172,6 +172,8 @@ def materialize_composed_act_v74(
     steps: Sequence[PlanStepTraceV73],
     support_contexts: int,
     contexts: Sequence[str],
+    gain_bits_est: int = 0,
+    overhead_bits: int = 1024,
     seed_step: int = 0,
 ) -> Tuple[Act, Dict[str, Any]]:
     """
@@ -215,6 +217,19 @@ def materialize_composed_act_v74(
         if out_key in out_schema:
             output_schema[str(out_key)] = str(out_schema.get(out_key) or "str")
 
+    # Heuristic: composed plan-style concepts should validate with plan_validator when they
+    # output a string and have the canonical plan inputs in scope. This enables composed
+    # concepts to be eligible for the plan_validator concept executor in the runtime.
+    try:
+        if (
+            str(output_schema.get(str(out_key)) or "") == "str"
+            and "goal_id" in input_schema
+            and "plan" in input_schema
+        ):
+            validator_id = "plan_validator"
+    except Exception:
+        pass
+
     # Hygienic temporaries: map produced var -> env var.
     produced_map: Dict[str, str] = {}
     for i, st in enumerate(steps):
@@ -256,26 +271,102 @@ def materialize_composed_act_v74(
     )
     act_id = f"concept_v74_induced_{act_id_sig}"
 
+    overhead_bits0 = int(overhead_bits)
+    if overhead_bits0 < 0:
+        overhead_bits0 = 0
+
+    # Match constraints (family_ids) should propagate through composition to prevent
+    # selecting a composed concept in a context where its callees are disallowed.
+    #
+    # Use the intersection of explicit callee family_ids when available.
+    match: Dict[str, Any] = {}
+    try:
+        fam_inter: Optional[set] = None
+        for st in steps:
+            callee = store_base.get_concept_act(str(st.concept_id))
+            if callee is None or not isinstance(getattr(callee, "match", None), dict):
+                continue
+            fams = callee.match.get("family_ids")
+            if not isinstance(fams, list) or not fams:
+                continue
+            s = {str(x) for x in fams if isinstance(x, str) and str(x)}
+            if not s:
+                continue
+            fam_inter = set(s) if fam_inter is None else fam_inter.intersection(s)
+        if fam_inter is not None and fam_inter:
+            match = {"family_ids": sorted(fam_inter, key=str)}
+    except Exception:
+        match = {}
     act = Act(
         id=str(act_id),
         version=1,
         created_at=deterministic_iso(step=int(seed_step)),
         kind="concept_csv",
-        match={},
+        match=dict(match),
         program=list(program),
         evidence={
             "interface": dict(interface),
+            "meta": {"birth_tags": ["plan"]},
             "induced_v74": {
                 "schema_version": 1,
                 "method": "subpath_concepts_v74",
                 "support_contexts": int(support_contexts),
                 "contexts": [str(x) for x in sorted(set(str(c) for c in contexts if str(c)), key=str)],
+                "gain_bits_est": int(gain_bits_est),
+                "overhead_bits": int(overhead_bits0),
             },
         },
-        cost={"overhead_bits": 1024},
+        cost={"overhead_bits": int(overhead_bits0)},
         deps=[str(s.concept_id) for s in steps],
         active=True,
     )
+
+    # CSG (Concept SubGraph) explicit representation (audit-first):
+    # - Not used by the executor directly (concept_csv program is canonical),
+    #   but recorded as explicit state so that "concepts are subgraphs" is
+    #   mechanically verifiable and merge/split can reason over structure.
+    try:
+        from .csg_v87 import canonicalize_csg_v87, csg_hash_v87  # local import
+
+        csg_nodes: List[Dict[str, Any]] = []
+        for ins in program:
+            if not isinstance(ins, Instruction) or str(ins.op) != "CSV_CALL":
+                continue
+            args = ins.args if isinstance(ins.args, dict) else {}
+            csg_nodes.append(
+                {
+                    "act_id": str(args.get("concept_id") or ""),
+                    "bind": dict(args.get("bind") if isinstance(args.get("bind"), dict) else {}),
+                    "produces": str(args.get("out") or ""),
+                    "role": "call",
+                }
+            )
+        csg = canonicalize_csg_v87(
+            {
+                "schema_version": 1,
+                "nodes": list(csg_nodes),
+                "interface": {
+                    "inputs": sorted([str(k) for k in input_schema.keys() if str(k)], key=str),
+                    "outputs": [str(out_key)],
+                    "validator_ids": [str(validator_id)] if str(validator_id) else [],
+                    "match": dict(match),
+                },
+            }
+        )
+        # Persist in evidence (explicit state).
+        ev2 = act.evidence if isinstance(act.evidence, dict) else {}
+        ev2 = dict(ev2)
+        ev2["csg_v87"] = dict(csg)
+        # Add a stable hash pointer in meta for quick inspection without loading the whole CSG.
+        meta2 = ev2.get("meta") if isinstance(ev2.get("meta"), dict) else {}
+        meta2 = dict(meta2)
+        meta2["csg_v87_hash"] = str(csg_hash_v87(dict(csg)))
+        meta2["csg_v87_nodes"] = int(len(csg.get("nodes") or [])) if isinstance(csg.get("nodes"), list) else 0
+        meta2["csg_v87_edges"] = int(len(csg.get("edges") or [])) if isinstance(csg.get("edges"), list) else 0
+        ev2["meta"] = dict(meta2)
+        act.evidence = dict(ev2)
+    except Exception:
+        pass
 
     debug = {
         "external_inputs": list(external),
@@ -283,6 +374,139 @@ def materialize_composed_act_v74(
         "validator_id": str(validator_id),
         "hygiene": {"produced_map": dict(produced_map)},
     }
+    return act, debug
+
+
+def materialize_deep_wrapper_act_v74(
+    *,
+    store_base: ActStore,
+    inner_concept_id: str,
+    overhead_bits: int = 1024,
+    seed_step: int = 0,
+) -> Tuple[Act, Dict[str, Any]]:
+    """
+    Deterministically materialize a depth-raising wrapper:
+      wrapper -> CSV_CALL(inner) -> RETURN.
+
+    This is used only to satisfy existential "deep concept" survival laws when
+    the system has composed concepts (depth=1) but no nested hierarchy (depth>=2).
+    """
+    inner_id = str(inner_concept_id or "")
+    if not inner_id:
+        raise ValueError("missing_inner_concept_id")
+    inner = store_base.get_concept_act(inner_id)
+    if inner is None:
+        raise ValueError(f"inner_concept_not_found:{inner_id}")
+    inner_match: Dict[str, Any] = {}
+    try:
+        if isinstance(getattr(inner, "match", None), dict):
+            inner_match = dict(inner.match or {})
+    except Exception:
+        inner_match = {}
+    ev = inner.evidence if isinstance(inner.evidence, dict) else {}
+    iface = ev.get("interface") if isinstance(ev.get("interface"), dict) else {}
+    iface = iface if isinstance(iface, dict) else {}
+    in_schema = iface.get("input_schema") if isinstance(iface.get("input_schema"), dict) else {}
+    out_schema = iface.get("output_schema") if isinstance(iface.get("output_schema"), dict) else {}
+    validator_id = str(iface.get("validator_id") or "")
+    if not isinstance(in_schema, dict) or not in_schema:
+        raise ValueError("inner_missing_input_schema")
+    if not isinstance(out_schema, dict) or not out_schema:
+        raise ValueError("inner_missing_output_schema")
+    if len(out_schema) != 1:
+        raise ValueError("inner_output_schema_not_singleton")
+    out_key = str(sorted(out_schema.keys(), key=str)[0])
+    if not out_key:
+        raise ValueError("inner_missing_output_key")
+
+    program: List[Instruction] = []
+    input_schema: Dict[str, str] = {str(k): str(v) for k, v in in_schema.items() if str(k)}
+    output_schema: Dict[str, str] = {str(out_key): str(out_schema.get(out_key) or "str")}
+    for name in sorted(input_schema.keys(), key=str):
+        program.append(Instruction("CSV_GET_INPUT", {"name": str(name), "out": str(name)}))
+    bind = {str(k): str(k) for k in sorted(input_schema.keys(), key=str)}
+    program.append(
+        Instruction("CSV_CALL", {"concept_id": str(inner_id), "bind": dict(bind), "out": str(out_key)})
+    )
+    program.append(Instruction("CSV_RETURN", {"var": str(out_key)}))
+
+    interface = {"input_schema": dict(input_schema), "output_schema": dict(output_schema), "validator_id": str(validator_id)}
+    act_id_sig = _stable_hash_obj(
+        {
+            "schema_version": 1,
+            "induced_kind": "deep_wrapper_v74",
+            "inner_concept_id": str(inner_id),
+            "interface": interface,
+            "program": [ins.to_dict() for ins in program],
+        }
+    )
+    act_id = f"concept_v74_deepwrap_{act_id_sig}"
+
+    overhead_bits0 = int(overhead_bits)
+    if overhead_bits0 < 0:
+        overhead_bits0 = 0
+    act = Act(
+        id=str(act_id),
+        version=1,
+        created_at=deterministic_iso(step=int(seed_step)),
+        kind="concept_csv",
+        match=dict(inner_match),
+        program=list(program),
+        evidence={
+            "interface": dict(interface),
+            "meta": {"birth_tags": ["plan"]},
+            "induced_v74_deepwrap": {
+                "schema_version": 1,
+                "method": "deep_wrapper_v74",
+                "inner_concept_id": str(inner_id),
+                "overhead_bits": int(overhead_bits0),
+            },
+        },
+        cost={"overhead_bits": int(overhead_bits0)},
+        deps=[str(inner_id)],
+        active=True,
+    )
+    try:
+        from .csg_v87 import canonicalize_csg_v87, csg_hash_v87  # local import
+
+        csg_nodes: List[Dict[str, Any]] = []
+        for ins in program:
+            if not isinstance(ins, Instruction) or str(ins.op) != "CSV_CALL":
+                continue
+            args = ins.args if isinstance(ins.args, dict) else {}
+            csg_nodes.append(
+                {
+                    "act_id": str(args.get("concept_id") or ""),
+                    "bind": dict(args.get("bind") if isinstance(args.get("bind"), dict) else {}),
+                    "produces": str(args.get("out") or ""),
+                    "role": "call",
+                }
+            )
+        csg = canonicalize_csg_v87(
+            {
+                "schema_version": 1,
+                "nodes": list(csg_nodes),
+                "interface": {
+                    "inputs": sorted([str(k) for k in input_schema.keys() if str(k)], key=str),
+                    "outputs": [str(out_key)],
+                    "validator_ids": [str(validator_id)] if str(validator_id) else [],
+                    "match": dict(inner_match),
+                },
+            }
+        )
+        ev2 = act.evidence if isinstance(act.evidence, dict) else {}
+        ev2 = dict(ev2)
+        ev2["csg_v87"] = dict(csg)
+        meta2 = ev2.get("meta") if isinstance(ev2.get("meta"), dict) else {}
+        meta2 = dict(meta2)
+        meta2["csg_v87_hash"] = str(csg_hash_v87(dict(csg)))
+        meta2["csg_v87_nodes"] = int(len(csg.get("nodes") or [])) if isinstance(csg.get("nodes"), list) else 0
+        meta2["csg_v87_edges"] = int(len(csg.get("edges") or [])) if isinstance(csg.get("edges"), list) else 0
+        ev2["meta"] = dict(meta2)
+        act.evidence = dict(ev2)
+    except Exception:
+        pass
+    debug = {"inner_concept_id": str(inner_id), "output_key": str(out_key), "validator_id": str(validator_id)}
     return act, debug
 
 
@@ -362,4 +586,3 @@ def mutate_bindings_plus1_numeric(
 
     b[k0] = v0 + "1"
     return dict(b)
-

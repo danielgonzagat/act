@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -138,7 +139,7 @@ def _parse_task_json_v141(*, path: Path, task_id: str) -> ArcTaskV141:
 
 
 def write_arc_canonical_jsonl_v141(
-    *, arc_root: str, split: Optional[str], limit: int, out_jsonl: Path, out_manifest: Path
+    *, arc_root: str, split: Optional[str], limit: int, seed: Optional[int], out_jsonl: Path, out_manifest: Path
 ) -> Dict[str, Any]:
     tasks_root = _resolve_arc_tasks_root_v141(arc_root=str(arc_root), split=split)
     if out_jsonl.exists():
@@ -148,8 +149,14 @@ def write_arc_canonical_jsonl_v141(
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     out_manifest.parent.mkdir(parents=True, exist_ok=True)
 
-    task_paths = sorted(tasks_root.rglob("*.json"), key=lambda p: str(p.relative_to(tasks_root)))
+    task_paths_all = sorted(tasks_root.rglob("*.json"), key=lambda p: str(p.relative_to(tasks_root)))
+    task_paths = list(task_paths_all)
+    selection_mode = "sorted"
     if int(limit) > 0:
+        if seed is not None:
+            selection_mode = "shuffled"
+            rng = random.Random(int(seed))
+            rng.shuffle(task_paths)
         task_paths = task_paths[: int(limit)]
 
     inputs: List[Dict[str, Any]] = []
@@ -172,6 +179,8 @@ def write_arc_canonical_jsonl_v141(
         "tasks_root": str(tasks_root),
         "split": str(split or ""),
         "limit": int(limit),
+        "seed": (int(seed) if seed is not None else None),
+        "selection_mode": str(selection_mode),
         "inputs": inputs,
         "canonical_jsonl_sha256": _sha256_file(out_jsonl),
     }
@@ -200,4 +209,3 @@ def iter_canonical_tasks_v141(jsonl_path: str) -> Iterator[ArcTaskV141]:
                 out = _parse_grid_v141(out_obj) if out_obj is not None else None
                 test_pairs.append((inp, out))
             yield ArcTaskV141(task_id=str(obj.get("task_id")), train_pairs=tuple(train_pairs), test_pairs=tuple(test_pairs))
-

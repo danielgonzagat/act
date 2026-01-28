@@ -14,6 +14,7 @@ from .atolang import AtoLangVM, Candidate
 from .concepts import PRIMITIVE_OPS
 from .ethics import EthicsVerdict, fail_closed_text, validate_before_execute
 from .metrics import detokenize, is_space, tokenize_text
+from .semantic_ids import plan_id_for_expected_spec_sig
 from .suite import (
     compile_dialogue_v67,
     last_user_text_from_prompt,
@@ -67,6 +68,94 @@ class EngineConfig:
     use_gate_table_act: bool = False
     # If set, load exactly this gate-table ACT id (default OFF).
     gate_table_act_id: Optional[str] = None
+    # --- Decoder fluency projection (CPU-only; deterministic; audit-friendly) ---
+    # Override decoder-level no-repeat n-gram length (0 disables).
+    decoder_fluency_no_repeat_ngram: int = 3
+    # When True (and not in strict-format turns), seed the no-repeat n-gram set with
+    # prompt n-grams to reduce prompt-echo / scaffold loops.
+    decoder_fluency_prompt_ngram_block: bool = False
+    # When >0, use this stricter EOS delay (min new tokens) for freeform turns only.
+    decoder_fluency_min_new_tokens_before_eos_freeform: int = 0
+    # Optional token-level block regex applied in freeform turns (soft penalty).
+    # Example: r\"</?DOC>\" to avoid dataset markup leakage in assistant surface text.
+    decoder_fluency_block_token_regex: str = ""
+    decoder_fluency_block_penalty: float = 1e6
+    # --- Dialogue state / long-dialogue coherence (explicit; CPU-only; deterministic) ---
+    # When enabled, the engine maintains a bounded per-dialogue turn log and extracted
+    # facts inside `memory_facts` (fact_memory_v0). This is explicit state (audit-friendly)
+    # and allows long dialogues even when prompts are truncated.
+    dialogue_state_enabled: bool = False
+    # Keep at most this many turns (by index) per dialogue in the fact table.
+    dialogue_state_tail_k: int = 64
+    # When enabled, prepend a deterministic memory prefix when the prompt is short
+    # (e.g., evaluation harness truncates history).
+    dialogue_state_prefix_enabled: bool = False
+    # Only prepend a memory prefix when the prompt has <= this many user turns.
+    dialogue_state_prefix_prompt_turns_leq: int = 4
+    # Max number of missing turns to render into the prefix (includes turn 0 when present).
+    dialogue_state_prefix_max_missing_turns: int = 8
+    # Hard cap on prefix size (characters).
+    dialogue_state_prefix_max_chars: int = 2000
+    # Extract a few stable conversation facts from user turns (name/topic/password-ish).
+    dialogue_state_fact_extract_enabled: bool = True
+    # Limit number of facts rendered in prefix.
+    dialogue_state_fact_max: int = 16
+
+
+_PROMPT_TURN_PAIR_RE = re.compile(r"(?:^|\n)User:\s*([^\n]*)\nSystem:", flags=re.UNICODE)
+
+
+def _count_prompt_turn_pairs(prompt: str) -> int:
+    try:
+        return int(len(_PROMPT_TURN_PAIR_RE.findall(str(prompt or ""))))
+    except Exception:
+        return 0
+
+
+_DIALOGUE_FACT_PATTERNS_V1: List[Tuple[str, re.Pattern[str]]] = [
+    # user_name
+    ("user_name", re.compile(r"(?i)\bmeu\s+nome\s+(?:é|eh)\s+([^\n\r\.,;:!?()\[\]{}]{1,64})")),
+    ("user_name", re.compile(r"(?i)\bmy\s+name\s+is\s+([^\n\r\.,;:!?()\[\]{}]{1,64})")),
+    # topic
+    (
+        "topic",
+        re.compile(
+            r"(?i)\b(?:vamos\s+conversar\s+sobre|vamos\s+falar\s+sobre)\s+([^\n\r\.,;:!?()\[\]{}]{1,128})"
+        ),
+    ),
+    (
+        "topic",
+        re.compile(
+            r"(?i)\b(?:let's\s+talk\s+about|we\s+are\s+talking\s+about)\s+([^\n\r\.,;:!?()\[\]{}]{1,128})"
+        ),
+    ),
+    # password-ish (closed-world; deterministic)
+    ("password", re.compile(r"(?i)\b(?:a\s+senha\s+é|senha\s+é)\s+([A-Z0-9_-]{2,32})\b")),
+    ("password", re.compile(r"(?i)\bthe\s+password\s+is\s+([A-Z0-9_-]{2,32})\b")),
+]
+
+
+def _strip_fact_value_v1(v: str) -> str:
+    s = str(v or "").strip()
+    s = s.strip("“”").strip("\"'").strip("`").strip()
+    s = s.strip().strip(".,;:!?()[]{}").strip()
+    return s
+
+
+def _extract_dialogue_facts_v1(user_text: str) -> Dict[str, str]:
+    u = str(user_text or "").strip()
+    if not u:
+        return {}
+    facts: Dict[str, str] = {}
+    for name, pat in _DIALOGUE_FACT_PATTERNS_V1:
+        m = pat.search(u)
+        if not m:
+            continue
+        val = _strip_fact_value_v1(m.group(1))
+        if not val:
+            continue
+        facts[str(name)] = str(val)
+    return facts
 
 
 class Engine:
@@ -93,6 +182,339 @@ class Engine:
         self._gate_table_ctxsig_table: Optional[Dict[str, List[str]]] = None
         self._gate_table_act_status: Dict[str, Any] = {}
         self.rebuild_cache()
+
+    def _fact_memory_table(self) -> Optional[Dict[str, Any]]:
+        act = self._fact_memory
+        if act is None:
+            return None
+        ev = act.evidence
+        if not isinstance(ev, dict) or not bool(ev.get("enabled", True)):
+            return None
+        table = ev.setdefault("table", {})
+        if not isinstance(table, dict):
+            table = {}
+            ev["table"] = table
+        return table
+
+    def _fact_get(self, key: str) -> Optional[str]:
+        table = self._fact_memory_table()
+        if table is None:
+            return None
+        entry = table.get(str(key))
+        if not isinstance(entry, dict):
+            return None
+        val = str(entry.get("value", ""))
+        return val if val else None
+
+    def _fact_set(
+        self,
+        key: str,
+        value: str,
+        *,
+        dialogue_id: int = 0,
+        turn: int = 0,
+        mode: str = "",
+    ) -> bool:
+        table = self._fact_memory_table()
+        if table is None:
+            return False
+        k = str(key)
+        entry = table.get(k)
+        if entry is None or not isinstance(entry, dict):
+            entry = {
+                "value": str(value),
+                "confidence": 0.5,
+                "evidence_turns": [],
+                "last_seen_step": 0,
+                "count": 0,
+            }
+            table[k] = entry
+        prev = str(entry.get("value", ""))
+        if prev and prev != str(value):
+            entry["confidence"] = min(1.0, float(entry.get("confidence", 0.0)) + 0.01)
+        entry["value"] = str(value)
+        entry["count"] = int(entry.get("count", 0)) + 1
+        cnt = int(entry["count"])
+        entry["confidence"] = float(1.0 - (0.5**cnt))
+        entry["last_seen_step"] = 0
+        ev_turns = entry.get("evidence_turns")
+        if not isinstance(ev_turns, list):
+            ev_turns = []
+            entry["evidence_turns"] = ev_turns
+        ev_turns.append({"dialogue_id": int(dialogue_id), "turn": int(turn), "mode": str(mode or "")})
+        while len(ev_turns) > 8:
+            ev_turns.pop(0)
+        return True
+
+    def _fact_del(self, key: str) -> bool:
+        table = self._fact_memory_table()
+        if table is None:
+            return False
+        k = str(key)
+        if k in table:
+            try:
+                del table[k]
+            except Exception:
+                table.pop(k, None)
+            return True
+        return False
+
+    def _dialogue_key(self, dialogue_id: int, *parts: str) -> str:
+        suffix = ":".join(str(p) for p in parts if p is not None and str(p) != "")
+        if suffix:
+            return f"dialogue:{int(dialogue_id)}:{suffix}"
+        return f"dialogue:{int(dialogue_id)}"
+
+    def _dialogue_clear_state(self, *, dialogue_id: int) -> None:
+        did = int(dialogue_id)
+        tail_key = self._dialogue_key(did, "turn_tail")
+        facts_key = self._dialogue_key(did, "facts")
+        tail_raw = self._fact_get(tail_key)
+        turns: List[int] = []
+        if tail_raw:
+            try:
+                parsed = json.loads(str(tail_raw))
+                if isinstance(parsed, list):
+                    for x in parsed:
+                        try:
+                            turns.append(int(x))
+                        except Exception:
+                            pass
+            except Exception:
+                turns = []
+        for t in turns:
+            self._fact_del(self._dialogue_key(did, "turn", str(int(t)), "user"))
+            self._fact_del(self._dialogue_key(did, "turn", str(int(t)), "assistant"))
+        self._fact_del(tail_key)
+
+        facts_raw = self._fact_get(facts_key)
+        names: List[str] = []
+        if facts_raw:
+            try:
+                parsed = json.loads(str(facts_raw))
+                if isinstance(parsed, list):
+                    for x in parsed:
+                        xs = str(x or "")
+                        if xs:
+                            names.append(xs)
+            except Exception:
+                names = []
+        for name in names:
+            self._fact_del(self._dialogue_key(did, "fact", str(name)))
+        self._fact_del(facts_key)
+
+    def _dialogue_prefix(
+        self,
+        *,
+        dialogue_id: int,
+        turn: int,
+        prompt_turns: int,
+        strict_turn: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        cfg = self.config
+        did = int(dialogue_id)
+        trn = int(turn)
+
+        if not bool(getattr(cfg, "dialogue_state_enabled", False)):
+            return "", {"enabled": False, "reason": "disabled"}
+        if not bool(getattr(cfg, "dialogue_state_prefix_enabled", False)):
+            return "", {"enabled": True, "reason": "prefix_disabled"}
+        try:
+            leq = int(getattr(cfg, "dialogue_state_prefix_prompt_turns_leq", 0) or 0)
+        except Exception:
+            leq = 0
+        if leq > 0 and int(prompt_turns) > int(leq):
+            return "", {"enabled": True, "reason": "prompt_long", "prompt_turns": int(prompt_turns)}
+        if trn <= 0:
+            return "", {"enabled": True, "reason": "first_turn"}
+
+        missing_upto = max(0, (int(trn) + 1) - int(prompt_turns))
+        if missing_upto <= 0:
+            return "", {"enabled": True, "reason": "no_missing_turns", "prompt_turns": int(prompt_turns)}
+
+        try:
+            max_missing = int(getattr(cfg, "dialogue_state_prefix_max_missing_turns", 0) or 0)
+        except Exception:
+            max_missing = 0
+        if max_missing <= 0:
+            max_missing = 8
+
+        missing_end = missing_upto - 1
+        want: List[int] = []
+        if missing_end >= 0:
+            want.append(0)
+            recent_k = max(0, int(max_missing) - 1)
+            start = max(1, missing_upto - max(1, recent_k))
+            for t in range(start, missing_upto):
+                want.append(int(t))
+        want = sorted(set([t for t in want if 0 <= t <= missing_end]))
+
+        # Facts (names are stored as a list for bounded deterministic rendering).
+        fact_lines: List[str] = []
+        if bool(getattr(cfg, "dialogue_state_fact_extract_enabled", True)):
+            facts_key = self._dialogue_key(did, "facts")
+            facts_raw = self._fact_get(facts_key)
+            names: List[str] = []
+            if facts_raw:
+                try:
+                    parsed = json.loads(str(facts_raw))
+                    if isinstance(parsed, list):
+                        for x in parsed:
+                            xs = str(x or "")
+                            if xs:
+                                names.append(xs)
+                except Exception:
+                    names = []
+            names = sorted(set(names), key=str)
+            try:
+                fact_max = int(getattr(cfg, "dialogue_state_fact_max", 0) or 0)
+            except Exception:
+                fact_max = 0
+            if fact_max <= 0:
+                fact_max = 16
+            names = names[: int(fact_max)]
+            for name in names:
+                val = self._fact_get(self._dialogue_key(did, "fact", str(name)))
+                if val:
+                    fact_lines.append(f"{name}={val}")
+
+        turn_lines: List[str] = []
+        for t in want:
+            u = self._fact_get(self._dialogue_key(did, "turn", str(int(t)), "user")) or ""
+            s = self._fact_get(self._dialogue_key(did, "turn", str(int(t)), "assistant")) or ""
+            u = str(u).strip()
+            s = str(s).strip()
+            if not u and not s:
+                continue
+            turn_lines.append(f"User: {u}\nSystem: {s}")
+
+        parts: List[str] = []
+        if fact_lines:
+            parts.append("[MEMORY_FACTS] " + "; ".join(fact_lines))
+        if turn_lines:
+            parts.append("[MEMORY_TURNS]\n" + "\n".join(turn_lines).rstrip() + "\n[/MEMORY_TURNS]")
+        prefix = "\n".join(parts).strip()
+        if prefix:
+            prefix = prefix + "\n"
+
+        try:
+            max_chars = int(getattr(cfg, "dialogue_state_prefix_max_chars", 0) or 0)
+        except Exception:
+            max_chars = 0
+        if max_chars > 0 and len(prefix) > int(max_chars):
+            prefix = prefix[: int(max_chars) - 1] + "\n"
+
+        return prefix, {
+            "enabled": True,
+            "used": bool(prefix),
+            "prompt_turns": int(prompt_turns),
+            "missing_upto": int(missing_upto),
+            "missing_rendered": int(len(turn_lines)),
+            "facts_rendered": int(len(fact_lines)),
+        }
+
+    def _dialogue_update_state(
+        self,
+        *,
+        dialogue_id: int,
+        turn: int,
+        user_text: str,
+        assistant_text: str,
+        mode: str,
+    ) -> None:
+        cfg = self.config
+        if not bool(getattr(cfg, "dialogue_state_enabled", False)):
+            return
+        did = int(dialogue_id)
+        trn = int(turn)
+
+        self._fact_set(
+            self._dialogue_key(did, "turn", str(trn), "user"),
+            str(user_text or "").strip(),
+            dialogue_id=did,
+            turn=trn,
+            mode=str(mode or ""),
+        )
+        self._fact_set(
+            self._dialogue_key(did, "turn", str(trn), "assistant"),
+            str(assistant_text or "").strip(),
+            dialogue_id=did,
+            turn=trn,
+            mode=str(mode or ""),
+        )
+
+        # Tail list (ordered unique).
+        tail_key = self._dialogue_key(did, "turn_tail")
+        tail_raw = self._fact_get(tail_key)
+        tail: List[int] = []
+        if tail_raw:
+            try:
+                parsed = json.loads(str(tail_raw))
+                if isinstance(parsed, list):
+                    for x in parsed:
+                        try:
+                            tail.append(int(x))
+                        except Exception:
+                            pass
+            except Exception:
+                tail = []
+        if not tail or tail[-1] != trn:
+            tail.append(int(trn))
+        seen: set = set()
+        dedup: List[int] = []
+        for x in tail:
+            if x in seen:
+                continue
+            seen.add(x)
+            dedup.append(int(x))
+        tail = dedup
+
+        try:
+            tail_k = int(getattr(cfg, "dialogue_state_tail_k", 0) or 0)
+        except Exception:
+            tail_k = 0
+        if tail_k <= 0:
+            tail_k = 64
+        if len(tail) > int(tail_k):
+            dropped = tail[: -int(tail_k)]
+            tail = tail[-int(tail_k) :]
+            for t in dropped:
+                self._fact_del(self._dialogue_key(did, "turn", str(int(t)), "user"))
+                self._fact_del(self._dialogue_key(did, "turn", str(int(t)), "assistant"))
+
+        self._fact_set(tail_key, canonical_json_dumps(tail), dialogue_id=did, turn=trn, mode=str(mode or ""))
+
+        if bool(getattr(cfg, "dialogue_state_fact_extract_enabled", True)):
+            facts = _extract_dialogue_facts_v1(str(user_text or ""))
+            if facts:
+                facts_key = self._dialogue_key(did, "facts")
+                names_raw = self._fact_get(facts_key)
+                names: List[str] = []
+                if names_raw:
+                    try:
+                        parsed = json.loads(str(names_raw))
+                        if isinstance(parsed, list):
+                            for x in parsed:
+                                xs = str(x or "")
+                                if xs:
+                                    names.append(xs)
+                    except Exception:
+                        names = []
+                for k, v in facts.items():
+                    name = str(k)
+                    val = str(v)
+                    if not name or not val:
+                        continue
+                    self._fact_set(
+                        self._dialogue_key(did, "fact", name),
+                        val,
+                        dialogue_id=did,
+                        turn=trn,
+                        mode=str(mode or ""),
+                    )
+                    names.append(name)
+                names = sorted(set(names), key=str)
+                self._fact_set(facts_key, canonical_json_dumps(names), dialogue_id=did, turn=trn, mode=str(mode or ""))
 
     def rebuild_cache(self) -> None:
         self._tables.clear()
@@ -612,6 +1034,81 @@ class Engine:
         turn: Optional[int] = None,
         plan_trace: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        plan_trace_view = plan_trace if isinstance(plan_trace, dict) else None
+
+        def _is_strict_turn(pt: Optional[Dict[str, Any]]) -> bool:
+            if not isinstance(pt, dict) or not pt:
+                return False
+            # Prefer explicit constraints; fall back to validator_id.
+            cons = pt.get("constraints")
+            constraints: List[str] = []
+            if isinstance(cons, list):
+                constraints = [str(x) for x in cons if isinstance(x, str)]
+            if "no_extra_tokens" in set(constraints):
+                return True
+            vid = str(pt.get("validator_id") or "")
+            if vid in {
+                "exact_match",
+                "int_exact",
+                "json_parse_keys",
+                "regex_fullmatch",
+                "contains_exact_token",
+                "plan_validator",
+                "state_validator",
+            }:
+                return True
+            return False
+
+        strict_turn = _is_strict_turn(plan_trace_view)
+
+        did = int(dialogue_id or 0)
+        trn = int(turn or 0)
+
+        # Dialogue state: clear per-dialogue state when a new dialogue starts (turn 0).
+        if (
+            bool(getattr(self.config, "dialogue_state_enabled", False))
+            and dialogue_id is not None
+            and turn is not None
+            and int(trn) == 0
+        ):
+            try:
+                self._dialogue_clear_state(dialogue_id=int(did))
+            except Exception:
+                pass
+
+        prompt_turns_raw = _count_prompt_turn_pairs(prompt)
+        prompt_turns = int(prompt_turns_raw)
+        # When the harness truncates prompt history, it can pass an explicit window size via plan_trace.
+        # This avoids miscounting turns when the model emits "User:/System:" strings in prior replies.
+        prompt_history_k = 0
+        if isinstance(plan_trace_view, dict):
+            try:
+                prompt_history_k = int(plan_trace_view.get("prompt_history_k", 0) or 0)
+            except Exception:
+                prompt_history_k = 0
+        if int(prompt_history_k) > 0:
+            prompt_turns = min(int(prompt_history_k), int(trn) + 1)
+
+        dialogue_state_meta: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "dialogue_state_enabled", False)),
+            "prompt_turns_raw": int(prompt_turns_raw),
+            "prompt_turns_used": int(prompt_turns),
+            "prompt_history_k": int(prompt_history_k),
+        }
+        if bool(getattr(self.config, "dialogue_state_enabled", False)) and dialogue_id is not None and turn is not None:
+            try:
+                prefix, meta = self._dialogue_prefix(
+                    dialogue_id=int(did),
+                    turn=int(trn),
+                    prompt_turns=int(prompt_turns),
+                    strict_turn=bool(strict_turn),
+                )
+                dialogue_state_meta = dict(meta) if isinstance(meta, dict) else dict(dialogue_state_meta)
+                if prefix:
+                    prompt = str(prefix) + str(prompt)
+            except Exception:
+                dialogue_state_meta = {"enabled": True, "used": False, "reason": "prefix_error"}
+
         prompt_tokens = tokenize_text(prompt)
         context: List[str] = ["<BOS>"] * (self.config.max_order - 1)
         for t in prompt_tokens[-(self.config.max_order - 1) :]:
@@ -906,17 +1403,7 @@ class Engine:
             return str(s).strip().strip(".,;:!?()[]{}").strip()
 
         def _mem_table() -> Optional[Dict[str, Any]]:
-            act = self._fact_memory
-            if act is None:
-                return None
-            ev = act.evidence
-            if not isinstance(ev, dict) or not bool(ev.get("enabled", True)):
-                return None
-            table = ev.setdefault("table", {})
-            if not isinstance(table, dict):
-                table = {}
-                ev["table"] = table
-            return table
+            return self._fact_memory_table()
 
         def _mem_key(kind: str, *parts: str) -> str:
             suffix = ":".join(str(p) for p in parts if p is not None and str(p) != "")
@@ -925,45 +1412,16 @@ class Engine:
             return f"contract:{kind}:{did}"
 
         def _mem_set(key: str, value: str) -> bool:
-            table = _mem_table()
-            if table is None:
-                return False
-            entry = table.get(key)
-            if entry is None or not isinstance(entry, dict):
-                entry = {
-                    "value": str(value),
-                    "confidence": 0.5,
-                    "evidence_turns": [],
-                    "last_seen_step": 0,
-                    "count": 0,
-                }
-                table[key] = entry
-            prev = str(entry.get("value", ""))
-            if prev and prev != str(value):
-                entry["confidence"] = min(1.0, float(entry.get("confidence", 0.0)) + 0.01)
-            entry["value"] = str(value)
-            entry["count"] = int(entry.get("count", 0)) + 1
-            cnt = int(entry["count"])
-            entry["confidence"] = float(1.0 - (0.5**cnt))
-            entry["last_seen_step"] = 0
-            ev_turns = entry.get("evidence_turns")
-            if not isinstance(ev_turns, list):
-                ev_turns = []
-                entry["evidence_turns"] = ev_turns
-            ev_turns.append({"dialogue_id": int(did), "turn": int(trn), "mode": str(mode_state)})
-            while len(ev_turns) > 8:
-                ev_turns.pop(0)
-            return True
+            return self._fact_set(
+                str(key),
+                str(value),
+                dialogue_id=int(did),
+                turn=int(trn),
+                mode=str(mode_state),
+            )
 
         def _mem_get(key: str) -> Optional[str]:
-            table = _mem_table()
-            if table is None:
-                return None
-            entry = table.get(key)
-            if not isinstance(entry, dict):
-                return None
-            val = str(entry.get("value", ""))
-            return val if val else None
+            return self._fact_get(str(key))
 
         if bool(self.config.enable_contracts):
             act = self._instruction_contract
@@ -1282,6 +1740,549 @@ class Engine:
 
         contract_active = bool(contract_tokens)
 
+        # Concept-as-policy (SELECT_CONCEPT_AS_POLICY): if enabled for this turn, the engine must not
+        # fall back to global token generation when no concept can be selected/executed.
+        concept_policy_required = False
+        try:
+            if isinstance(plan_trace_view, dict):
+                cons0 = plan_trace_view.get("constraints")
+                constraints0: List[str] = []
+                if isinstance(cons0, list):
+                    constraints0 = [str(x) for x in cons0 if isinstance(x, str)]
+                wants_plan0 = bool(
+                    str(plan_trace_view.get("validator_id") or "") == "plan_validator"
+                    or str(plan_trace_view.get("expected_format") or "") == "plan"
+                    or ("plan_validator" in set(constraints0))
+                )
+                concept_policy_required = bool(plan_trace_view.get("concept_policy_required", False) or wants_plan0)
+        except Exception:
+            concept_policy_required = False
+
+        # Concept executor (INDUCE_CONCEPT usage): when the evaluation harness provides a structured
+        # expected spec (plan_validator) OR an explicit concept_expected_spec (generic), try to solve
+        # by executing a matching concept_csv ACT (no hidden solver).
+        concept_tokens: List[str] = []
+        concept_pos = 0
+        concept_act_id: Optional[str] = None
+        concept_meta: Dict[str, Any] = {"enabled": False}
+        try:
+            if isinstance(plan_trace, dict):
+                expected_spec = plan_trace.get("expected_spec")
+                wants_plan = bool(
+                    str(plan_trace.get("validator_id") or "") == "plan_validator"
+                    or str(plan_trace.get("expected_format") or "") == "plan"
+                    or ("plan_validator" in (plan_trace.get("constraints") or []))
+                )
+
+                # Generic concept executor (for non-plan tasks): deterministic spec with
+                # {inputs, input_keys, expected_for_validator}.
+                concept_expected_spec = plan_trace.get("concept_expected_spec")
+                concept_validator_id = str(plan_trace.get("concept_validator_id") or "")
+                # Auto concept executor for instruction-like tasks (no expected_spec provided):
+                # if we can infer a deterministic instruction-following spec from the current user text,
+                # run a concept_csv act instead of relying on raw token generation.
+                if (
+                    (not wants_plan)
+                    and (not isinstance(concept_expected_spec, dict) or not concept_expected_spec)
+                    and (not concept_validator_id)
+                ):
+                    # Use the explicit, auditable primitive instruction solver (concept_csv op).
+                    # If it can deterministically solve the current prompt, run a concept_csv act
+                    # instead of relying on raw token generation.
+                    try:
+                        spec_fn = PRIMITIVE_OPS.get("instruction_solve_v1")
+                        solver = spec_fn[1] if isinstance(spec_fn, tuple) and len(spec_fn) == 2 else None
+                    except Exception:
+                        solver = None
+                    if solver is not None:
+                        try:
+                            out_text = str(solver(str(prompt)))
+                        except Exception:
+                            out_text = ""
+                        out_text = out_text.strip()
+                        if out_text:
+                            concept_expected_spec = {
+                                "inputs": {"text": str(prompt)},
+                                "input_keys": ["text"],
+                                "expected_for_validator": {
+                                    "kind": "exact",
+                                    "text": str(out_text),
+                                    "collapse_ws": True,
+                                    "case_sensitive": True,
+                                    "strip_edge_punct": False,
+                                },
+                            }
+                            concept_validator_id = "instruction_following_validator"
+
+                # Determine the expected+interface for concept execution.
+                want_validator_id = ""
+                expected_for_validator: Any = None
+                inputs: Any = None
+                input_keys: Any = None
+                want_output_key = ""
+                if wants_plan and isinstance(expected_spec, dict) and expected_spec:
+                    want_validator_id = "plan_validator"
+                    expected_for_validator = dict(expected_spec)
+                    inputs = expected_spec.get("inputs")
+                    input_keys = expected_spec.get("input_keys")
+                    want_output_key = str(expected_spec.get("return_var") or "")
+                elif isinstance(concept_expected_spec, dict) and concept_expected_spec and concept_validator_id:
+                    want_validator_id = str(concept_validator_id)
+                    expected_for_validator = concept_expected_spec.get("expected_for_validator")
+                    if expected_for_validator is None:
+                        expected_for_validator = concept_expected_spec.get("expected")
+                    if expected_for_validator is None:
+                        expected_for_validator = concept_expected_spec.get("expected_text")
+                    inputs = concept_expected_spec.get("inputs")
+                    input_keys = concept_expected_spec.get("input_keys")
+
+                if want_validator_id and isinstance(inputs, dict) and isinstance(input_keys, list) and input_keys:
+                    concept_meta = {
+                        "enabled": True,
+                        "required": True,
+                        "used": False,
+                        "ok": False,
+                        "reason": "",
+                        "concept_id": None,
+                        "concept_calls_total": 0,
+                        "concept_calls_max_depth": 0,
+                    }
+                    # Semantic objects as observability (IAC): goal+plan are explicit internal objects.
+                    # This does not mutate state; training/ICS can enforce these as survival law.
+                    if bool(wants_plan):
+                        goal_id = str(plan_trace.get("goal_id") or "")
+                        exp_sig = str(plan_trace.get("expected_spec_sig") or "")
+                        plan_id = plan_id_for_expected_spec_sig(exp_sig)
+                        goal_ok = False
+                        plan_ok = False
+                        try:
+                            g = self.store.get(goal_id) if goal_id else None
+                            goal_ok = bool(
+                                g is not None
+                                and bool(getattr(g, "active", True))
+                                and str(getattr(g, "kind", "")) == "goal"
+                            )
+                        except Exception:
+                            goal_ok = False
+                        try:
+                            p = self.store.get(plan_id) if plan_id else None
+                            plan_ok = bool(
+                                p is not None
+                                and bool(getattr(p, "active", True))
+                                and str(getattr(p, "kind", "")) == "plan"
+                            )
+                        except Exception:
+                            plan_ok = False
+                        concept_meta["iac"] = {
+                            "goal_id": str(goal_id),
+                            "plan_id": str(plan_id),
+                            "goal_ok": bool(goal_ok),
+                            "plan_ok": bool(plan_ok),
+                        }
+                    want_schema: Dict[str, str] = {}
+                    for k in list(input_keys):
+                        ks = str(k or "")
+                        if not ks:
+                            continue
+                        v = inputs.get(ks)
+                        if isinstance(v, bool):
+                            want_t = "int"
+                        elif isinstance(v, int):
+                            want_t = "int"
+                        else:
+                            want_t = "str"
+                        want_schema[ks] = str(want_t)
+
+                    try:
+                        min_depth = int(plan_trace.get("concept_min_depth", 0) or 0)
+                    except Exception:
+                        min_depth = 0
+                    if min_depth < 0:
+                        min_depth = 0
+                    try:
+                        csg_req_nodes = int(plan_trace.get("concept_csg_min_nodes", 0) or 0)
+                    except Exception:
+                        csg_req_nodes = 0
+                    try:
+                        csg_req_edges = int(plan_trace.get("concept_csg_min_edges", 0) or 0)
+                    except Exception:
+                        csg_req_edges = 0
+                    csg_req_nodes = max(0, int(csg_req_nodes))
+                    csg_req_edges = max(0, int(csg_req_edges))
+                    fam_id = ""
+                    try:
+                        fam_id = str(plan_trace.get("family_id") or "")
+                    except Exception:
+                        fam_id = ""
+
+                    cands: List[Act] = []
+                    cand_out_match: Dict[str, int] = {}
+                    cand_life_rank: Dict[str, int] = {}
+                    cand_csg_nodes: Dict[str, int] = {}
+                    cand_csg_edges: Dict[str, int] = {}
+                    cand_csg_ok: Dict[str, int] = {}
+
+                    def _csg_counts(a0: Act) -> Tuple[int, int]:
+                        # Prefer explicit stored CSG counts; fallback to deriving from the program.
+                        nodes0 = 0
+                        edges0 = 0
+                        try:
+                            ev0 = a0.evidence if isinstance(a0.evidence, dict) else {}
+                            meta0 = ev0.get("meta") if isinstance(ev0.get("meta"), dict) else {}
+                            if isinstance(meta0, dict):
+                                try:
+                                    nodes0 = int(meta0.get("csg_v87_nodes", 0) or 0)
+                                except Exception:
+                                    nodes0 = 0
+                                try:
+                                    edges0 = int(meta0.get("csg_v87_edges", 0) or 0)
+                                except Exception:
+                                    edges0 = 0
+                            csg0 = ev0.get("csg_v87") if isinstance(ev0.get("csg_v87"), dict) else None
+                            if (nodes0 <= 0 and edges0 <= 0) and isinstance(csg0, dict):
+                                nn = csg0.get("nodes") if isinstance(csg0.get("nodes"), list) else []
+                                ee = csg0.get("edges") if isinstance(csg0.get("edges"), list) else []
+                                nodes0 = int(len(nn))
+                                edges0 = int(len(ee))
+                        except Exception:
+                            nodes0 = 0
+                            edges0 = 0
+                        if nodes0 <= 0 and edges0 <= 0:
+                            try:
+                                calls: List[Dict[str, Any]] = []
+                                for ins in list(getattr(a0, "program", []) or []):
+                                    if str(getattr(ins, "op", "")) != "CSV_CALL":
+                                        continue
+                                    args0 = getattr(ins, "args", {}) or {}
+                                    args0 = args0 if isinstance(args0, dict) else {}
+                                    outv = str(args0.get("out") or "")
+                                    bind0 = args0.get("bind") if isinstance(args0.get("bind"), dict) else {}
+                                    calls.append({"out": outv, "bind": dict(bind0)})
+                                nodes0 = int(len(calls))
+                                prod: Dict[str, int] = {}
+                                for i0, c0 in enumerate(calls):
+                                    ov = str(c0.get("out") or "")
+                                    if ov:
+                                        prod[ov] = int(i0)
+                                e_cnt = 0
+                                for j0, c0 in enumerate(calls):
+                                    bind0 = c0.get("bind") if isinstance(c0.get("bind"), dict) else {}
+                                    for v0 in bind0.values():
+                                        vv = str(v0 or "")
+                                        if not vv:
+                                            continue
+                                        i0 = prod.get(vv)
+                                        if i0 is None or int(i0) == int(j0):
+                                            continue
+                                        e_cnt += 1
+                                edges0 = int(e_cnt)
+                            except Exception:
+                                nodes0 = 0
+                                edges0 = 0
+                        return int(max(0, nodes0)), int(max(0, edges0))
+
+                    for a in getattr(self.store, "concept_acts", lambda: [])():
+                        # Optional context-match for concepts (anti-overgeneralization).
+                        if fam_id and isinstance(getattr(a, "match", None), dict):
+                            fams = a.match.get("family_ids")
+                            if isinstance(fams, list) and fams:
+                                allow = {str(x) for x in fams if isinstance(x, str) and str(x)}
+                                if fam_id not in allow:
+                                    continue
+                        ev = a.evidence if isinstance(a.evidence, dict) else {}
+                        iface = ev.get("interface")
+                        if not isinstance(iface, dict):
+                            continue
+                        if str(iface.get("validator_id") or "") != str(want_validator_id):
+                            continue
+                        in_schema = iface.get("input_schema")
+                        out_schema = iface.get("output_schema")
+                        if not isinstance(in_schema, dict):
+                            continue
+                        got_schema = {str(k): str(v) for k, v in in_schema.items() if str(k)}
+                        if got_schema != want_schema:
+                            continue
+                        score_out = 0
+                        if wants_plan and want_output_key and isinstance(out_schema, dict) and out_schema:
+                            if str(want_output_key) in out_schema:
+                                score_out = 2
+                            elif len(out_schema) == 1 and "value" in out_schema:
+                                # Single-slot legacy interface (tests/older concepts): treat as a weak match.
+                                score_out = 1
+                        cand_out_match[str(a.id)] = int(score_out)
+                        # Prefer concepts that survived ICS promotion/quarantine.
+                        life_rank = 0
+                        try:
+                            meta0 = ev.get("meta") if isinstance(ev.get("meta"), dict) else {}
+                            ics0 = meta0.get("ics_v1") if isinstance(meta0.get("ics_v1"), dict) else {}
+                            st0 = str(ics0.get("state") or "")
+                            if st0 == "promoted":
+                                life_rank = 2
+                            elif st0 == "candidate":
+                                life_rank = 1
+                            elif st0 == "quarantined":
+                                life_rank = 0
+                        except Exception:
+                            life_rank = 0
+                        cand_life_rank[str(a.id)] = int(life_rank)
+                        try:
+                            nn0, ee0 = _csg_counts(a)
+                        except Exception:
+                            nn0, ee0 = 0, 0
+                        cand_csg_nodes[str(a.id)] = int(nn0)
+                        cand_csg_edges[str(a.id)] = int(ee0)
+                        cand_csg_ok[str(a.id)] = 1 if (int(nn0) >= int(csg_req_nodes) and int(ee0) >= int(csg_req_edges)) else 0
+                        cands.append(a)
+                    cands.sort(
+                        key=lambda a: (
+                            -int(cand_out_match.get(str(a.id), 0)),
+                            -int(cand_life_rank.get(str(a.id), 0)),
+                            -int(cand_csg_ok.get(str(a.id), 0)),
+                            -int(cand_csg_nodes.get(str(a.id), 0)),
+                            -int(cand_csg_edges.get(str(a.id), 0)),
+                            str(a.id),
+                        )
+                    )
+                    if not cands:
+                        concept_meta["reason"] = "no_matching_concept"
+                    else:
+                        chosen: Optional[Act] = None
+                        if int(min_depth) > 0:
+                            memo_depth: Dict[str, int] = {}
+
+                            def _static_depth(concept_id: str, stack: set) -> int:
+                                cid = str(concept_id or "")
+                                if not cid:
+                                    return 0
+                                if cid in memo_depth:
+                                    return int(memo_depth[cid])
+                                if cid in stack:
+                                    return 0
+                                act = self.store.get_concept_act(cid)
+                                if act is None:
+                                    memo_depth[cid] = 0
+                                    return 0
+                                callees: List[str] = []
+                                for ins in list(getattr(act, "program", []) or []):
+                                    if str(getattr(ins, "op", "")) != "CSV_CALL":
+                                        continue
+                                    args0 = getattr(ins, "args", {}) or {}
+                                    if not isinstance(args0, dict):
+                                        args0 = {}
+                                    callee = str(args0.get("concept_id") or "")
+                                    if callee:
+                                        callees.append(callee)
+                                if not callees:
+                                    d0 = 0
+                                else:
+                                    st2 = set(stack)
+                                    st2.add(cid)
+                                    d0 = 1 + max(_static_depth(c, st2) for c in callees)
+                                memo_depth[cid] = int(d0)
+                                return int(d0)
+
+                            ranked_ok: List[Tuple[int, int, int, int, int, int, int, str, Act]] = []
+                            ranked_depth_ok: List[Tuple[int, int, int, int, int, int, int, str, Act]] = []
+                            ranked_any: List[Tuple[int, int, int, int, int, int, int, str, Act]] = []
+                            for a in cands:
+                                aid = str(a.id)
+                                out_match = int(cand_out_match.get(aid, 0))
+                                d = int(_static_depth(aid, set()))
+                                prog_len = int(len(getattr(a, "program", []) or []))
+                                life = int(cand_life_rank.get(aid, 0))
+                                nn0 = int(cand_csg_nodes.get(aid, 0))
+                                ee0 = int(cand_csg_edges.get(aid, 0))
+                                csg_ok0 = int(cand_csg_ok.get(aid, 0))
+                                tup = (
+                                    int(out_match),
+                                    int(life),
+                                    int(csg_ok0),
+                                    int(d),
+                                    int(nn0),
+                                    int(ee0),
+                                    int(prog_len),
+                                    str(aid),
+                                    a,
+                                )
+                                ranked_any.append(tup)
+                                if int(d) >= int(min_depth):
+                                    ranked_depth_ok.append(tup)
+                                    if int(csg_ok0) > 0:
+                                        ranked_ok.append(tup)
+
+                            def _rk(t: Tuple[int, int, int, int, int, int, int, str, Act]) -> Tuple[Any, ...]:
+                                # Prefer concepts that satisfy the requirement with *minimal excess depth*.
+                                # Depth is a survival constraint, not a score to maximize. This enables
+                                # planning-cost reduction across domains once reusable abstractions exist.
+                                try:
+                                    excess = int(t[3]) - int(min_depth)
+                                except Exception:
+                                    excess = 0
+                                if excess < 0:
+                                    excess = 10**9
+                                return (
+                                    -int(t[0]),  # out_match
+                                    -int(t[1]),  # life
+                                    -int(t[2]),  # csg_ok
+                                    int(excess),  # depth_excess (smaller is better)
+                                    -int(t[4]),  # csg_nodes
+                                    -int(t[5]),  # csg_edges
+                                    int(t[6]),   # prog_len
+                                    str(t[7]),   # act_id
+                                )
+
+                            ranked_ok.sort(key=_rk)
+                            ranked_depth_ok.sort(key=_rk)
+                            ranked_any.sort(key=_rk)
+
+                            concept_meta["selection_min_depth_required"] = int(min_depth)
+                            concept_meta["selection_csg_required_nodes"] = int(csg_req_nodes)
+                            concept_meta["selection_csg_required_edges"] = int(csg_req_edges)
+                            if ranked_ok:
+                                chosen = ranked_ok[0][8]
+                                concept_meta["selection_min_depth_met"] = True
+                                concept_meta["selection_chosen_static_depth"] = int(ranked_ok[0][3])
+                                concept_meta["selection_csg_met"] = True
+                                concept_meta["selection_chosen_csg_nodes"] = int(ranked_ok[0][4])
+                                concept_meta["selection_chosen_csg_edges"] = int(ranked_ok[0][5])
+                            elif ranked_depth_ok:
+                                # Depth is satisfied, but no concept meets the minimum CSG complexity.
+                                chosen = ranked_depth_ok[0][8]
+                                concept_meta["selection_min_depth_met"] = True
+                                concept_meta["selection_chosen_static_depth"] = int(ranked_depth_ok[0][3])
+                                concept_meta["selection_csg_met"] = bool(int(ranked_depth_ok[0][2]) > 0)
+                                concept_meta["selection_chosen_csg_nodes"] = int(ranked_depth_ok[0][4])
+                                concept_meta["selection_chosen_csg_edges"] = int(ranked_depth_ok[0][5])
+                                if (int(csg_req_nodes) > 0 or int(csg_req_edges) > 0) and not bool(
+                                    concept_meta.get("selection_csg_met", False)
+                                ):
+                                    concept_meta["selection_reason"] = "no_matching_concept_csg_min_complexity"
+                            elif ranked_any:
+                                # Fallback: execute the best available candidate even if too shallow,
+                                # so we still get traces and can induce deeper structure.
+                                chosen = ranked_any[0][8]
+                                concept_meta["selection_reason"] = "no_matching_concept_min_depth"
+                                concept_meta["selection_min_depth_met"] = False
+                                concept_meta["selection_chosen_static_depth"] = int(ranked_any[0][3])
+                                concept_meta["selection_csg_met"] = bool(int(ranked_any[0][2]) > 0)
+                                concept_meta["selection_chosen_csg_nodes"] = int(ranked_any[0][4])
+                                concept_meta["selection_chosen_csg_edges"] = int(ranked_any[0][5])
+                            else:
+                                concept_meta["reason"] = "no_matching_concept_min_depth"
+                        else:
+                            chosen = cands[0]
+                            try:
+                                concept_meta["selection_csg_required_nodes"] = int(csg_req_nodes)
+                                concept_meta["selection_csg_required_edges"] = int(csg_req_edges)
+                                aid0 = str(getattr(chosen, "id", "") or "")
+                                concept_meta["selection_csg_met"] = bool(int(cand_csg_ok.get(aid0, 0)) > 0)
+                                concept_meta["selection_chosen_csg_nodes"] = int(cand_csg_nodes.get(aid0, 0))
+                                concept_meta["selection_chosen_csg_edges"] = int(cand_csg_edges.get(aid0, 0))
+                                if (int(csg_req_nodes) > 0 or int(csg_req_edges) > 0) and not bool(
+                                    concept_meta.get("selection_csg_met", False)
+                                ):
+                                    concept_meta["selection_reason"] = "no_matching_concept_csg_min_complexity"
+                            except Exception:
+                                pass
+
+                        if chosen is None:
+                            concept_act_id = None
+                            concept_meta["used"] = False
+                            concept_meta["concept_id"] = None
+                        else:
+                            concept_act_id = str(chosen.id)
+                            concept_meta["used"] = True
+                            concept_meta["concept_id"] = str(concept_act_id)
+                            try:
+                                exec_res = self.execute_concept_csv(
+                                    concept_act_id=str(concept_act_id),
+                                    inputs=dict(inputs),
+                                    expected=expected_for_validator,
+                                    step=int(0),
+                                    max_depth=int(8),
+                                    match_context={"family_id": str(fam_id)} if str(fam_id) else None,
+                                )
+                                meta = exec_res.get("meta") if isinstance(exec_res.get("meta"), dict) else {}
+                                ok2 = bool(meta.get("ok", False))
+                                concept_meta["ok"] = bool(ok2)
+                                concept_meta["reason"] = str(meta.get("reason") or "")
+                                trace = exec_res.get("trace") if isinstance(exec_res.get("trace"), dict) else {}
+                                calls = trace.get("concept_calls") if isinstance(trace.get("concept_calls"), list) else []
+                                concept_meta["concept_calls_total"] = int(len(calls))
+                                try:
+                                    ids: List[str] = []
+                                    for c in calls:
+                                        if not isinstance(c, dict):
+                                            continue
+                                        cid0 = str(c.get("concept_id") or "")
+                                        if cid0:
+                                            ids.append(cid0)
+                                    # Stable, deterministic order for logging/metrics.
+                                    concept_meta["concept_call_ids"] = sorted(set(ids))
+                                except Exception:
+                                    concept_meta["concept_call_ids"] = []
+                                try:
+                                    nested: List[str] = []
+                                    for c in calls:
+                                        if not isinstance(c, dict):
+                                            continue
+                                        cid0 = str(c.get("concept_id") or "")
+                                        if not cid0:
+                                            continue
+                                        try:
+                                            cd = int(c.get("call_depth", 0) or 0)
+                                        except Exception:
+                                            cd = 0
+                                        if int(cd) > 0:
+                                            nested.append(cid0)
+                                    concept_meta["concept_nested_call_ids"] = sorted(set(nested))
+                                    concept_meta["concept_nested_calls_total"] = int(len(nested))
+                                except Exception:
+                                    concept_meta["concept_nested_call_ids"] = []
+                                    concept_meta["concept_nested_calls_total"] = 0
+                                try:
+                                    md = 0
+                                    for c in calls:
+                                        if not isinstance(c, dict):
+                                            continue
+                                        d = int(c.get("call_depth", 0) or 0)
+                                        if d > md:
+                                            md = d
+                                    concept_meta["concept_calls_max_depth"] = int(md)
+                                except Exception:
+                                    concept_meta["concept_calls_max_depth"] = 0
+                                out_text = str(exec_res.get("output") or "")
+                                concept_tokens = tokenize_text(out_text)
+                            except Exception:
+                                concept_meta["ok"] = False
+                                concept_meta["reason"] = "concept_exec_error"
+        except Exception:
+            concept_tokens = []
+            concept_pos = 0
+            concept_act_id = None
+            concept_meta = {"enabled": False}
+
+        concept_active = bool(concept_tokens)
+        if bool(concept_policy_required):
+            if not isinstance(concept_meta, dict):
+                concept_meta = {"enabled": True}
+            concept_meta["policy_required"] = True
+            concept_meta["policy_used"] = bool(concept_active)
+            if not bool(concept_active):
+                # No concept chosen ⇒ no survival via fallback. Fail-closed: do not emit contract tokens
+                # or proceed with global token generation.
+                if not bool(concept_meta.get("enabled", False)):
+                    concept_meta.update({"enabled": True, "required": True, "used": False, "ok": False})
+                if not str(concept_meta.get("reason") or ""):
+                    concept_meta["reason"] = "concept_policy_missing"
+                try:
+                    contract_meta["blocked_by_concept_policy"] = True
+                except Exception:
+                    pass
+                contract_tokens = []
+                contract_active = False
+                max_new_tokens = 0
+
         if isinstance(trace_plan_trace, dict):
             try:
                 trace_plan_trace["trace_instruction_contract"] = copy.deepcopy(contract_meta)
@@ -1389,7 +2390,7 @@ class Engine:
             return [t for t in seq if t not in {"<BOS>"} and (not is_space(t))]
 
         # Decoder-level anti-loop / fluency controls (deterministic; must not affect contracts).
-        NO_REPEAT_NGRAM = 3
+        NO_REPEAT_NGRAM = int(getattr(self.config, "decoder_fluency_no_repeat_ngram", 3) or 3)
         REP_WINDOW = 64
         REP_ALPHA = 0.45
         BLOCK_PENALTY = 1e6
@@ -1399,6 +2400,20 @@ class Engine:
         ROUTER_DECODER_FLUENCY_ID = "antiloop_v40"
 
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).digest()
+
+        fluency_block_re = None
+        try:
+            pat = str(getattr(self.config, "decoder_fluency_block_token_regex", "") or "")
+            if pat:
+                fluency_block_re = re.compile(pat)
+        except Exception:
+            fluency_block_re = None
+        try:
+            fluency_block_pen = float(
+                getattr(self.config, "decoder_fluency_block_penalty", 1e6) or 0.0
+            )
+        except Exception:
+            fluency_block_pen = 0.0
 
         def _prompt_jitter(tok: str) -> float:
             try:
@@ -1461,6 +2476,22 @@ class Engine:
                         continue
                     cand.score += float(PROMPT_JITTER_ALPHA) * float(_prompt_jitter(tok))
 
+            # Soft blocklist: discourage dataset markup leakage and similar tokens.
+            # This is applied even in strict-format turns (it only penalizes tokens that are
+            # almost never desired as final answers, e.g., "<DOC>"), while EOS-delay remains
+            # freeform-only.
+            if fluency_block_re is not None and float(fluency_block_pen) > 0.0:
+                for tok, cand in work.items():
+                    if tok == "<EOS>":
+                        continue
+                    if is_space(tok):
+                        continue
+                    try:
+                        if fluency_block_re.search(tok):
+                            cand.score -= float(fluency_block_pen)
+                    except Exception:
+                        pass
+
             if NO_REPEAT_NGRAM >= 2 and len(turn_non_ws) >= (NO_REPEAT_NGRAM - 1) and seen_turn_ngrams:
                 prefix = tuple(turn_non_ws[-(NO_REPEAT_NGRAM - 1) :])
                 eligible = [
@@ -1480,10 +2511,87 @@ class Engine:
 
         seen_turn_ngrams: set = set()
         turn_non_ws: List[str] = []
+        if bool(getattr(self.config, "decoder_fluency_prompt_ngram_block", False)) and NO_REPEAT_NGRAM >= 2:
+            # Seed the anti-repeat set with prompt n-grams (prompt includes prior turns),
+            # discouraging prompt echo and cross-turn scaffold loops.
+            pnw = [t for t in prompt_tokens if t not in {"<BOS>"} and (not is_space(t))]
+            if len(pnw) >= NO_REPEAT_NGRAM:
+                for i0 in range(0, len(pnw) - NO_REPEAT_NGRAM + 1):
+                    seen_turn_ngrams.add(tuple(pnw[i0 : i0 + NO_REPEAT_NGRAM]))
 
         for i in range(int(max_new_tokens)):
             ck = ctx_key(context)
             penalties = penalty_view(out_tokens + gen_tokens, gen_tokens)
+
+            if concept_active and concept_pos < len(concept_tokens):
+                nxt = str(concept_tokens[concept_pos])
+                concept_pos += 1
+
+                trace_context_keys.append(ck)
+                trace_executed_predictor_ids.append([])
+                trace_rewrite_rule_hit_ids.append([])
+                trace_rewrite_rules_changed_count.append(0)
+
+                trace_predictor_iterated.append(0)
+                trace_predictor_matched.append(0)
+                trace_predictor_emitted.append(0)
+                trace_candidates_pre.append(1)
+                trace_candidates_post.append(1)
+
+                trace_router_live_used.append(0)
+                trace_router_live_fallback.append(0)
+                trace_router_live_fallback_reason.append("")
+                trace_router_live_allowed_predictor_ids.append([])
+                trace_router_live_predictors_iterated.append(0)
+                trace_router_live_predictors_matched.append(0)
+                trace_router_live_predictors_emitted.append(0)
+                trace_baseline_predictors_iterated.append(0)
+                trace_baseline_predictors_matched.append(0)
+                trace_baseline_predictors_emitted.append(0)
+                trace_router_live_mismatch.append(0)
+                trace_router_live_debug_baseline_token.append("")
+                trace_router_live_debug_gate_token.append("")
+
+                trace_instruction_contract_used.append(0)
+                trace_instruction_contract_kind.append("")
+                trace_instruction_contract_reason.append("")
+                trace_force_gate_used.append(0)
+                trace_force_gate_fallback.append(0)
+                trace_force_gate_fallback_reason.append("")
+                trace_force_gate_allowed_size.append(0)
+                trace_force_gate_predictors_iterated.append(0)
+                trace_force_gate_predictors_matched.append(0)
+                trace_force_gate_predictors_emitted.append(0)
+                trace_force_gate_baseline_predictors_iterated.append(0)
+                trace_force_gate_baseline_predictors_matched.append(0)
+                trace_force_gate_baseline_predictors_emitted.append(0)
+                trace_force_gate_mismatch.append(0)
+                trace_force_gate_debug_baseline_token.append("")
+                trace_force_gate_debug_gate_token.append("")
+                trace_gate_table_hit.append(0)
+                trace_gate_table_allowed_k.append(0)
+
+                trace_selected_act_ids.append(str(concept_act_id or "__concept_executor__"))
+                trace_selected_tokens.append(str(nxt))
+
+                gen_tokens.append(nxt)
+                filtered = [x for x in (out_tokens + gen_tokens) if x not in {"<BOS>"}]
+                n = self.config.cycle_ngram
+                if len(filtered) >= n:
+                    ng = tuple(filtered[-n:])
+                    history_ngrams.append(ng)
+                    history_ngram_set.add(ng)
+                    if len(history_ngrams) > self.config.cycle_history:
+                        old = history_ngrams.pop(0)
+                        if old not in history_ngrams:
+                            history_ngram_set.discard(old)
+
+                context.append(nxt)
+                context = context[-(self.config.max_order - 1) :]
+
+                if concept_pos >= len(concept_tokens):
+                    break
+                continue
 
             if contract_active and contract_pos < len(contract_tokens):
                 nxt = str(contract_tokens[contract_pos])
@@ -1994,7 +3102,22 @@ class Engine:
             )
 
             # EOS guardrail
-            if (not contract_active) and i < self.config.min_new_tokens_before_eos and "<EOS>" in candidates:
+            min_eos = int(self.config.min_new_tokens_before_eos)
+            if not strict_turn:
+                try:
+                    freeform_min = int(
+                        getattr(
+                            self.config,
+                            "decoder_fluency_min_new_tokens_before_eos_freeform",
+                            0,
+                        )
+                        or 0
+                    )
+                except Exception:
+                    freeform_min = 0
+                if freeform_min > 0:
+                    min_eos = max(int(min_eos), int(freeform_min))
+            if (not contract_active) and i < int(min_eos) and "<EOS>" in candidates:
                 candidates["<EOS>"].score -= 1e6
 
             if not candidates:
@@ -2148,6 +3271,7 @@ class Engine:
             "instruction_contract_used": trace_instruction_contract_used,
             "instruction_contract_kind": trace_instruction_contract_kind,
             "instruction_contract_reason": trace_instruction_contract_reason,
+            "concept_executor": dict(concept_meta) if isinstance(concept_meta, dict) else {"enabled": False},
             "force_gate_used": trace_force_gate_used,
             "force_gate_fallback": trace_force_gate_fallback,
             "force_gate_fallback_reason": trace_force_gate_fallback_reason,
@@ -2170,6 +3294,32 @@ class Engine:
         if isinstance(trace_plan_trace, dict):
             trace_out["plan_trace"] = trace_plan_trace
             trace_out["plan_trace_sig"] = str(trace_plan_trace_sig)
+
+        # Dialogue state update (explicit, bounded) after generation.
+        if bool(getattr(self.config, "dialogue_state_enabled", False)) and dialogue_id is not None and turn is not None:
+            try:
+                user_txt = str(last_user_text_from_prompt(prompt) or "").strip()
+            except Exception:
+                user_txt = ""
+            try:
+                full_text = detokenize(out_tokens + gen_tokens)
+                resp_txt = full_text[len(str(prompt)) :]
+            except Exception:
+                resp_txt = detokenize(gen_tokens)
+            try:
+                self._dialogue_update_state(
+                    dialogue_id=int(did),
+                    turn=int(trn),
+                    user_text=str(user_txt),
+                    assistant_text=str(resp_txt),
+                    mode=str(mode_state),
+                )
+            except Exception:
+                pass
+
+        # Observability only: expose whether a memory prefix was used.
+        if isinstance(trace_out, dict) and isinstance(dialogue_state_meta, dict):
+            trace_out["dialogue_state"] = dict(dialogue_state_meta)
 
         return {
             "prompt": prompt,
@@ -2196,6 +3346,7 @@ class Engine:
         max_depth: int = 8,
         max_events: int = 512,
         validate_output: bool = True,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute a first-class concept_csv ACT as an explicit subgraph (CSV-MVP semantics).
@@ -2258,6 +3409,7 @@ class Engine:
             *,
             expected_for_validator: Any,
             validate_output: bool,
+            match_context: Optional[Dict[str, Any]],
         ) -> Tuple[Any, Dict[str, Any]]:
             if int(depth) > int(max_depth):
                 return None, {"ok": False, "reason": "max_depth", "concept_id": str(concept_id)}
@@ -2308,6 +3460,11 @@ class Engine:
                 "cost": float(len(act.program or [])),
                 "evidence_refs": [{"kind": "concept_act", "act_id": str(concept_id)}],
             }
+            if isinstance(match_context, dict) and match_context:
+                try:
+                    call_rec["match_context"] = copy.deepcopy(match_context)
+                except Exception:
+                    call_rec["match_context"] = dict(match_context)
             if len(concept_calls) < int(max_events):
                 concept_calls.append(call_rec)
 
@@ -2334,6 +3491,28 @@ class Engine:
                 }
                 _finalize_call(out_val=None, meta=meta)
                 return None, meta
+
+            # Match constraints (fail-closed): prevent split concepts from being called outside their
+            # allowed family contexts (no bypass via nested CSV_CALL).
+            try:
+                if isinstance(match_context, dict) and isinstance(getattr(act, "match", None), dict):
+                    fams = act.match.get("family_ids")
+                    if isinstance(fams, list) and fams:
+                        allow = {str(x) for x in fams if isinstance(x, str) and str(x)}
+                        fid = str(match_context.get("family_id") or "")
+                        if (not fid) or (fid not in allow):
+                            meta = {
+                                "ok": False,
+                                "reason": "match_disallowed",
+                                "concept_id": str(concept_id),
+                                "family_id": str(fid),
+                            }
+                            call_rec["blocked"] = True
+                            call_rec["blocked_reason"] = "match_disallowed"
+                            _finalize_call(out_val=None, meta=meta)
+                            return None, meta
+            except Exception:
+                pass
 
             # Typed inputs (deterministic).
             for k, want_t in in_schema.items():
@@ -2445,6 +3624,7 @@ class Engine:
                         depth + 1,
                         expected_for_validator=None,
                         validate_output=False,
+                        match_context=match_context,
                     )
                     if not bool(sub_meta.get("ok", False)):
                         meta = {
@@ -2457,6 +3637,63 @@ class Engine:
                         _finalize_call(out_val=None, meta=meta)
                         return None, meta
                     env[out] = sub_out
+                elif op in {"CSV_FACT_GET", "CSV_FACT_SET"}:
+                    # Explicit memory-facts access (deterministic, explicit state): interact with the
+                    # `memory_facts` ACT (fact_memory_v0) via its evidence.table.
+                    mem_act = self._fact_memory
+                    mem_ev = mem_act.evidence if (mem_act is not None and isinstance(mem_act.evidence, dict)) else {}
+                    if mem_act is None or (not isinstance(mem_ev, dict)) or (not bool(mem_ev.get("enabled", True))):
+                        meta = {"ok": False, "reason": "memory_disabled", "concept_id": str(concept_id)}
+                        _finalize_call(out_val=None, meta=meta)
+                        return None, meta
+                    table = mem_ev.setdefault("table", {})
+                    if not isinstance(table, dict):
+                        table = {}
+                        mem_ev["table"] = table
+
+                    key_var = str(args.get("key_var") or "")
+                    key_raw = env.get(key_var) if key_var else args.get("key")
+                    key = str("" if key_raw is None else key_raw).strip()
+                    if not key:
+                        meta = {"ok": False, "reason": "memory_missing_key", "concept_id": str(concept_id)}
+                        _finalize_call(out_val=None, meta=meta)
+                        return None, meta
+
+                    if op == "CSV_FACT_GET":
+                        out = str(args.get("out") or "")
+                        if not out:
+                            meta = {"ok": False, "reason": "memory_missing_out", "concept_id": str(concept_id)}
+                            _finalize_call(out_val=None, meta=meta)
+                            return None, meta
+                        entry = table.get(key)
+                        if isinstance(entry, dict):
+                            val = entry.get("value", "")
+                        else:
+                            val = "" if entry is None else entry
+                        s_val = str("" if val is None else val)
+                        if s_val == "":
+                            meta = {"ok": False, "reason": "memory_value_missing", "concept_id": str(concept_id)}
+                            _finalize_call(out_val=None, meta=meta)
+                            return None, meta
+                        env[out] = s_val
+                    else:
+                        # CSV_FACT_SET
+                        value_var = str(args.get("value_var") or "")
+                        value_raw = env.get(value_var) if value_var else args.get("value")
+                        s_val = str("" if value_raw is None else value_raw)
+                        entry = table.get(key)
+                        if not isinstance(entry, dict):
+                            entry = {}
+                            table[key] = entry
+                        prev_val = str(entry.get("value", ""))
+                        entry["value"] = s_val
+                        entry["count"] = int(entry.get("count", 0) or 0) + (0 if prev_val == s_val else 1)
+                        cnt = int(entry.get("count", 0) or 0)
+                        entry["confidence"] = float(1.0 - (0.5**max(0, cnt)))
+                        entry["last_seen_step"] = int(step)
+                        out = str(args.get("out") or "")
+                        if out:
+                            env[out] = s_val
                 elif op == "CSV_RETURN":
                     var = str(args.get("var") or "")
                     out_val = env.get(var)
@@ -2532,6 +3769,7 @@ class Engine:
             0,
             expected_for_validator=expected,
             validate_output=bool(validate_output),
+            match_context=(dict(match_context) if isinstance(match_context, dict) else None),
         )
         return {
             "output": out,

@@ -47,6 +47,15 @@ def _abstract_slots_after_steps_v141(steps: Sequence["ProgramStepV141"]) -> Dict
     avail: Dict[str, bool] = {"grid": True, "objset": False, "obj": False, "bbox": False, "patch": False}
     for st in steps:
         op_id = str(st.op_id)
+        # Meta-ops (concept/macro calls) are treated as grid-modifying closures for reachability pruning.
+        # Their inner steps are executed via _apply_step_cached_v141; here we only need conservative
+        # invalidation so the stage machine remains sound.
+        if op_id in {"macro_call", "concept_call"}:
+            avail["objset"] = False
+            avail["obj"] = False
+            avail["bbox"] = False
+            avail["patch"] = False
+            continue
         od = OP_DEFS_V141.get(op_id)
         if od is None:
             continue
@@ -243,6 +252,31 @@ def _apply_step_cached_v141(
     grid_hash_cache: Dict[GridV124, str],
     metrics: Dict[str, int],
 ) -> StateV132:
+    op_id = str(op_id or "")
+    if op_id in {"macro_call", "concept_call"}:
+        steps_raw = args.get("steps")
+        if not isinstance(steps_raw, list) or not steps_raw:
+            raise ValueError("meta_call_missing_steps")
+        st = state
+        for row in steps_raw:
+            if not isinstance(row, dict):
+                raise ValueError("meta_call_bad_step")
+            op2 = str(row.get("op_id") or "")
+            if not op2:
+                raise ValueError("meta_call_bad_step_op")
+            if op2 in {"macro_call", "concept_call"}:
+                raise ValueError("meta_call_nested_forbidden")
+            a2 = row.get("args") if isinstance(row.get("args"), dict) else {}
+            st = _apply_step_cached_v141(
+                state=st,
+                op_id=str(op2),
+                args=dict(a2),
+                apply_cache=apply_cache,
+                grid_hash_cache=grid_hash_cache,
+                metrics=metrics,
+            )
+        return st
+
     def freeze_json(x: Any) -> Any:
         if isinstance(x, dict):
             return tuple((str(k), freeze_json(x[k])) for k in sorted(x.keys()))
@@ -551,6 +585,10 @@ def _propose_next_steps_v141(
     if bool(avail.get("bbox", False)):
         out_steps.append(ProgramStepV141(op_id="crop_bbox", args={}))
 
+    if bool(avail.get("patch", False)):
+        # crop_bbox writes patch (not grid); commit_patch is required to make the crop effective.
+        out_steps.append(ProgramStepV141(op_id="commit_patch", args={}))
+
     for bg in bg_candidates:
         if not _crop_bbox_nonzero_is_noop_v141(train_in=train_in + [test_in], bg=int(bg)):
             out_steps.append(ProgramStepV141(op_id="crop_bbox_nonzero", args={"bg": int(bg)}))
@@ -582,6 +620,161 @@ def _propose_next_steps_v141(
     return uniq
 
 
+def _norm_macro_templates_v141(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize macro/operator templates to a minimal internal schema:
+      {macro_id, op_ids, support}
+
+    Supports:
+      - arc_macro_template_v143 (macro_id, op_ids, support)
+      - arc_operator_template_v147 (operator_id/op_ids/support)  [treated as macro_id]
+    """
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "")
+        macro_id = str(row.get("macro_id") or "")
+        if not macro_id and kind == "arc_operator_template_v147":
+            macro_id = str(row.get("operator_id") or "")
+        if not macro_id:
+            continue
+        op_ids_raw = row.get("op_ids")
+        if not isinstance(op_ids_raw, list) or not op_ids_raw:
+            continue
+        op_ids = [str(x) for x in op_ids_raw if str(x)]
+        if not op_ids:
+            continue
+        support = int(row.get("support") or 0)
+        if macro_id in seen:
+            continue
+        seen.add(macro_id)
+        out.append({"macro_id": str(macro_id), "op_ids": list(op_ids), "support": int(support)})
+    out.sort(
+        key=lambda r: (-int(r.get("support") or 0), -len(list(r.get("op_ids") or [])), str(r.get("macro_id") or ""))
+    )
+    return out
+
+
+def _floor_log2_int(n: int) -> int:
+    x = int(n)
+    if x <= 0:
+        return 0
+    return int(x.bit_length() - 1)
+
+
+def _macro_call_cost_bits_v141(
+    *,
+    macro_id: str,
+    steps: Sequence[Dict[str, Any]],
+    support_by_macro_id: Dict[str, int],
+) -> int:
+    inner = 0
+    for row in steps:
+        if not isinstance(row, dict):
+            continue
+        op_id = str(row.get("op_id") or "")
+        if not op_id or op_id in {"macro_call", "concept_call"}:
+            continue
+        args = row.get("args") if isinstance(row.get("args"), dict) else {}
+        inner += int(step_cost_bits_v141(op_id=str(op_id), args=dict(args)))
+
+    # MDL compression bonus: higher-support macros are cheaper to call (bounded).
+    sup = int(support_by_macro_id.get(str(macro_id), 0))
+    bonus = min(8, _floor_log2_int(max(1, sup)))
+    return max(1, int(inner) - int(bonus))
+
+
+def _step_cost_bits_total_v141(
+    *,
+    step: "ProgramStepV141",
+    macro_support_by_id: Dict[str, int],
+) -> int:
+    op_id = str(step.op_id or "")
+    if op_id == "macro_call":
+        args = step.args if isinstance(step.args, dict) else {}
+        mid = str(args.get("macro_id") or "")
+        steps_raw = args.get("steps")
+        steps_list = steps_raw if isinstance(steps_raw, list) else []
+        return _macro_call_cost_bits_v141(macro_id=str(mid), steps=steps_list, support_by_macro_id=macro_support_by_id)
+    if op_id == "concept_call":
+        # Concept-call cost is carried by the concept template (compression). If missing, fall back to 10.
+        args = step.args if isinstance(step.args, dict) else {}
+        cb = args.get("cost_bits")
+        if isinstance(cb, int):
+            return max(1, int(cb))
+        if isinstance(cb, str) and str(cb).isdigit():
+            return max(1, int(str(cb)))
+        return 10
+    return int(step_cost_bits_v141(op_id=str(step.op_id), args=dict(step.args)))
+
+
+def _instantiate_macro_steps_v141(
+    *,
+    macro_op_ids: Sequence[str],
+    steps_prefix: Tuple["ProgramStepV141", ...],
+    train_pairs: Sequence[Tuple[GridV124, GridV124]],
+    test_in: GridV124,
+    bg_candidates: Sequence[int],
+    shapes_out: Sequence[Tuple[int, int]],
+    palette_out: Sequence[int],
+    direct_steps: Sequence["ProgramStepV141"],
+    max_instantiations: int,
+    max_branch_per_op: int,
+) -> List[Tuple["ProgramStepV141", ...]]:
+    """
+    Deterministically instantiate a macro template (sequence of op_ids) into executable steps
+    by choosing concrete args via the same per-step proposal policy used by the solver.
+
+    This is a bounded search over args only (op_ids are fixed by the template).
+    """
+    want = [str(x) for x in macro_op_ids if str(x)]
+    if not want:
+        return []
+    max_inst = max(1, int(max_instantiations))
+    max_branch = max(1, int(max_branch_per_op))
+
+    frontier: List[Tuple["ProgramStepV141", ...]] = [tuple()]
+    for op in want:
+        next_frontier: List[Tuple["ProgramStepV141", ...]] = []
+        for inst in frontier:
+            steps_so_far = tuple(list(steps_prefix) + list(inst))
+            candidates = _propose_next_steps_v141(
+                steps_so_far=steps_so_far,
+                train_pairs=train_pairs,
+                test_in=test_in,
+                bg_candidates=bg_candidates,
+                shapes_out=shapes_out,
+                palette_out=palette_out,
+                direct_steps=direct_steps,
+            )
+            matches = [c for c in candidates if str(c.op_id) == str(op)]
+            matches.sort(
+                key=lambda st: (
+                    int(step_cost_bits_v141(op_id=str(st.op_id), args=dict(st.args))),
+                    canonical_json_dumps(st.to_dict()),
+                )
+            )
+            for st in matches[:max_branch]:
+                next_frontier.append(tuple(list(inst) + [st]))
+        if not next_frontier:
+            return []
+
+        # Prune instantiations deterministically by accumulated inner-step MDL.
+        def _inst_cost_key(steps: Tuple["ProgramStepV141", ...]) -> Tuple[int, str]:
+            cost = 0
+            for st in steps:
+                cost += int(step_cost_bits_v141(op_id=str(st.op_id), args=dict(st.args)))
+            sig = sha256_hex(canonical_json_dumps([s.to_dict() for s in steps]).encode("utf-8"))
+            return (int(cost), str(sig))
+
+        next_frontier.sort(key=_inst_cost_key)
+        frontier = next_frontier[:max_inst]
+
+    return list(frontier)
+
+
 @dataclass(frozen=True)
 class SolveConfigV141:
     max_depth: int = 4
@@ -589,6 +782,32 @@ class SolveConfigV141:
     trace_program_limit: int = 80
     max_ambiguous_outputs: int = 8
     max_next_steps: int = 128
+
+    # Allow collecting multiple near-minimal solutions for auditing, while keeping the
+    # decision rule fail-closed on minimal programs.
+    solution_cost_slack_bits: int = 0
+
+    # Learned closures: macro/operator templates (v143/v147) and concept templates (v146).
+    macro_templates: Tuple[Dict[str, Any], ...] = tuple()
+    concept_templates: Tuple[Dict[str, Any], ...] = tuple()
+
+    # Pressure / gating flags (kept in config for determinism; the solver remains fail-closed).
+    abstraction_pressure: bool = False
+    macro_try_on_fail_only: bool = True
+    enable_reachability_pruning: bool = True
+
+    # Macro instantiation policy (bounded, deterministic).
+    macro_propose_max_depth: int = 0
+    macro_max_templates: int = 24
+    macro_max_instantiations: int = 10
+    macro_max_branch_per_op: int = 10
+
+    # Optional stages (accepted for harness compatibility).
+    enable_repair_stage: bool = True
+    enable_residual_stage: bool = True
+    enable_refine_stage: bool = True
+    enable_point_patch_repair: bool = False
+    point_patch_max_points: int = 12
 
 
 def solve_arc_task_v141(
@@ -639,6 +858,23 @@ def solve_arc_task_v141(
     trace_program_limit = int(config.trace_program_limit)
     max_ambiguous_outputs = int(config.max_ambiguous_outputs)
     max_next_steps = int(config.max_next_steps)
+    solution_cost_slack_bits = int(getattr(config, "solution_cost_slack_bits", 0) or 0)
+
+    enable_reachability_pruning = bool(getattr(config, "enable_reachability_pruning", True))
+    macro_propose_max_depth = int(getattr(config, "macro_propose_max_depth", 0) or 0)
+    macro_max_templates = int(getattr(config, "macro_max_templates", 24) or 24)
+    macro_max_instantiations = int(getattr(config, "macro_max_instantiations", 10) or 10)
+    macro_max_branch_per_op = int(getattr(config, "macro_max_branch_per_op", 10) or 10)
+    macro_try_on_fail_only = bool(getattr(config, "macro_try_on_fail_only", True))
+
+    # Normalize macros (operators) once per task.
+    raw_mt = getattr(config, "macro_templates", ()) or ()
+    macro_templates_all = tuple([m for m in raw_mt if isinstance(m, dict)])
+    macro_templates_norm = _norm_macro_templates_v141([dict(r) for r in macro_templates_all])
+    macro_templates_norm = macro_templates_norm[: int(max(0, int(macro_max_templates)))]
+    macro_support_by_id: Dict[str, int] = {
+        str(r.get("macro_id") or ""): int(r.get("support") or 0) for r in macro_templates_norm if str(r.get("macro_id") or "")
+    }
 
     # Memoization caches (pure, local).
     apply_cache: Dict[Tuple[Any, ...], StateV132] = {}
@@ -672,43 +908,44 @@ def solve_arc_task_v141(
         eval_cache[psig] = ev
         return ev
 
-    frontier: List[Tuple[Tuple[int, int, int, str], Tuple[ProgramStepV141, ...], str]] = []
-    seen_programs: Set[str] = set()
+    def _solve_pass(*, allow_macros: bool) -> Dict[str, Any]:
+        frontier: List[Tuple[Tuple[int, int, int, str], Tuple[ProgramStepV141, ...], str]] = []
+        seen_programs: Set[str] = set()
 
-    def push(steps: Tuple[ProgramStepV141, ...]) -> None:
-        p = ProgramV141(steps=steps)
-        sig = p.program_sig()
-        if sig in seen_programs:
-            return
-        seen_programs.add(sig)
-        # MDL cost
-        cost = 0
-        for st in steps:
-            cost += int(step_cost_bits_v141(op_id=str(st.op_id), args=dict(st.args)))
-        ev = eval_program(steps)
-        # train_loss_tuple: (shape_mismatch_count, diff_cells)
-        loss_shape, loss_cells = ev.loss
-        key = (int(cost), int(loss_shape), int(loss_cells), str(sig))
-        heapq.heappush(frontier, (key, steps, sig))
+        def push(steps: Tuple[ProgramStepV141, ...]) -> None:
+            p = ProgramV141(steps=steps)
+            sig = p.program_sig()
+            if sig in seen_programs:
+                return
+            seen_programs.add(sig)
+            # MDL cost (meta-ops handled explicitly; base ops via step_cost_bits_v141).
+            cost = 0
+            for st in steps:
+                cost += int(_step_cost_bits_total_v141(step=st, macro_support_by_id=macro_support_by_id))
+            ev = eval_program(steps)
+            loss_shape, loss_cells = ev.loss
+            key = (int(cost), int(loss_shape), int(loss_cells), str(sig))
+            heapq.heappush(frontier, (key, steps, sig))
 
-    # Seed with empty program.
-    push(tuple())
+        push(tuple())
 
-    trace_programs: List[Dict[str, Any]] = []
-    best_cost: Optional[int] = None
-    best_programs: List[Dict[str, Any]] = []
+        trace_programs: List[Dict[str, Any]] = []
+        trace_items: List[Tuple[Tuple[int, int, int, int, str], Dict[str, Any]]] = []
+        programs_explored = 0
+        best_cost: Optional[int] = None
+        best_programs: List[Dict[str, Any]] = []
 
-    pruned_shape = 0
-    pruned_palette = 0
-    pruned_no_grid_modify = 0
+        pruned_shape = 0
+        pruned_palette = 0
+        pruned_no_grid_modify = 0
 
-    while frontier and len(trace_programs) < max_programs:
-        (cost_key, steps, sig) = heapq.heappop(frontier)
-        depth = int(len(steps))
-        ev = eval_program(steps)
-        if len(trace_programs) < trace_program_limit:
-            trace_programs.append(
-                {
+        while frontier and int(programs_explored) < int(max_programs):
+            (cost_key, steps, sig) = heapq.heappop(frontier)
+            programs_explored += 1
+            depth = int(len(steps))
+            ev = eval_program(steps)
+            if int(trace_program_limit) > 0:
+                tr_row = {
                     "program_sig": str(sig),
                     "depth": int(depth),
                     "cost_bits": int(cost_key[0]),
@@ -717,98 +954,213 @@ def solve_arc_task_v141(
                     "mismatch_ex": ev.mismatch_ex,
                     "steps": [s.to_dict() for s in steps],
                 }
+                # Keep the best-N trace programs by (loss_shape, loss_cells, cost_bits, depth, sig).
+                # This makes operator mining stable and useful (near-miss programs survive), rather than
+                # storing just the first explored prefixes.
+                tr_key = (int(ev.loss[0]), int(ev.loss[1]), int(cost_key[0]), int(depth), str(sig))
+                if len(trace_items) < int(trace_program_limit):
+                    trace_items.append((tr_key, tr_row))
+                else:
+                    worst_i = 0
+                    worst_k = trace_items[0][0]
+                    for i, (k, _row) in enumerate(trace_items):
+                        if k > worst_k:
+                            worst_k = k
+                            worst_i = i
+                    if tr_key < worst_k:
+                        trace_items[worst_i] = (tr_key, tr_row)
+
+            if ev.ok_train:
+                if best_cost is None:
+                    best_cost = int(cost_key[0])
+                if int(cost_key[0]) <= int(best_cost) + int(solution_cost_slack_bits):
+                    best_programs.append(
+                        {
+                            "program_sig": str(sig),
+                            "cost_bits": int(cost_key[0]),
+                            "steps": [s.to_dict() for s in steps],
+                            "predicted_grid": [list(r) for r in ev.test_grid],
+                            "predicted_grid_hash": _grid_hash_cached_v141(g=ev.test_grid, cache=grid_hash_cache),
+                        }
+                    )
+                if len(best_programs) >= max_ambiguous_outputs:
+                    break
+                if frontier and best_cost is not None and int(frontier[0][0][0]) > int(best_cost) + int(solution_cost_slack_bits):
+                    break
+                continue
+
+            if isinstance(ev.mismatch_ex, dict) and str(ev.mismatch_ex.get("kind") or "") == "exception":
+                metrics["pruned_by_exception_prefix"] = int(metrics.get("pruned_by_exception_prefix", 0)) + 1
+                continue
+
+            if depth >= max_depth:
+                continue
+
+            avail = _abstract_slots_after_steps_v141(steps)
+            stage = _stage_from_avail_v141(avail)
+            steps_left = int(max_depth - depth)
+
+            if bool(enable_reachability_pruning):
+                ok_reach = True
+                for want_shape in shapes_out:
+                    for got_shape in ev.got_shapes:
+                        if not _can_reach_shape_v141(
+                            stage=stage, got_shape=got_shape, want_shape=want_shape, steps_left=steps_left
+                        ):
+                            pruned_shape += 1
+                            ok_reach = False
+                            break
+                    if not ok_reach:
+                        break
+                if not ok_reach:
+                    continue
+                for want_palette in [set(int(c) for c in palette_out)]:
+                    for got_pal in ev.got_palettes:
+                        if not _can_reach_palette_v141(
+                            stage=stage,
+                            got_palette=set(int(x) for x in got_pal),
+                            want_palette=want_palette,
+                            steps_left=steps_left,
+                        ):
+                            pruned_palette += 1
+                            ok_reach = False
+                            break
+                    if not ok_reach:
+                        break
+                if not ok_reach:
+                    continue
+
+                if _min_steps_to_grid_modify_v141(stage) > steps_left:
+                    pruned_no_grid_modify += 1
+                    continue
+
+            next_steps: List[ProgramStepV141] = list(
+                _propose_next_steps_v141(
+                    steps_so_far=steps,
+                    train_pairs=train_pairs,
+                    test_in=test_in,
+                    bg_candidates=bg_candidates,
+                    shapes_out=shapes_out,
+                    palette_out=palette_out,
+                    direct_steps=direct_steps,
+                )
             )
 
-        if ev.ok_train:
-            if best_cost is None:
-                best_cost = int(cost_key[0])
-            if int(cost_key[0]) != int(best_cost):
-                # All remaining programs will have >= cost; stop collecting minimal solutions.
-                break
-            best_programs.append(
+            macro_allowed_here = bool(allow_macros) and bool(macro_templates_norm) and int(depth) <= int(macro_propose_max_depth)
+            if macro_allowed_here:
+                for tmpl in macro_templates_norm:
+                    mid = str(tmpl.get("macro_id") or "")
+                    op_ids = tmpl.get("op_ids") if isinstance(tmpl.get("op_ids"), list) else []
+                    insts = _instantiate_macro_steps_v141(
+                        macro_op_ids=[str(x) for x in op_ids if str(x)],
+                        steps_prefix=steps,
+                        train_pairs=train_pairs,
+                        test_in=test_in,
+                        bg_candidates=bg_candidates,
+                        shapes_out=shapes_out,
+                        palette_out=palette_out,
+                        direct_steps=direct_steps,
+                        max_instantiations=int(macro_max_instantiations),
+                        max_branch_per_op=int(macro_max_branch_per_op),
+                    )
+                    for inner_steps in insts:
+                        next_steps.append(
+                            ProgramStepV141(
+                                op_id="macro_call",
+                                args={"macro_id": str(mid), "steps": [s.to_dict() for s in inner_steps]},
+                            )
+                        )
+
+            next_steps.sort(
+                key=lambda st: (
+                    int(_step_cost_bits_total_v141(step=st, macro_support_by_id=macro_support_by_id)),
+                    canonical_json_dumps(st.to_dict()),
+                )
+            )
+            if len(next_steps) > max_next_steps:
+                metrics["pruned_by_next_steps_cap"] = int(metrics.get("pruned_by_next_steps_cap", 0)) + int(
+                    len(next_steps) - max_next_steps
+                )
+                next_steps = next_steps[:max_next_steps]
+            for ns in next_steps:
+                push(tuple(list(steps) + [ns]))
+
+        trace_items.sort(key=lambda kv: kv[0])
+        trace_programs = [row for _k, row in trace_items]
+
+        if best_cost is None or not best_programs:
+            return {
+                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
+                "kind": "arc_solver_result_v141",
+                "status": "FAIL",
+                "program_sig": "",
+                "predicted_grid_hash": "",
+                "failure_reason": {"kind": "SEARCH_BUDGET_EXCEEDED" if frontier else "MISSING_OPERATOR", "details": {}},
+                "trace": {
+                    "trace_programs": trace_programs,
+                    "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
+                    "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
+                    "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
+                    "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
+                    "pruned_by_shape_reachability": int(pruned_shape),
+                    "pruned_by_palette_reachability": int(pruned_palette),
+                    "pruned_by_no_grid_modify_in_time": int(pruned_no_grid_modify),
+                    "pruned_by_exception_prefix": int(metrics.get("pruned_by_exception_prefix", 0)),
+                    "pruned_by_next_steps_cap": int(metrics.get("pruned_by_next_steps_cap", 0)),
+                },
+            }
+
+        # Fail-closed decision uses minimal-cost programs only.
+        min_cost = min(int(bp.get("cost_bits") or 0) for bp in best_programs)
+        minimal = [bp for bp in best_programs if int(bp.get("cost_bits") or 0) == int(min_cost)]
+
+        outputs: Dict[str, Dict[str, Any]] = {}
+        for bp in minimal:
+            h = str(bp.get("predicted_grid_hash") or "")
+            if h and h not in outputs:
+                outputs[h] = bp
+
+        if len(outputs) == 1:
+            only = list(outputs.values())[0]
+            steps_rows = only.get("steps") if isinstance(only.get("steps"), list) else []
+            return {
+                "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
+                "kind": "arc_solver_result_v141",
+                "status": "SOLVED",
+                "program_sig": str(only.get("program_sig") or ""),
+                "program_cost_bits": int(only.get("cost_bits") or 0),
+                "program_steps": list(steps_rows),
+                "predicted_grid": only.get("predicted_grid"),
+                "predicted_grid_hash": str(only.get("predicted_grid_hash") or ""),
+                "trace": {
+                    "trace_programs": trace_programs,
+                    "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
+                    "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
+                    "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
+                    "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
+                    "pruned_by_shape_reachability": int(pruned_shape),
+                    "pruned_by_palette_reachability": int(pruned_palette),
+                    "pruned_by_no_grid_modify_in_time": int(pruned_no_grid_modify),
+                    "pruned_by_exception_prefix": int(metrics.get("pruned_by_exception_prefix", 0)),
+                    "pruned_by_next_steps_cap": int(metrics.get("pruned_by_next_steps_cap", 0)),
+                },
+            }
+
+        outs_sorted = sorted(outputs.values(), key=lambda x: str(x.get("predicted_grid_hash") or ""))
+        return {
+            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
+            "kind": "arc_solver_result_v141",
+            "status": "UNKNOWN",
+            "predicted_grids": [o.get("predicted_grid") for o in outs_sorted],
+            "predicted_grids_by_solution": [
                 {
-                    "program_sig": str(sig),
-                    "cost_bits": int(cost_key[0]),
-                    "steps": [s.to_dict() for s in steps],
-                    "predicted_grid": [list(r) for r in ev.test_grid],
-                    "predicted_grid_hash": _grid_hash_cached_v141(g=ev.test_grid, cache=grid_hash_cache),
+                    "program_sig": str(o.get("program_sig") or ""),
+                    "program_cost_bits": int(o.get("cost_bits") or 0),
+                    "predicted_grid_hash": str(o.get("predicted_grid_hash") or ""),
                 }
-            )
-            if len(best_programs) >= max_ambiguous_outputs:
-                break
-            continue
-
-        if isinstance(ev.mismatch_ex, dict) and str(ev.mismatch_ex.get("kind") or "") == "exception":
-            metrics["pruned_by_exception_prefix"] = int(metrics.get("pruned_by_exception_prefix", 0)) + 1
-            continue
-
-        if depth >= max_depth:
-            continue
-
-        avail = _abstract_slots_after_steps_v141(steps)
-        stage = _stage_from_avail_v141(avail)
-        steps_left = int(max_depth - depth)
-
-        # Reachability pruning against each train output shape/palette.
-        ok_reach = True
-        for want_shape in shapes_out:
-            for got_shape in ev.got_shapes:
-                if not _can_reach_shape_v141(stage=stage, got_shape=got_shape, want_shape=want_shape, steps_left=steps_left):
-                    pruned_shape += 1
-                    ok_reach = False
-                    break
-            if not ok_reach:
-                break
-        if not ok_reach:
-            continue
-        for want_palette in [set(int(c) for c in palette_out)]:
-            for got_pal in ev.got_palettes:
-                if not _can_reach_palette_v141(
-                    stage=stage, got_palette=set(int(x) for x in got_pal), want_palette=want_palette, steps_left=steps_left
-                ):
-                    pruned_palette += 1
-                    ok_reach = False
-                    break
-            if not ok_reach:
-                break
-        if not ok_reach:
-            continue
-
-        if _min_steps_to_grid_modify_v141(stage) > steps_left:
-            pruned_no_grid_modify += 1
-            continue
-
-        next_steps = _propose_next_steps_v141(
-            steps_so_far=steps,
-            train_pairs=train_pairs,
-            test_in=test_in,
-            bg_candidates=bg_candidates,
-            shapes_out=shapes_out,
-            palette_out=palette_out,
-            direct_steps=direct_steps,
-        )
-        # Deterministic cap to prevent combinatorial blowup: prefer cheaper steps.
-        next_steps.sort(
-            key=lambda st: (
-                int(step_cost_bits_v141(op_id=str(st.op_id), args=dict(st.args))),
-                canonical_json_dumps(st.to_dict()),
-            )
-        )
-        if len(next_steps) > max_next_steps:
-            metrics["pruned_by_next_steps_cap"] = int(metrics.get("pruned_by_next_steps_cap", 0)) + int(
-                len(next_steps) - max_next_steps
-            )
-            next_steps = next_steps[:max_next_steps]
-        for ns in next_steps:
-            push(tuple(list(steps) + [ns]))
-
-    # Decide status.
-    if best_cost is None or not best_programs:
-        return {
-            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
-            "kind": "arc_solver_result_v141",
-            "status": "FAIL",
-            "failure_reason": {"kind": "SEARCH_BUDGET_EXCEEDED" if frontier else "MISSING_OPERATOR", "details": {}},
+                for o in outs_sorted
+            ],
+            "failure_reason": {"kind": "AMBIGUOUS_RULE", "details": {"solutions": int(len(outputs))}},
             "trace": {
                 "trace_programs": trace_programs,
                 "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
@@ -823,56 +1175,12 @@ def solve_arc_task_v141(
             },
         }
 
-    # Collect unique outputs among minimal programs.
-    outputs: Dict[str, Dict[str, Any]] = {}
-    for bp in best_programs:
-        h = str(bp.get("predicted_grid_hash") or "")
-        if h and h not in outputs:
-            outputs[h] = bp
-    if len(outputs) == 1:
-        only = list(outputs.values())[0]
-        return {
-            "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
-            "kind": "arc_solver_result_v141",
-            "status": "SOLVED",
-            "program_sig": str(only.get("program_sig") or ""),
-            "predicted_grid": only.get("predicted_grid"),
-            "predicted_grid_hash": str(only.get("predicted_grid_hash") or ""),
-            "trace": {
-                "trace_programs": trace_programs,
-                "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
-                "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
-                "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
-                "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
-                "pruned_by_shape_reachability": int(pruned_shape),
-                "pruned_by_palette_reachability": int(pruned_palette),
-                "pruned_by_no_grid_modify_in_time": int(pruned_no_grid_modify),
-                "pruned_by_exception_prefix": int(metrics.get("pruned_by_exception_prefix", 0)),
-                "pruned_by_next_steps_cap": int(metrics.get("pruned_by_next_steps_cap", 0)),
-            },
-        }
+    if macro_templates_norm and not bool(macro_try_on_fail_only):
+        return _solve_pass(allow_macros=True)
 
-    # Fail-closed: ambiguous minimal programs.
-    outs_sorted = sorted(outputs.values(), key=lambda x: str(x.get("predicted_grid_hash") or ""))
-    return {
-        "schema_version": int(ARC_SOLVER_SCHEMA_VERSION_V141),
-        "kind": "arc_solver_result_v141",
-        "status": "UNKNOWN",
-        "predicted_grids": [o.get("predicted_grid") for o in outs_sorted],
-        "predicted_grids_by_solution": [
-            {"program_sig": str(o.get("program_sig") or ""), "predicted_grid_hash": str(o.get("predicted_grid_hash") or "")} for o in outs_sorted
-        ],
-        "failure_reason": {"kind": "AMBIGUOUS_RULE", "details": {"solutions": int(len(outputs))}},
-        "trace": {
-            "trace_programs": trace_programs,
-            "apply_cache_hits": int(metrics.get("apply_cache_hits", 0)),
-            "apply_cache_misses": int(metrics.get("apply_cache_misses", 0)),
-            "eval_cache_hits": int(metrics.get("eval_cache_hits", 0)),
-            "eval_cache_misses": int(metrics.get("eval_cache_misses", 0)),
-            "pruned_by_shape_reachability": int(pruned_shape),
-            "pruned_by_palette_reachability": int(pruned_palette),
-            "pruned_by_no_grid_modify_in_time": int(pruned_no_grid_modify),
-            "pruned_by_exception_prefix": int(metrics.get("pruned_by_exception_prefix", 0)),
-            "pruned_by_next_steps_cap": int(metrics.get("pruned_by_next_steps_cap", 0)),
-        },
-    }
+    r0 = _solve_pass(allow_macros=False)
+    if str(r0.get("status") or "") != "FAIL":
+        return r0
+    if not macro_templates_norm:
+        return r0
+    return _solve_pass(allow_macros=True)

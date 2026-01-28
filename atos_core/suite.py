@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from .act import canonical_json_dumps, sha256_hex
 from .metrics import distinct_n, loop_rate, repeat_ngram_rate, tokenize_text
 from .validators import run_validator
+from .semantic_ids import plan_id_for_expected_spec_sig, reference_id_v1
+from .world_pressure_validators_v123 import validate_iac_v123
 
 
 CHAT_DIALOGUES_20X3: Tuple[Tuple[str, str, str], ...] = (
@@ -313,8 +315,254 @@ SKILL_DIALOGUES_V1_PARAPHRASE: Tuple[Dict[str, Any], ...] = (
 )
 
 
+# Extra deterministic tasks used by the SOTA-ish packs (no world knowledge).
+SKILL_DIALOGUES_V2_SOTA_EXTRA: Tuple[Dict[str, Any], ...] = (
+    # Longer state retention across multiple turns.
+    {
+        "task_id": "state_long_delta8",
+        "dialogue": (
+            "Memorize a palavra-código: DELTA8.",
+            "Responda exatamente: OK",
+            "Responda exatamente: OK",
+            "Repita a palavra-código exatamente.",
+        ),
+        "validate_turn": 3,
+        "validator_id": "exact_match",
+        "expected_spec": {"text": "DELTA8", "collapse_ws": True, "case_sensitive": True},
+        "tags": ["state"],
+    },
+    # Clarification under ambiguity (must ask a question instead of guessing).
+    {
+        "task_id": "clarify_ambiguous_number_pt",
+        "dialogue": ("Me dê o número. (Não especifiquei qual.)",),
+        "validator_id": "regex_fullmatch",
+        "expected_spec": {"pattern": r"(?is).*\bqual\b.*\?.*", "flags": 0},
+        "tags": ["clarify"],
+    },
+    # Consistency / contradiction handling (deterministic rule).
+    {
+        "task_id": "consistency_contradiction_flag",
+        "dialogue": (
+            "Contexto: a senha é ALFA9. Apenas memorize.",
+            "Agora diga que a senha é BETA7. Se isso contradiz o contexto, responda exatamente: CONTRADIÇÃO",
+        ),
+        "validate_turn": 1,
+        "validator_id": "exact_match",
+        "expected_spec": {"text": "CONTRADIÇÃO", "collapse_ws": True, "case_sensitive": True},
+        "tags": ["consistency"],
+    },
+    {
+        "task_id": "consistency_no_contradiction_branch",
+        "dialogue": (
+            "Contexto: a senha é GAMMA3. Apenas memorize.",
+            "Agora, diga que a senha é GAMMA3. Se isso contradiz o contexto, responda exatamente: CONTRADIÇÃO; "
+            "caso contrário responda exatamente com a senha.",
+        ),
+        "validate_turn": 1,
+        "validator_id": "exact_match",
+        "expected_spec": {"text": "GAMMA3", "collapse_ws": True, "case_sensitive": True},
+        "tags": ["consistency"],
+    },
+    # Multi-step arithmetic (still deterministic and self-contained).
+    {
+        "task_id": "math_multistep_9_7",
+        "dialogue": ("Calcule (9 + 7) * 2 - 10. Responda APENAS com o número inteiro.",),
+        "validator_id": "int_exact",
+        "expected_spec": {"value": 22, "strict": True},
+        "tags": ["math"],
+    },
+)
+
+
+# Deterministic long-memory tasks (closed world, no external knowledge).
+# These force explicit memory state (via concept_csv + memory_facts) by separating
+# store and recall across the pack ordering (so the secret is not present in the recall prompt).
+SKILL_DIALOGUES_V3_MEMORY_LONG: Tuple[Dict[str, Any], ...] = (
+    {
+        "task_id": "memory_long_store_secret_v1",
+        "dialogue": ("Memória: armazene o segredo. Responda exatamente: OK",),
+        "validate_turn": 0,
+        "validator_id": "exact_match",
+        "expected_spec": {"text": "OK", "collapse_ws": True, "case_sensitive": True},
+        # Generic concept-executor spec (executed by the runtime, not by token continuation).
+        "concept_expected_spec": {
+            "inputs": {"key": "mem_long_secret_v1", "value": "DELTA8"},
+            "input_keys": ["key", "value"],
+            "expected_for_validator": "OK",
+        },
+        "concept_validator_id": "text_exact",
+        "tags": ["memory"],
+    },
+    {
+        "task_id": "memory_long_recall_secret_v1",
+        "dialogue": ("Memória: recupere o segredo e responda exatamente com ele (sem texto extra).",),
+        "validate_turn": 0,
+        "validator_id": "exact_match",
+        "expected_spec": {"text": "DELTA8", "collapse_ws": True, "case_sensitive": True},
+        "concept_expected_spec": {
+            "inputs": {"key": "mem_long_secret_v1"},
+            "input_keys": ["key"],
+            "expected_for_validator": "DELTA8",
+        },
+        "concept_validator_id": "text_exact",
+        "tags": ["memory"],
+    },
+)
+
+
+# Long-dialogue coherence tasks (closed world; deterministic). These are designed to be
+# run with a truncated prompt history (e.g., last 4 turns) + explicit `dialogue_state`
+# so earlier facts/goals must persist beyond the visible prompt window.
+SKILL_DIALOGUES_V4_DIALOGUE_LONG: Tuple[Dict[str, Any], ...] = (
+    {
+        "task_id": "dialogue_long_recall_name_pt_v1",
+        "dialogue": (
+            "Meu nome é CARLOS. Apenas memorize. Responda exatamente: OK",
+            "Responda exatamente: OK",
+            "Calcule 2 + 2. Responda APENAS com o número inteiro.",
+            "Responda exatamente: OK",
+            "Responda exatamente: OK",
+            "Qual meu nome? Responda APENAS com ele.",
+        ),
+        "validate_turn": 5,
+        "validator_id": "contains_exact_token",
+        "expected_spec": {"token": "CARLOS", "case_sensitive": False},
+        "tags": ["dialogue"],
+    },
+    {
+        "task_id": "dialogue_long_resume_topic_en_v1",
+        "dialogue": (
+            "Let's talk about PROJECT ALPHA. Just remember. Reply exactly: OK",
+            "Reply exactly: OK",
+            "Compute (3 + 5) * 2. Reply with the integer only.",
+            "Reply exactly: OK",
+            "Reply exactly: OK",
+            "Back to the previous topic: what project were we discussing? Reply with the project name only.",
+        ),
+        "validate_turn": 5,
+        "validator_id": "contains_exact_token",
+        "expected_spec": {"token": "PROJECT ALPHA", "case_sensitive": False},
+        "tags": ["dialogue"],
+    },
+)
+
+
 def goal_id_for(goal_spec: Dict[str, Any]) -> str:
     return sha256_hex(canonical_json_dumps(goal_spec).encode("utf-8"))
+
+
+def _v69_long_sum_task(
+    *,
+    task_id: str,
+    values: Sequence[int],
+    b: int,
+    plan: str,
+    concept_min_depth: int = 2,
+) -> Dict[str, Any]:
+    vals = [int(x) for x in list(values)]
+    goal_spec = {
+        "kind": "v69_long_sum_state_json",
+        "task_id": str(task_id),
+        "plan": str(plan),
+        "values": list(vals),
+        "b": int(b),
+    }
+    gid = goal_id_for(goal_spec)
+    input_keys = ["goal_id", "plan"] + [f"x{i}" for i in range(len(vals))] + ["b"]
+    inputs: Dict[str, Any] = {"goal_id": str(gid), "plan": str(plan), "b": int(b)}
+    for i, v in enumerate(vals):
+        inputs[f"x{i}"] = int(v)
+
+    # Ops: chain add_int over all x_i (>=2), then wrap + canonicalize.
+    ops: List[Dict[str, Any]] = []
+    if len(vals) < 2:
+        raise ValueError("v69_long_sum_requires_at_least_2_values")
+
+    # in0=goal_id, in1=plan, in2=x0, in3=x1, ... , in{len(vals)+1}=x{len(vals)-1}, last in = b
+    v_prev = "v0"
+    ops.append({"fn": "add_int", "in": ["in2", "in3"], "out": v_prev})
+    for i in range(2, len(vals)):
+        v_next = f"v{i-1}"
+        ops.append({"fn": "add_int", "in": [v_prev, f"in{2 + i}"], "out": v_next})
+        v_prev = v_next
+
+    v_obj = f"v{len(vals)}"
+    v_out = f"v{len(vals) + 1}"
+    ops.append(
+        {
+            "fn": "make_dict_goal_plan_ab",
+            "in": ["in0", "in1", v_prev, f"in{len(vals) + 2}"],
+            "out": v_obj,
+        }
+    )
+    ops.append({"fn": "json_canonical", "in": [v_obj], "out": v_out})
+
+    expected_obj = {"goal_id": str(gid), "plan": str(plan), "a": int(sum(vals)), "b": int(b)}
+    expected_text = canonical_json_dumps(expected_obj)
+    expected_spec = {
+        "compiler_id": "v69_long_sum_compiler",
+        "task_kind": "v69_long_sum_wrap",
+        "goal_spec": dict(goal_spec),
+        "goal_id": str(gid),
+        "input_keys": list(input_keys),
+        "inputs": dict(inputs),
+        "ops": list(ops),
+        "return_var": str(v_out),
+        "expected_output_text": str(expected_text),
+        "required_keys": ["goal_id", "plan", "a", "b"],
+        "expected_values": dict(expected_obj),
+    }
+
+    return {
+        "task_id": str(task_id),
+        "dialogue": (
+            f"V69 long plan. Reply with the exact canonical JSON for goal_id={gid} (plan={plan}).",
+        ),
+        "validator_id": "plan_validator",
+        "expected_spec": expected_spec,
+        "concept_min_depth": int(concept_min_depth),
+        "tags": ["utility", "plan", "math"],
+    }
+
+
+# Long-horizon deterministic plan tasks (closed world; no world knowledge). These force the
+# system to sustain long multi-step execution and/or planning under the same SOTA regime.
+SKILL_DIALOGUES_V5_LONG_HORIZON: Tuple[Dict[str, Any], ...] = (
+    _v69_long_sum_task(
+        task_id="v69_long_sum_21a",
+        values=list(range(1, 22)),
+        b=0,
+        plan="long_sum_chain_21",
+        concept_min_depth=2,
+    ),
+    _v69_long_sum_task(
+        task_id="v69_long_sum_25a",
+        values=list(range(1, 26)),
+        b=0,
+        plan="long_sum_chain_25",
+        concept_min_depth=2,
+    ),
+)
+
+
+# Longer-horizon deterministic plan tasks (>=50 steps). Used to stress multi-step execution
+# beyond the 20–30 step range in sota_v7.
+SKILL_DIALOGUES_V6_LONG_HORIZON: Tuple[Dict[str, Any], ...] = (
+    _v69_long_sum_task(
+        task_id="v69_long_sum_49a",
+        values=list(range(1, 50)),
+        b=0,
+        plan="long_sum_chain_49",
+        concept_min_depth=2,
+    ),
+    _v69_long_sum_task(
+        task_id="v69_long_sum_75a",
+        values=list(range(1, 76)),
+        b=0,
+        plan="long_sum_chain_75",
+        concept_min_depth=2,
+    ),
+)
 
 
 V67_DIALOGUE_COMPILER_ID = "v67_dialogue_compiler"
@@ -729,6 +977,590 @@ UTILITY_DIALOGUES_V68: Tuple[Dict[str, Any], ...] = (
 )
 
 
+def _with_plan_concept_min_depth(
+    tasks: Sequence[Dict[str, Any]],
+    *,
+    min_depth: int,
+) -> Tuple[Dict[str, Any], ...]:
+    """
+    Deterministically enforce concept compositionality for plan_validator tasks:
+    require concept_calls_max_depth >= min_depth at validation time.
+    """
+    md = int(min_depth or 0)
+    if md < 0:
+        md = 0
+    out: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t2 = dict(t)
+        if str(t2.get("validator_id") or "") == "plan_validator":
+            t2["concept_min_depth"] = int(md)
+        out.append(t2)
+    return tuple(out)
+
+
+def _with_plan_iac_required(tasks: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], ...]:
+    """
+    Deterministically enforce IAC (Intention->Action->Consequence) as survival law for plan tasks:
+    require explicit Goal + Plan objects to exist in the ActStore.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t2 = dict(t)
+        if str(t2.get("validator_id") or "") == "plan_validator":
+            t2["iac_required"] = True
+            t2["hypothesis_required"] = True
+        out.append(t2)
+    return tuple(out)
+
+
+def _with_plan_reference_required(tasks: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], ...]:
+    """
+    Deterministically enforce semantic reference bindings as survival law for plan tasks:
+    require explicit token→object bindings (Reference ACTs) to exist in the ActStore.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t2 = dict(t)
+        if str(t2.get("validator_id") or "") == "plan_validator":
+            t2["reference_required"] = True
+            # Within the goal scope, bind stable tokens to the current goal/plan objects.
+            t2["reference_tokens"] = [
+                {"token": "o objetivo", "target_kind": "goal"},
+                {"token": "o plano", "target_kind": "plan"},
+            ]
+        out.append(t2)
+    return tuple(out)
+
+
+def _with_concept_policy_required(tasks: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], ...]:
+    """
+    Deterministically enforce concept-as-policy as survival law:
+    tasks must select and execute an explicit concept_csv (dominant policy), with no global
+    fallback "search" path.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t2 = dict(t)
+        t2["concept_policy_required"] = True
+        out.append(t2)
+    return tuple(out)
+
+
+def _with_plan_concept_csg_min_complexity(
+    tasks: Sequence[Dict[str, Any]],
+    *,
+    min_nodes: int,
+    min_edges: int,
+) -> Tuple[Dict[str, Any], ...]:
+    """
+    Deterministically enforce "concepts as non-trivial subgraphs" for plan_validator tasks:
+    require the executed concept_csv to have a CSG (v87) with at least `min_nodes` call-nodes and
+    `min_edges` dataflow edges (i.e., not a wrapper-only deepwrap chain).
+    """
+    mn = int(min_nodes or 0)
+    me = int(min_edges or 0)
+    if mn < 0:
+        mn = 0
+    if me < 0:
+        me = 0
+    out: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        t2 = dict(t)
+        if str(t2.get("validator_id") or "") == "plan_validator":
+            t2["concept_csg_min_nodes"] = int(mn)
+            t2["concept_csg_min_edges"] = int(me)
+        out.append(t2)
+    return tuple(out)
+
+
+# Skill-suite packs used by training/eval loops. These are deterministic "validator packs"
+# (no world knowledge) and can be used as a bottleneck (LOSS-AND) across categories.
+SKILL_SUITE_PACKS: Dict[str, Tuple[Dict[str, Any], ...]] = {
+    "v0": SKILL_DIALOGUES_V0,
+    "v1_paraphrase": SKILL_DIALOGUES_V1_PARAPHRASE,
+    "v68_plan": UTILITY_DIALOGUES_V68,
+    # SOTA-ish pack: baseline + paraphrases + plan/state/json deterministic tasks.
+    "sota_v1": SKILL_DIALOGUES_V0 + SKILL_DIALOGUES_V1_PARAPHRASE + UTILITY_DIALOGUES_V68,
+    # Extended SOTA-ish pack: add ambiguity/consistency/long-state tasks.
+    "sota_v2": SKILL_DIALOGUES_V0
+    + SKILL_DIALOGUES_V1_PARAPHRASE
+    + UTILITY_DIALOGUES_V68
+    + SKILL_DIALOGUES_V2_SOTA_EXTRA,
+    # SOTA-ish + concept compositionality: plan tasks require nested concept calls (CSV_CALL).
+    "sota_v3": _with_plan_concept_min_depth(
+        SKILL_DIALOGUES_V0
+        + SKILL_DIALOGUES_V1_PARAPHRASE
+        # Include both explicit-spec (v66) and dialogue-compiled (v68) plan families to force
+        # cross-context transfer and prevent "single-family plan concepts" from surviving indefinitely.
+        + UTILITY_DIALOGUES_V66
+        + UTILITY_DIALOGUES_V68
+        + SKILL_DIALOGUES_V2_SOTA_EXTRA,
+        min_depth=1,
+    ),
+}
+
+# SOTA-ish + compositionality + long-memory (store+recall) enforced as concept execution.
+# Ordering: store task, then core pack, then recall task (so the secret is not present in recall prompt).
+SKILL_SUITE_PACKS["sota_v4"] = (
+    (SKILL_DIALOGUES_V3_MEMORY_LONG[0],)
+    + SKILL_SUITE_PACKS["sota_v3"]
+    + (SKILL_DIALOGUES_V3_MEMORY_LONG[1],)
+)
+
+# SOTA-ish + long-memory + deeper concept hierarchy: plan tasks require nested depth >=2.
+SKILL_SUITE_PACKS["sota_v5"] = (
+    (SKILL_DIALOGUES_V3_MEMORY_LONG[0],)
+    + _with_plan_concept_min_depth(SKILL_SUITE_PACKS["sota_v3"], min_depth=2)
+    + (SKILL_DIALOGUES_V3_MEMORY_LONG[1],)
+)
+
+# SOTA-ish + long-memory + deep concept hierarchy + long-dialogue coherence.
+SKILL_SUITE_PACKS["sota_v6"] = (
+    (SKILL_DIALOGUES_V3_MEMORY_LONG[0],)
+    + _with_plan_concept_min_depth(SKILL_SUITE_PACKS["sota_v3"], min_depth=2)
+    + SKILL_DIALOGUES_V4_DIALOGUE_LONG
+    + (SKILL_DIALOGUES_V3_MEMORY_LONG[1],)
+)
+
+# SOTA-ish + long-memory + deep concept hierarchy + long-dialogue coherence + long-horizon plans.
+# Ordering: store secret, then long-horizon plans (to excite planning/long reasoning), then core SOTA pack,
+# then long-dialogue coherence, then recall secret.
+SKILL_SUITE_PACKS["sota_v7"] = (
+    (SKILL_DIALOGUES_V3_MEMORY_LONG[0],)
+    + SKILL_DIALOGUES_V5_LONG_HORIZON
+    + _with_plan_concept_min_depth(SKILL_SUITE_PACKS["sota_v3"], min_depth=2)
+    + SKILL_DIALOGUES_V4_DIALOGUE_LONG
+    + (SKILL_DIALOGUES_V3_MEMORY_LONG[1],)
+)
+
+# SOTA-ish + long-memory + deeper concept hierarchy + long-dialogue coherence + longer-horizon plans.
+# This pushes:
+# - multi-step execution (>50 steps)
+# - nested concept execution depth >=3 (concept_min_depth).
+SKILL_SUITE_PACKS["sota_v8"] = (
+    (SKILL_DIALOGUES_V3_MEMORY_LONG[0],)
+    + _with_plan_concept_min_depth(
+        SKILL_DIALOGUES_V5_LONG_HORIZON + SKILL_DIALOGUES_V6_LONG_HORIZON + SKILL_SUITE_PACKS["sota_v3"],
+        min_depth=3,
+    )
+    + SKILL_DIALOGUES_V4_DIALOGUE_LONG
+    + (SKILL_DIALOGUES_V3_MEMORY_LONG[1],)
+)
+
+# SOTA v8 + world-pressure IAC law: plan tasks require Goal+Plan objects (not only correct output).
+SKILL_SUITE_PACKS["sota_v9"] = _with_plan_iac_required(SKILL_SUITE_PACKS["sota_v8"])
+
+# SOTA v9 + binding law: plan tasks require explicit Reference objects (token→goal/plan).
+SKILL_SUITE_PACKS["sota_v10"] = _with_plan_reference_required(SKILL_SUITE_PACKS["sota_v9"])
+
+# SOTA v10 + concept-as-policy law: no survival without selecting a concept as dominant policy.
+SKILL_SUITE_PACKS["sota_v11"] = _with_concept_policy_required(SKILL_SUITE_PACKS["sota_v10"])
+
+# SOTA v11 + semantic CSG law: plan tasks require non-trivial concept subgraphs (>=2 nodes, >=1 edge).
+SKILL_SUITE_PACKS["sota_v12"] = _with_plan_concept_csg_min_complexity(
+    SKILL_SUITE_PACKS["sota_v11"],
+    min_nodes=2,
+    min_edges=1,
+)
+
+
+def _xdom_v1_long_sum_task(
+    *,
+    task_id: str,
+    values: Sequence[int],
+    b: int,
+    plan: str,
+    concept_min_depth: int,
+) -> Dict[str, Any]:
+    """
+    Cross-domain plan task (non-ARC): same logical primitives (add_int + canonical JSON),
+    but different compiler_id/family_id so schema overlap with SOTA packs is 0.
+    """
+    vals = [int(x) for x in list(values)]
+    goal_spec = {
+        "kind": "xdom_v1_energy_balance_json",
+        "task_id": str(task_id),
+        "plan": str(plan),
+        "values": list(vals),
+        "b": int(b),
+    }
+    gid = goal_id_for(goal_spec)
+    input_keys = ["goal_id", "plan"] + [f"x{i}" for i in range(len(vals))] + ["b"]
+    inputs: Dict[str, Any] = {"goal_id": str(gid), "plan": str(plan), "b": int(b)}
+    for i, v in enumerate(vals):
+        inputs[f"x{i}"] = int(v)
+
+    ops: List[Dict[str, Any]] = []
+    if len(vals) < 2:
+        raise ValueError("xdom_v1_long_sum_requires_at_least_2_values")
+    v_prev = "v0"
+    ops.append({"fn": "add_int", "in": ["in2", "in3"], "out": v_prev})
+    for i in range(2, len(vals)):
+        v_next = f"v{i-1}"
+        ops.append({"fn": "add_int", "in": [v_prev, f"in{2 + i}"], "out": v_next})
+        v_prev = v_next
+    v_obj = f"v{len(vals)}"
+    v_out = f"v{len(vals) + 1}"
+    ops.append(
+        {
+            "fn": "make_dict_goal_plan_ab",
+            "in": ["in0", "in1", v_prev, f"in{len(vals) + 2}"],
+            "out": v_obj,
+        }
+    )
+    ops.append({"fn": "json_canonical", "in": [v_obj], "out": v_out})
+
+    expected_obj = {"goal_id": str(gid), "plan": str(plan), "a": int(sum(vals)), "b": int(b)}
+    expected_text = canonical_json_dumps(expected_obj)
+    expected_spec = {
+        "task_kind": "xdom_v1_long_sum_wrap",
+        "goal_spec": dict(goal_spec),
+        "goal_id": str(gid),
+        "input_keys": list(input_keys),
+        "inputs": dict(inputs),
+        "ops": list(ops),
+        "return_var": str(v_out),
+        "expected_output_text": str(expected_text),
+        "required_keys": ["goal_id", "plan", "a", "b"],
+        "expected_values": dict(expected_obj),
+    }
+
+    return {
+        "task_id": str(task_id),
+        # Critical for schema_overlap==0 in cross-domain tests: family_id includes compiler_id.
+        "compiler_id": "xdom_v1_compiler",
+        "dialogue": (
+            f"XDOM v1. Energy-balance domain. Reply with the exact canonical JSON "
+            f"for goal_id={gid} (plan={plan}).",
+        ),
+        "validator_id": "plan_validator",
+        "expected_spec": expected_spec,
+        "concept_min_depth": int(concept_min_depth),
+        "tags": ["utility", "plan", "math", "xdom"],
+    }
+
+
+# Cross-domain suite (non-ARC): same logical primitives, different family ids (schema-disjoint).
+# Keep it small and deterministic; used by CROSS_DOMAIN_CONCEPT_REUSE.
+SKILL_SUITE_PACKS["xdom_v1"] = _with_plan_concept_csg_min_complexity(
+    _with_concept_policy_required(
+        _with_plan_concept_min_depth(
+            (
+                _xdom_v1_long_sum_task(
+                    task_id="xdom_v1_sum_2a",
+                    values=[7, 11],
+                    b=3,
+                    plan="xdom_energy_chain_2",
+                    concept_min_depth=2,
+                ),
+                _xdom_v1_long_sum_task(
+                    task_id="xdom_v1_sum_3a",
+                    values=[3, 5, 9],
+                    b=1,
+                    plan="xdom_energy_chain_3",
+                    concept_min_depth=2,
+                ),
+                _xdom_v1_long_sum_task(
+                    task_id="xdom_v1_sum_5a",
+                    values=[2, 4, 6, 8, 10],
+                    b=0,
+                    plan="xdom_energy_chain_5",
+                    concept_min_depth=2,
+                ),
+                _xdom_v1_long_sum_task(
+                    task_id="xdom_v1_sum_8a",
+                    values=[1, 1, 2, 3, 5, 8, 13, 21],
+                    b=34,
+                    plan="xdom_energy_chain_8",
+                    concept_min_depth=2,
+                ),
+            ),
+            min_depth=2,
+        )
+    ),
+    min_nodes=2,
+    min_edges=1,
+)
+
+
+def _xdom_v2_sum_plus_offset_task(
+    *,
+    task_id: str,
+    values: Sequence[int],
+    b: int,
+    plan: str,
+    concept_min_depth: int,
+) -> Dict[str, Any]:
+    """
+    Cross-domain plan task (non-ARC): compute (a=sum(values), b=sum(values)+b_input),
+    then wrap + canonicalize. This differs from xdom_v1 where b is an independent input.
+    """
+    vals = [int(x) for x in list(values)]
+    goal_spec = {
+        "kind": "xdom_v2_sum_plus_offset_json",
+        "task_id": str(task_id),
+        "plan": str(plan),
+        "values": list(vals),
+        "b": int(b),
+    }
+    gid = goal_id_for(goal_spec)
+    input_keys = ["goal_id", "plan"] + [f"x{i}" for i in range(len(vals))] + ["b"]
+    inputs: Dict[str, Any] = {"goal_id": str(gid), "plan": str(plan), "b": int(b)}
+    for i, v in enumerate(vals):
+        inputs[f"x{i}"] = int(v)
+
+    ops: List[Dict[str, Any]] = []
+    if len(vals) < 2:
+        raise ValueError("xdom_v2_sum_plus_offset_requires_at_least_2_values")
+
+    # Sum chain over x_i.
+    v_prev = "v0"
+    ops.append({"fn": "add_int", "in": ["in2", "in3"], "out": v_prev})
+    for i in range(2, len(vals)):
+        v_next = f"v{i-1}"
+        ops.append({"fn": "add_int", "in": [v_prev, f"in{2 + i}"], "out": v_next})
+        v_prev = v_next
+
+    # b_out = sum(values) + b_input
+    v_b = f"v{len(vals)}"
+    ops.append({"fn": "add_int", "in": [v_prev, f"in{len(vals) + 2}"], "out": v_b})
+
+    v_obj = f"v{len(vals) + 1}"
+    v_out = f"v{len(vals) + 2}"
+    ops.append({"fn": "make_dict_goal_plan_ab", "in": ["in0", "in1", v_prev, v_b], "out": v_obj})
+    ops.append({"fn": "json_canonical", "in": [v_obj], "out": v_out})
+
+    expected_obj = {"goal_id": str(gid), "plan": str(plan), "a": int(sum(vals)), "b": int(sum(vals) + int(b))}
+    expected_text = canonical_json_dumps(expected_obj)
+    expected_spec = {
+        "task_kind": "xdom_v2_sum_plus_offset_wrap",
+        "goal_spec": dict(goal_spec),
+        "goal_id": str(gid),
+        "input_keys": list(input_keys),
+        "inputs": dict(inputs),
+        "ops": list(ops),
+        "return_var": str(v_out),
+        "expected_output_text": str(expected_text),
+        "required_keys": ["goal_id", "plan", "a", "b"],
+        "expected_values": dict(expected_obj),
+    }
+
+    return {
+        "task_id": str(task_id),
+        "compiler_id": "xdom_v2_compiler",
+        "dialogue": (
+            f"XDOM v2. Sum-plus-offset domain. Reply with the exact canonical JSON "
+            f"for goal_id={gid} (plan={plan}).",
+        ),
+        "validator_id": "plan_validator",
+        "expected_spec": expected_spec,
+        "concept_min_depth": int(concept_min_depth),
+        "tags": ["utility", "plan", "math", "xdom"],
+    }
+
+
+# Cross-domain suite v2 (schema-disjoint): b depends on a (sum), unlike xdom_v1.
+SKILL_SUITE_PACKS["xdom_v2"] = _with_plan_concept_csg_min_complexity(
+    _with_concept_policy_required(
+        _with_plan_concept_min_depth(
+            (
+                _xdom_v2_sum_plus_offset_task(
+                    task_id="xdom_v2_sumoff_2a",
+                    values=[7, 11],
+                    b=3,
+                    plan="xdom_sum_plus_offset_2",
+                    concept_min_depth=2,
+                ),
+                _xdom_v2_sum_plus_offset_task(
+                    task_id="xdom_v2_sumoff_3a",
+                    values=[3, 5, 9],
+                    b=1,
+                    plan="xdom_sum_plus_offset_3",
+                    concept_min_depth=2,
+                ),
+                _xdom_v2_sum_plus_offset_task(
+                    task_id="xdom_v2_sumoff_5a",
+                    values=[2, 4, 6, 8, 10],
+                    b=0,
+                    plan="xdom_sum_plus_offset_5",
+                    concept_min_depth=2,
+                ),
+                _xdom_v2_sum_plus_offset_task(
+                    task_id="xdom_v2_sumoff_8a",
+                    values=[1, 1, 2, 3, 5, 8, 13, 21],
+                    b=34,
+                    plan="xdom_sum_plus_offset_8",
+                    concept_min_depth=2,
+                ),
+            ),
+            min_depth=2,
+        )
+    ),
+    min_nodes=2,
+    min_edges=1,
+)
+
+
+def _xdom_v3_split_even_odd_task(
+    *,
+    task_id: str,
+    values: Sequence[int],
+    plan: str,
+    concept_min_depth: int,
+) -> Dict[str, Any]:
+    """
+    Cross-domain plan task (non-ARC): split a sequence into even/odd index sums:
+      a = sum(values[0], values[2], ...), b = sum(values[1], values[3], ...)
+    This induces different internal structure (two accumulators).
+    """
+    vals = [int(x) for x in list(values)]
+    if len(vals) < 4 or (len(vals) % 2) != 0:
+        raise ValueError("xdom_v3_split_even_odd_requires_even_len_ge4")
+
+    goal_spec = {
+        "kind": "xdom_v3_split_even_odd_json",
+        "task_id": str(task_id),
+        "plan": str(plan),
+        "values": list(vals),
+    }
+    gid = goal_id_for(goal_spec)
+    input_keys = ["goal_id", "plan"] + [f"x{i}" for i in range(len(vals))]
+    inputs: Dict[str, Any] = {"goal_id": str(gid), "plan": str(plan)}
+    for i, v in enumerate(vals):
+        inputs[f"x{i}"] = int(v)
+
+    # in0=goal_id, in1=plan, in2=x0, in3=x1, ...
+    ops: List[Dict[str, Any]] = []
+    # seed sums
+    v_even = "v0"
+    v_odd = "v1"
+    ops.append({"fn": "add_int", "in": ["in2", "in4"], "out": v_even})
+    ops.append({"fn": "add_int", "in": ["in3", "in5"], "out": v_odd})
+    # accumulate remaining pairs
+    out_idx = 2
+    for i in range(6, 2 + len(vals), 2):
+        v_next_even = f"v{out_idx}"
+        v_next_odd = f"v{out_idx + 1}"
+        ops.append({"fn": "add_int", "in": [v_even, f"in{i}"], "out": v_next_even})
+        ops.append({"fn": "add_int", "in": [v_odd, f"in{i + 1}"], "out": v_next_odd})
+        v_even = v_next_even
+        v_odd = v_next_odd
+        out_idx += 2
+
+    v_obj = f"v{out_idx}"
+    v_out = f"v{out_idx + 1}"
+    ops.append({"fn": "make_dict_goal_plan_ab", "in": ["in0", "in1", v_even, v_odd], "out": v_obj})
+    ops.append({"fn": "json_canonical", "in": [v_obj], "out": v_out})
+
+    a_val = int(sum(vals[0::2]))
+    b_val = int(sum(vals[1::2]))
+    expected_obj = {"goal_id": str(gid), "plan": str(plan), "a": int(a_val), "b": int(b_val)}
+    expected_text = canonical_json_dumps(expected_obj)
+    expected_spec = {
+        "task_kind": "xdom_v3_split_even_odd_wrap",
+        "goal_spec": dict(goal_spec),
+        "goal_id": str(gid),
+        "input_keys": list(input_keys),
+        "inputs": dict(inputs),
+        "ops": list(ops),
+        "return_var": str(v_out),
+        "expected_output_text": str(expected_text),
+        "required_keys": ["goal_id", "plan", "a", "b"],
+        "expected_values": dict(expected_obj),
+    }
+
+    return {
+        "task_id": str(task_id),
+        "compiler_id": "xdom_v3_compiler",
+        "dialogue": (
+            f"XDOM v3. Split-sum domain (even/odd). Reply with the exact canonical JSON "
+            f"for goal_id={gid} (plan={plan}).",
+        ),
+        "validator_id": "plan_validator",
+        "expected_spec": expected_spec,
+        "concept_min_depth": int(concept_min_depth),
+        "tags": ["utility", "plan", "math", "xdom"],
+    }
+
+
+# Cross-domain suite v3 (schema-disjoint): two-accumulator split-sum structure.
+SKILL_SUITE_PACKS["xdom_v3"] = _with_plan_concept_csg_min_complexity(
+    _with_concept_policy_required(
+        _with_plan_concept_min_depth(
+            (
+                _xdom_v3_split_even_odd_task(
+                    task_id="xdom_v3_split_4a",
+                    values=[7, 11, 3, 5],
+                    plan="xdom_split_even_odd_4",
+                    concept_min_depth=2,
+                ),
+                _xdom_v3_split_even_odd_task(
+                    task_id="xdom_v3_split_6a",
+                    values=[1, 2, 3, 5, 8, 13],
+                    plan="xdom_split_even_odd_6",
+                    concept_min_depth=2,
+                ),
+                _xdom_v3_split_even_odd_task(
+                    task_id="xdom_v3_split_8a",
+                    values=[1, 1, 2, 3, 5, 8, 13, 21],
+                    plan="xdom_split_even_odd_8",
+                    concept_min_depth=2,
+                ),
+                _xdom_v3_split_even_odd_task(
+                    task_id="xdom_v3_split_10a",
+                    values=[2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
+                    plan="xdom_split_even_odd_10",
+                    concept_min_depth=2,
+                ),
+            ),
+            min_depth=2,
+        )
+    ),
+    min_nodes=2,
+    min_edges=1,
+)
+
+def skill_suite_tasks_for_pack(pack: str) -> Tuple[Dict[str, Any], ...]:
+    key = str(pack or "v0").strip().lower()
+    aliases = {
+        "v1": "v1_paraphrase",
+        "paraphrase": "v1_paraphrase",
+        "v68": "v68_plan",
+        "plan": "v68_plan",
+        "sota": "sota_v1",
+        "sota_v2": "sota_v2",
+        "sota_v3": "sota_v3",
+        "sota_v4": "sota_v4",
+        "sota_v5": "sota_v5",
+        "sota_v6": "sota_v6",
+        "sota_v7": "sota_v7",
+        "sota_v8": "sota_v8",
+        "sota_v9": "sota_v9",
+        "sota_v10": "sota_v10",
+        "sota_v11": "sota_v11",
+        "sota_v12": "sota_v12",
+        "xdom": "xdom_v1",
+        "xdom_v1": "xdom_v1",
+        "xdom_v2": "xdom_v2",
+        "xdom_v3": "xdom_v3",
+    }
+    key = aliases.get(key, key)
+    tasks = SKILL_SUITE_PACKS.get(key)
+    if tasks is None:
+        raise ValueError(f"unknown_skill_suite_pack:{pack}")
+    return tasks
+
+
 def _normalize_output(text: str, *, collapse_ws: bool) -> str:
     s = str(text or "").strip()
     if collapse_ws:
@@ -929,18 +1761,105 @@ def _plan_trace_for_task(task: Dict[str, Any], *, turn_idx: int) -> Dict[str, An
         except Exception:
             exp_sig = ""
 
-    return {
+    def _normalize_constraint(c: str) -> str:
+        s = str(c or "")
+        if not s:
+            return ""
+        if s.startswith("token:"):
+            return "token:*"
+        if s.startswith("keys:"):
+            raw = s[len("keys:") :]
+            parts = [p.strip() for p in raw.split(",")] if raw else []
+            parts = [p for p in parts if p]
+            return f"keys:n={len(parts)}"
+        return s
+
+    constraints_norm = [_normalize_constraint(c) for c in constraints if str(c)]
+    constraints_norm = [c for c in constraints_norm if str(c)]
+    try:
+        family_body = {
+            "validator_id": str(validator_id),
+            "expected_format": str(expected_format),
+            "constraints": list(constraints_norm),
+            "compiler_id": str(compiler_id),
+            "goal_active": bool(goal_id),
+        }
+        family_id = "fam_" + sha256_hex(canonical_json_dumps(family_body).encode("utf-8"))[:16]
+    except Exception:
+        family_id = ""
+
+    out = {
         "task_id": task_id,
         "compiler_id": str(compiler_id),
         "validator_id": validator_id,
         "expected_format": expected_format,
         "constraints": constraints,
+        "family_id": str(family_id),
         "goal_id": str(goal_id),
         "goal_active": bool(goal_id),
         "goal_progress": None,
         "goal_satisfied": None,
         "expected_spec_sig": str(exp_sig),
     }
+    # For plan_validator tasks, include the full expected_spec so the runtime can execute an
+    # induced concept_csv (no hidden solver; execution must flow through explicit concept acts).
+    if validator_id == "plan_validator" and isinstance(expected_spec, dict) and expected_spec:
+        out["expected_spec"] = dict(expected_spec)
+        try:
+            out["concept_min_depth"] = int(task.get("concept_min_depth", 0) or 0)
+        except Exception:
+            out["concept_min_depth"] = 0
+        try:
+            out["concept_csg_min_nodes"] = int(task.get("concept_csg_min_nodes", 0) or 0)
+        except Exception:
+            out["concept_csg_min_nodes"] = 0
+        try:
+            out["concept_csg_min_edges"] = int(task.get("concept_csg_min_edges", 0) or 0)
+        except Exception:
+            out["concept_csg_min_edges"] = 0
+    # Generic concept executor (non-plan tasks): when the harness provides an explicit
+    # concept_expected_spec, attach it to the plan_trace for the validate turn so that the
+    # runtime can execute a matching concept_csv ACT (no hidden solver).
+    if int(turn_idx) == int(validate_turn):
+        ces = task.get("concept_expected_spec")
+        if isinstance(ces, dict) and ces:
+            out["concept_expected_spec"] = dict(ces)
+            out["concept_validator_id"] = str(task.get("concept_validator_id") or "")
+            try:
+                out["concept_min_depth"] = int(task.get("concept_min_depth", out.get("concept_min_depth", 0)) or 0)
+            except Exception:
+                out["concept_min_depth"] = int(out.get("concept_min_depth", 0) or 0)
+            try:
+                out["concept_csg_min_nodes"] = int(
+                    task.get("concept_csg_min_nodes", out.get("concept_csg_min_nodes", 0)) or 0
+                )
+            except Exception:
+                out["concept_csg_min_nodes"] = int(out.get("concept_csg_min_nodes", 0) or 0)
+            try:
+                out["concept_csg_min_edges"] = int(
+                    task.get("concept_csg_min_edges", out.get("concept_csg_min_edges", 0)) or 0
+                )
+            except Exception:
+                out["concept_csg_min_edges"] = int(out.get("concept_csg_min_edges", 0) or 0)
+        # Reference bindings: optional, deterministic contract. This does not mutate state; it is
+        # an explicit requirement that can be enforced by validators + maintained by ICS.
+        if bool(task.get("reference_required", False)) or isinstance(task.get("reference_tokens"), list):
+            out["reference_required"] = bool(task.get("reference_required", False))
+            rts = task.get("reference_tokens") if isinstance(task.get("reference_tokens"), list) else []
+            items: List[Dict[str, str]] = []
+            for r in rts:
+                if not isinstance(r, dict):
+                    continue
+                tok = str(r.get("token") or "")
+                tk = str(r.get("target_kind") or "")
+                if tok and tk:
+                    items.append({"token": tok, "target_kind": tk})
+            items.sort(key=lambda d: (str(d.get("target_kind") or ""), str(d.get("token") or "")))
+            if items:
+                out["reference_tokens"] = list(items)
+        if bool(task.get("concept_policy_required", False)):
+            out["concept_policy_required"] = True
+    return out
 
 
 def reply_signature(text: str) -> str:
@@ -1093,6 +2012,15 @@ def suite_metrics_from_generations(
         loop_rate_global = loop_rate(all_gen_tokens, n=3, window=128, ignore_space=True)
         distinct2_global = distinct_n(all_gen_tokens, 2, ignore_space=True)
 
+    # Per-reply repetition/loop metrics (more stable and closer to dialogue quality than
+    # concatenating all replies into a single stream).
+    rep3_by_reply = [repeat_ngram_rate(toks, 3, ignore_space=True) for toks in reply_gen_tokens]
+    loop_by_reply = [loop_rate(toks, n=3, window=128, ignore_space=True) for toks in reply_gen_tokens]
+    rep3_reply_mean = (sum(rep3_by_reply) / len(rep3_by_reply)) if rep3_by_reply else 0.0
+    loop_reply_mean = (sum(loop_by_reply) / len(loop_by_reply)) if loop_by_reply else 0.0
+    rep3_reply_max = max(rep3_by_reply) if rep3_by_reply else 0.0
+    loop_reply_max = max(loop_by_reply) if loop_by_reply else 0.0
+
     c = Counter(reply_sigs)
     most_common = max(c.values()) if c else 0
     unique_reply_rate = (len(c) / max(1, len(reply_sigs))) if reply_sigs else 0.0
@@ -1141,6 +2069,10 @@ def suite_metrics_from_generations(
         "repeat3_global": float(repeat3_global),
         "loop_rate_global": float(loop_rate_global),
         "distinct2_global": float(distinct2_global),
+        "repeat3_reply_mean": float(rep3_reply_mean),
+        "loop_rate_reply_mean": float(loop_reply_mean),
+        "repeat3_reply_max": float(rep3_reply_max),
+        "loop_rate_reply_max": float(loop_reply_max),
         "unique_reply_rate": float(unique_reply_rate),
         "duplicate_reply_rate": float(duplicate_reply_rate),
         "most_common_reply_frac": float(most_common_reply_frac),
@@ -1216,7 +2148,8 @@ def run_chat_suite(
                 turn=int(j),
                 plan_trace=None,
             )
-            resp = out["text"][len(prompt) :]
+            prompt_used = str(out.get("prompt") or prompt)
+            resp = out["text"][len(prompt_used) :]
             history[-1]["system"] = resp
             history[-1]["mode"] = str(out.get("mode") or "default")
             history[-1]["mode_source"] = str(out.get("mode_source") or "router")
@@ -1524,6 +2457,9 @@ def run_skill_suite(
     *,
     tasks: Sequence[Dict[str, Any]] = SKILL_DIALOGUES_V0,
     max_new_tokens: int = 200,
+    prompt_history_k: int = 0,
+    family_shuffle_seed: Optional[int] = None,
+    family_shuffle_salt: int = 0,
     csv: Any = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     transcripts: List[Dict[str, Any]] = []
@@ -1537,11 +2473,86 @@ def run_skill_suite(
     goals_total = 0
     goals_satisfied = 0
 
+    # Concept usage as survival law: for structured plan tasks, require the runtime to execute
+    # an explicit concept_csv (not just emit the right text). This closes the escape route where
+    # the system can survive without depending on induced semantic objects.
+    concept_total = 0
+    concept_used_turns = 0
+    concept_ok_turns = 0
+    concept_calls_total_sum = 0
+    concept_calls_max_depth_sum = 0
+    concept_composed_turns = 0
+    concept_deep_turns = 0
+    concept_very_deep_turns = 0
+    concept_calls_max_depth_max = 0
+    concept_csg_nodes_sum = 0
+    concept_csg_edges_sum = 0
+    concept_csg_count_turns = 0
+    concept_csg_rich_turns = 0
+    concept_csg_required_total = 0
+    concept_csg_required_ok_turns = 0
+    concept_min_depth_required_max = 0
+    concept_nested_call_turns = 0
+    concept_nested_call_ids: set = set()
+
+    # Reference/binding as survival law (semantic persistence): require explicit token→object
+    # bindings for certain tasks (even if the output matches).
+    reference_required_total = 0
+    reference_ok_turns = 0
+
+    def _normalize_ref_token(token: str) -> str:
+        return " ".join(str(token or "").strip().split()).lower()
+
+    # Concept-as-policy law: require a concept executor to be selected (no global fallback).
+    concept_policy_required_total = 0
+    concept_policy_used_turns = 0
+
+    # Concept usage (any task): used to prove cross-context semantic reuse beyond plan tasks.
+    concept_any_used_turns = 0
+    concept_any_ok_turns = 0
+    concept_used_tags_by_id: Dict[str, set] = {}
+    concept_usage_by_id: Dict[str, Dict[str, Any]] = {}
+
     plan_turns_total = 0
     plan_turns_missing = 0
     contract_used_turns = 0
     contract_used_by_kind: Counter = Counter()
     csv_step = 0
+
+    family_id_map: Dict[str, str] = {}
+    if family_shuffle_seed is not None:
+        # Deterministic permutation over the latent family ids present in this task pack.
+        # This is an ablation knob: if the system depends on stable latent families, shuffling
+        # them should break convergence/performance.
+        try:
+            fids: set = set()
+            for i0, task0 in enumerate(tasks):
+                if not isinstance(task0, dict):
+                    continue
+                dialogue0 = task0.get("dialogue") or ()
+                if not isinstance(dialogue0, (list, tuple)) or not dialogue0:
+                    continue
+                vt0 = int(task0.get("validate_turn", max(0, len(dialogue0) - 1)) or 0)
+                vt0 = max(0, min(vt0, len(dialogue0) - 1))
+                pt0 = _plan_trace_for_task(task0, turn_idx=int(vt0))
+                if not isinstance(pt0, dict):
+                    continue
+                if not str(pt0.get("validator_id") or ""):
+                    continue
+                fid0 = str(pt0.get("family_id") or "")
+                if fid0:
+                    fids.add(fid0)
+            ordered = sorted(fids, key=str)
+            perm = sorted(
+                ordered,
+                key=lambda fid: sha256_hex(
+                    f"{int(family_shuffle_seed)}:{int(family_shuffle_salt)}:{fid}".encode("utf-8")
+                ),
+            )
+            if len(ordered) == len(perm) and ordered:
+                family_id_map = {ordered[i]: perm[i] for i in range(len(ordered))}
+        except Exception:
+            family_id_map = {}
 
     for i, task in enumerate(tasks):
         if not isinstance(task, dict):
@@ -1572,7 +2583,7 @@ def run_skill_suite(
         total_tasks += 1
         if isinstance(goal_spec, dict) and goal_spec:
             goals_total += 1
-        for cat in ("instruction", "json", "math", "state"):
+        for cat in ("instruction", "json", "math", "state", "plan", "clarify", "consistency", "memory", "dialogue"):
             if cat in tags:
                 cat_total[cat] += 1
 
@@ -1580,7 +2591,20 @@ def run_skill_suite(
         for j, user_msg in enumerate(turns):
             history.append({"user": str(user_msg), "system": ""})
             plan_trace = _plan_trace_for_task(task, turn_idx=int(j))
-            prompt = build_chat_prompt(history)
+            # Optional ablation: shuffle family ids (validate-turn contexts only).
+            try:
+                if family_id_map and isinstance(plan_trace, dict) and str(plan_trace.get("validator_id") or ""):
+                    fid0 = str(plan_trace.get("family_id") or "")
+                    if fid0 and fid0 in family_id_map:
+                        plan_trace = dict(plan_trace, family_id=str(family_id_map[fid0]))
+            except Exception:
+                pass
+            if isinstance(plan_trace, dict) and int(prompt_history_k) > 0:
+                plan_trace = dict(plan_trace, prompt_history_k=int(prompt_history_k))
+            if int(prompt_history_k) > 0 and len(history) > int(prompt_history_k):
+                prompt = build_chat_prompt(history[-int(prompt_history_k) :])
+            else:
+                prompt = build_chat_prompt(history)
             out = engine.generate(
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
@@ -1589,7 +2613,8 @@ def run_skill_suite(
                 turn=int(j),
                 plan_trace=plan_trace,
             )
-            resp = out["text"][len(prompt) :]
+            prompt_used = str(out.get("prompt") or prompt)
+            resp = out["text"][len(prompt_used) :]
             history[-1]["system"] = resp
             history[-1]["mode"] = str(out.get("mode") or "default")
             history[-1]["mode_source"] = str(out.get("mode_source") or "router")
@@ -1626,11 +2651,415 @@ def run_skill_suite(
         else:
             ok, reason = fn(out_text, expected_spec)
 
+        # Concept executor requirement (survival law):
+        # - plan_validator tasks always require explicit concept execution
+        # - tasks may opt-in via task["concept_expected_spec"] (e.g., long-memory)
+        concept_required = bool(str(validator_id) == "plan_validator" or bool(task.get("concept_expected_spec")))
+        if concept_required:
+            concept_total += 1
+            min_depth = int(task.get("concept_min_depth", 0) or 0)
+            if min_depth < 0:
+                min_depth = 0
+            concept_min_depth_required_max = max(int(concept_min_depth_required_max), int(min_depth))
+            try:
+                csg_req_nodes = int(task.get("concept_csg_min_nodes", 0) or 0)
+            except Exception:
+                csg_req_nodes = 0
+            try:
+                csg_req_edges = int(task.get("concept_csg_min_edges", 0) or 0)
+            except Exception:
+                csg_req_edges = 0
+            csg_req_nodes = max(0, int(csg_req_nodes))
+            csg_req_edges = max(0, int(csg_req_edges))
+            tr0 = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+            cm = tr0.get("concept_executor") if isinstance(tr0.get("concept_executor"), dict) else {}
+            used = bool(cm.get("used", False))
+            ok2 = bool(cm.get("ok", False))
+            try:
+                calls_total = int(cm.get("concept_calls_total", 0) or 0)
+            except Exception:
+                calls_total = 0
+            try:
+                calls_max_depth = int(cm.get("concept_calls_max_depth", 0) or 0)
+            except Exception:
+                calls_max_depth = 0
+            concept_calls_total_sum += int(max(0, calls_total))
+            concept_calls_max_depth_sum += int(max(0, calls_max_depth))
+            concept_calls_max_depth_max = max(int(concept_calls_max_depth_max), int(max(0, calls_max_depth)))
+            if used:
+                concept_used_turns += 1
+            if ok2 and int(calls_max_depth) >= int(min_depth):
+                concept_ok_turns += 1
+            # Composed/deep rates are only meaningful when the concept executor is correct:
+            # count nested depth only for successful concept execution (used + ok2).
+            if used and ok2:
+                if int(calls_max_depth) >= 1:
+                    concept_composed_turns += 1
+                if int(calls_max_depth) >= 2:
+                    concept_deep_turns += 1
+                if int(calls_max_depth) >= 3:
+                    concept_very_deep_turns += 1
+
+                # CSG richness: measure subgraph structure of the executed concept.
+                # Prefer stored csg_v87; fallback to deriving from the program (CSV_CALL + bind dataflow).
+                nodes = 0
+                edges = 0
+                try:
+                    cid = str(cm.get("concept_id") or "")
+                    act0 = engine.store.get_concept_act(cid) if cid else None
+                    if act0 is not None:
+                        ev0 = getattr(act0, "evidence", None)
+                        ev0 = ev0 if isinstance(ev0, dict) else {}
+                        meta0 = ev0.get("meta") if isinstance(ev0.get("meta"), dict) else {}
+                        if isinstance(meta0, dict):
+                            try:
+                                nodes = int(meta0.get("csg_v87_nodes", 0) or 0)
+                            except Exception:
+                                nodes = 0
+                            try:
+                                edges = int(meta0.get("csg_v87_edges", 0) or 0)
+                            except Exception:
+                                edges = 0
+                        csg0 = ev0.get("csg_v87") if isinstance(ev0.get("csg_v87"), dict) else None
+                        if (nodes <= 0 and edges <= 0) and isinstance(csg0, dict):
+                            nn = csg0.get("nodes") if isinstance(csg0.get("nodes"), list) else []
+                            ee = csg0.get("edges") if isinstance(csg0.get("edges"), list) else []
+                            nodes = int(len(nn))
+                            edges = int(len(ee))
+                        if nodes <= 0 and edges <= 0:
+                            calls: List[Dict[str, Any]] = []
+                            for ins in list(getattr(act0, "program", []) or []):
+                                if str(getattr(ins, "op", "")) != "CSV_CALL":
+                                    continue
+                                args0 = getattr(ins, "args", {}) or {}
+                                args0 = args0 if isinstance(args0, dict) else {}
+                                outv = str(args0.get("out") or "")
+                                bind0 = args0.get("bind") if isinstance(args0.get("bind"), dict) else {}
+                                calls.append({"out": outv, "bind": dict(bind0)})
+                            nodes = int(len(calls))
+                            prod: Dict[str, int] = {}
+                            for i0, c0 in enumerate(calls):
+                                ov = str(c0.get("out") or "")
+                                if ov:
+                                    prod[ov] = int(i0)
+                            e_cnt = 0
+                            for j0, c0 in enumerate(calls):
+                                bind0 = c0.get("bind") if isinstance(c0.get("bind"), dict) else {}
+                                for v0 in bind0.values():
+                                    vv = str(v0 or "")
+                                    if not vv:
+                                        continue
+                                    i0 = prod.get(vv)
+                                    if i0 is None or int(i0) == int(j0):
+                                        continue
+                                    e_cnt += 1
+                            edges = int(e_cnt)
+                except Exception:
+                    nodes = 0
+                    edges = 0
+
+                concept_csg_nodes_sum += int(max(0, nodes))
+                concept_csg_edges_sum += int(max(0, edges))
+                concept_csg_count_turns += 1
+                if int(nodes) >= 2 and int(edges) >= 1:
+                    concept_csg_rich_turns += 1
+
+                # Optional survival law: plan packs may require non-trivial CSG complexity.
+                if int(csg_req_nodes) > 0 or int(csg_req_edges) > 0:
+                    concept_csg_required_total += 1
+                    ok_csg = bool(int(nodes) >= int(csg_req_nodes) and int(edges) >= int(csg_req_edges))
+                    if ok_csg:
+                        concept_csg_required_ok_turns += 1
+                    if ok and (not ok_csg) and int(calls_max_depth) >= int(min_depth):
+                        ok = False
+                        reason = "concept_csg_too_shallow"
+            elif int(csg_req_nodes) > 0 or int(csg_req_edges) > 0:
+                # Requirement present but concept executor not ok/used: count as unmet.
+                concept_csg_required_total += 1
+            if ok and (not used):
+                ok = False
+                reason = "missing_concept_executor"
+            elif ok and used and (not ok2):
+                ok = False
+                reason = "concept_executor_not_ok"
+            elif ok and used and ok2 and int(calls_max_depth) < int(min_depth):
+                ok = False
+                reason = "concept_depth_too_shallow"
+
+        # IAC requirement (world-pressure law): require explicit Goal+Plan objects to exist.
+        # This can fail even when output is correct, closing the escape route "good text without semantics".
+        if bool(task.get("iac_required", False)):
+            goal_ok = False
+            plan_ok = False
+            eval_ok = False
+            consequence_ok = False
+            try:
+                pt = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+                pt = pt.get("plan_trace") if isinstance(pt.get("plan_trace"), dict) else {}
+            except Exception:
+                pt = {}
+            goal_id = str(pt.get("goal_id") or "")
+            exp_sig = str(pt.get("expected_spec_sig") or "")
+            plan_id = plan_id_for_expected_spec_sig(str(exp_sig))
+            try:
+                g = engine.store.get(str(goal_id)) if goal_id else None
+                goal_ok = bool(
+                    g is not None
+                    and bool(getattr(g, "active", True))
+                    and str(getattr(g, "kind", "")) == "goal"
+                )
+            except Exception:
+                goal_ok = False
+            try:
+                p = engine.store.get(str(plan_id)) if plan_id else None
+                plan_ok = bool(
+                    p is not None
+                    and bool(getattr(p, "active", True))
+                    and str(getattr(p, "kind", "")) == "plan"
+                )
+            except Exception:
+                plan_ok = False
+            try:
+                tr0 = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+                cm0 = tr0.get("concept_executor") if isinstance(tr0.get("concept_executor"), dict) else {}
+                eval_ok = bool(cm0.get("used", False)) and bool(cm0.get("ok", False))
+            except Exception:
+                eval_ok = False
+            consequence_ok = bool(ok)
+            ok_iac, reason_iac = validate_iac_v123(
+                goal_ok=bool(goal_ok),
+                plan_ok=bool(plan_ok),
+                eval_ok=bool(eval_ok),
+                consequence_ok=bool(consequence_ok),
+            )
+            if ok and (not bool(ok_iac)):
+                ok = False
+                reason = str(reason_iac)
+
+        # Reference requirement (binding law): require explicit token→object bindings to exist.
+        # This can fail even when output is correct, closing the escape route "good text without bindings".
+        if bool(task.get("reference_required", False)):
+            reference_required_total += 1
+            if bool(ok):
+                try:
+                    pt = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+                    pt = pt.get("plan_trace") if isinstance(pt.get("plan_trace"), dict) else {}
+                except Exception:
+                    pt = {}
+                goal_id = str(pt.get("goal_id") or "")
+                exp_sig = str(pt.get("expected_spec_sig") or "")
+                plan_id = plan_id_for_expected_spec_sig(str(exp_sig))
+                scope_sig = str(goal_id)
+                ref_specs = pt.get("reference_tokens") if isinstance(pt.get("reference_tokens"), list) else None
+                if not isinstance(ref_specs, list) or not ref_specs:
+                    ref_specs = task.get("reference_tokens") if isinstance(task.get("reference_tokens"), list) else []
+                ok_refs = True
+                for rs in list(ref_specs):
+                    if not isinstance(rs, dict):
+                        continue
+                    tok = str(rs.get("token") or "")
+                    tk = str(rs.get("target_kind") or "")
+                    if not tok or not tk:
+                        continue
+                    if tk == "goal":
+                        want_id = str(goal_id)
+                    elif tk == "plan":
+                        want_id = str(plan_id)
+                    else:
+                        # Unknown binding kind ⇒ fail-closed.
+                        ok_refs = False
+                        reason = "reference_unknown_target_kind_v1"
+                        break
+                    rid = reference_id_v1(scope_sig=str(scope_sig), token=_normalize_ref_token(tok))
+                    try:
+                        ra = engine.store.get(str(rid)) if rid else None
+                    except Exception:
+                        ra = None
+                    if ra is None or (not bool(getattr(ra, "active", True))) or str(getattr(ra, "kind", "")) != "reference":
+                        ok_refs = False
+                        reason = "reference_missing_v1"
+                        break
+                    evr = getattr(ra, "evidence", None)
+                    evr = evr if isinstance(evr, dict) else {}
+                    rr = evr.get("reference") if isinstance(evr.get("reference"), dict) else {}
+                    if str(rr.get("target_kind") or "") != str(tk):
+                        ok_refs = False
+                        reason = "reference_kind_mismatch_v1"
+                        break
+                    if str(rr.get("target_id") or "") != str(want_id):
+                        ok_refs = False
+                        reason = "reference_target_mismatch_v1"
+                        break
+                if not bool(ok_refs):
+                    ok = False
+                else:
+                    reference_ok_turns += 1
+
+        # Concept-as-policy requirement: require an explicit concept to be selected/executed
+        # (even if the output matches). This closes the escape route where tasks are solved by
+        # raw token generation or other non-concept fallbacks.
+        if bool(task.get("concept_policy_required", False)):
+            concept_policy_required_total += 1
+            try:
+                trp = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+                cm_p = trp.get("concept_executor") if isinstance(trp.get("concept_executor"), dict) else {}
+                used_p = bool(cm_p.get("used", False))
+            except Exception:
+                used_p = False
+            if used_p:
+                concept_policy_used_turns += 1
+            if ok and (not used_p):
+                ok = False
+                reason = "missing_concept_policy_v1"
+
+        # Hypothesis requirement: if a goal has a prior failure streak and we still fail now,
+        # require at least one explicit hypothesis object for that goal.
+        if bool(task.get("hypothesis_required", False)) and (not bool(ok)):
+            try:
+                pt = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+                pt = pt.get("plan_trace") if isinstance(pt.get("plan_trace"), dict) else {}
+            except Exception:
+                pt = {}
+            goal_id = str(pt.get("goal_id") or "")
+            streak = 0
+            try:
+                g = engine.store.get(str(goal_id)) if goal_id else None
+                if g is not None and bool(getattr(g, "active", True)) and str(getattr(g, "kind", "")) == "goal":
+                    ev = getattr(g, "evidence", None)
+                    if isinstance(ev, dict):
+                        gg = ev.get("goal")
+                        if isinstance(gg, dict):
+                            streak = int(gg.get("failure_streak", 0) or 0)
+            except Exception:
+                streak = 0
+            if int(streak) >= 1:
+                have_hyp = False
+                try:
+                    for h in engine.store.by_kind("hypothesis"):
+                        evh = getattr(h, "evidence", None)
+                        if not isinstance(evh, dict):
+                            continue
+                        hh = evh.get("hypothesis")
+                        if not isinstance(hh, dict):
+                            continue
+                        if str(hh.get("goal_id") or "") == str(goal_id):
+                            have_hyp = True
+                            break
+                except Exception:
+                    have_hyp = False
+                if not have_hyp:
+                    ok = False
+                    reason = "missing_hypothesis_v1"
+
+        # Track concept reuse even when not required by the harness.
+        try:
+            tr0_any = turn_rec.get("trace") if isinstance(turn_rec.get("trace"), dict) else {}
+            cm_any = tr0_any.get("concept_executor") if isinstance(tr0_any.get("concept_executor"), dict) else {}
+            used_any = bool(cm_any.get("used", False))
+            ok_any = bool(cm_any.get("ok", False))
+            if used_any:
+                concept_any_used_turns += 1
+            if used_any and ok_any:
+                concept_any_ok_turns += 1
+            if used_any:
+                ids: List[str] = []
+                cid_main = str(cm_any.get("concept_id") or "")
+                if cid_main:
+                    ids.append(cid_main)
+                call_ids = cm_any.get("concept_call_ids")
+                if isinstance(call_ids, list):
+                    for x in call_ids:
+                        xs = str(x or "")
+                        if xs:
+                            ids.append(xs)
+                nested_ids = cm_any.get("concept_nested_call_ids")
+                if isinstance(nested_ids, list):
+                    for x in nested_ids:
+                        xs = str(x or "")
+                        if xs:
+                            ids.append(xs)
+                    if nested_ids and ok_any:
+                        concept_nested_call_turns += 1
+                        for x in nested_ids:
+                            xs = str(x or "")
+                            if xs:
+                                concept_nested_call_ids.add(xs)
+                ids = sorted(set(ids))
+                fam_id = ""
+                try:
+                    pt0 = tr0_any.get("plan_trace") if isinstance(tr0_any.get("plan_trace"), dict) else {}
+                    fam_id = str(pt0.get("family_id") or "")
+                except Exception:
+                    fam_id = ""
+                try:
+                    calls_max_depth_any = int(cm_any.get("concept_calls_max_depth", 0) or 0)
+                except Exception:
+                    calls_max_depth_any = 0
+                if ids:
+                    for cid in ids:
+                        if not cid:
+                            continue
+                        rec = concept_usage_by_id.get(cid)
+                        if rec is None:
+                            rec = {
+                                "used_turns": 0,
+                                "ok_turns": 0,
+                                "calls_max_depth_max": 0,
+                                "families": {},
+                            }
+                            concept_usage_by_id[cid] = rec
+                        rec["used_turns"] = int(rec.get("used_turns", 0) or 0) + (1 if used_any else 0)
+                        rec["ok_turns"] = int(rec.get("ok_turns", 0) or 0) + (1 if (used_any and ok_any) else 0)
+                        rec["calls_max_depth_max"] = max(int(rec.get("calls_max_depth_max", 0) or 0), int(calls_max_depth_any))
+                        fams = rec.get("families")
+                        if not isinstance(fams, dict):
+                            fams = {}
+                            rec["families"] = fams
+                        if fam_id:
+                            frec = fams.get(fam_id)
+                            if frec is None:
+                                frec = {"used_turns": 0, "ok_turns": 0, "example_task_ids": set()}
+                                fams[fam_id] = frec
+                            frec["used_turns"] = int(frec.get("used_turns", 0) or 0) + (1 if used_any else 0)
+                            frec["ok_turns"] = int(frec.get("ok_turns", 0) or 0) + (1 if (used_any and ok_any) else 0)
+                            ex = frec.get("example_task_ids")
+                            if not isinstance(ex, set):
+                                ex = set()
+                                frec["example_task_ids"] = ex
+                            if str(task_id):
+                                ex.add(str(task_id))
+                cats_here = {
+                    str(c)
+                    for c in tags
+                    if c
+                    in {
+                        "instruction",
+                        "json",
+                        "math",
+                        "state",
+                        "plan",
+                        "clarify",
+                        "consistency",
+                        "memory",
+                        "dialogue",
+                        "agency",
+                        "concept",
+                    }
+                }
+                for cid in ids:
+                    st = concept_used_tags_by_id.get(cid)
+                    if st is None:
+                        st = set()
+                        concept_used_tags_by_id[cid] = st
+                    st.update(cats_here)
+        except Exception:
+            pass
+
         if ok:
             pass_count += 1
             if isinstance(goal_spec, dict) and goal_spec:
                 goals_satisfied += 1
-            for cat in ("instruction", "json", "math", "state"):
+            for cat in ("instruction", "json", "math", "state", "plan", "clarify", "consistency", "memory", "dialogue"):
                 if cat in tags:
                     cat_pass[cat] += 1
         else:
@@ -1678,12 +3107,80 @@ def run_skill_suite(
         "goals_total": int(goals_total),
         "goals_satisfied": int(goals_satisfied),
         "goals_satisfied_rate": _rate(goals_satisfied, goals_total),
+        "concept_total": int(concept_total),
+        "concept_used_turns": int(concept_used_turns),
+        "concept_ok_turns": int(concept_ok_turns),
+        "concept_used_rate": _rate(concept_used_turns, concept_total),
+        "concept_pass_count": int(concept_ok_turns),
+        "concept_pass_rate": _rate(concept_ok_turns, concept_total),
+        "concept_calls_total_sum": int(concept_calls_total_sum),
+        "concept_calls_max_depth_mean": float(concept_calls_max_depth_sum / concept_total) if concept_total > 0 else 0.0,
+        "concept_calls_max_depth_max": int(concept_calls_max_depth_max),
+        "concept_composed_turns": int(concept_composed_turns),
+        "concept_composed_rate": _rate(concept_composed_turns, concept_total),
+        "concept_deep_turns": int(concept_deep_turns),
+        "concept_deep_rate": _rate(concept_deep_turns, concept_total),
+        "concept_very_deep_turns": int(concept_very_deep_turns),
+        "concept_very_deep_rate": _rate(concept_very_deep_turns, concept_total),
+        "concept_csg_nodes_mean": float(concept_csg_nodes_sum / concept_csg_count_turns)
+        if concept_csg_count_turns > 0
+        else 0.0,
+        "concept_csg_edges_mean": float(concept_csg_edges_sum / concept_csg_count_turns)
+        if concept_csg_count_turns > 0
+        else 0.0,
+        "concept_csg_rich_turns": int(concept_csg_rich_turns),
+        "concept_csg_rich_rate": _rate(concept_csg_rich_turns, concept_total),
+        "concept_csg_required_total": int(concept_csg_required_total),
+        "concept_csg_required_ok_turns": int(concept_csg_required_ok_turns),
+        "concept_csg_required_pass_rate": _rate(concept_csg_required_ok_turns, concept_csg_required_total),
+        "concept_min_depth_required_max": int(concept_min_depth_required_max),
+        "concept_nested_call_turns": int(concept_nested_call_turns),
+        "concept_nested_call_rate": _rate(concept_nested_call_turns, total_tasks),
+        "concept_nested_call_ids_distinct": int(len(concept_nested_call_ids)),
+        "concept_any_used_turns": int(concept_any_used_turns),
+        "concept_any_ok_turns": int(concept_any_ok_turns),
+        "concept_any_used_rate": _rate(concept_any_used_turns, total_tasks),
+        "concept_any_ok_rate": _rate(concept_any_ok_turns, total_tasks),
+        "concept_policy_required_total": int(concept_policy_required_total),
+        "concept_policy_used_turns": int(concept_policy_used_turns),
+        "concept_policy_pass_rate": _rate(concept_policy_used_turns, concept_policy_required_total),
+        "concept_selected_as_policy_rate": _rate(concept_policy_used_turns, total_tasks),
+        "reference_required_total": int(reference_required_total),
+        "reference_ok_turns": int(reference_ok_turns),
+        "reference_pass_rate": _rate(reference_ok_turns, reference_required_total),
+        "instruction_total": int(cat_total.get("instruction", 0)),
+        "instruction_pass_count": int(cat_pass.get("instruction", 0)),
         "instruction_pass_rate": _rate(
             int(cat_pass.get("instruction", 0)), int(cat_total.get("instruction", 0))
         ),
+        "json_total": int(cat_total.get("json", 0)),
+        "json_pass_count": int(cat_pass.get("json", 0)),
         "json_pass_rate": _rate(int(cat_pass.get("json", 0)), int(cat_total.get("json", 0))),
+        "math_total": int(cat_total.get("math", 0)),
+        "math_pass_count": int(cat_pass.get("math", 0)),
         "math_pass_rate": _rate(int(cat_pass.get("math", 0)), int(cat_total.get("math", 0))),
+        "state_total": int(cat_total.get("state", 0)),
+        "state_pass_count": int(cat_pass.get("state", 0)),
         "state_pass_rate": _rate(int(cat_pass.get("state", 0)), int(cat_total.get("state", 0))),
+        "plan_total": int(cat_total.get("plan", 0)),
+        "plan_pass_count": int(cat_pass.get("plan", 0)),
+        "plan_pass_rate": _rate(int(cat_pass.get("plan", 0)), int(cat_total.get("plan", 0))),
+        "clarify_total": int(cat_total.get("clarify", 0)),
+        "clarify_pass_count": int(cat_pass.get("clarify", 0)),
+        "clarify_pass_rate": _rate(
+            int(cat_pass.get("clarify", 0)), int(cat_total.get("clarify", 0))
+        ),
+        "consistency_total": int(cat_total.get("consistency", 0)),
+        "consistency_pass_count": int(cat_pass.get("consistency", 0)),
+        "consistency_pass_rate": _rate(
+            int(cat_pass.get("consistency", 0)), int(cat_total.get("consistency", 0))
+        ),
+        "memory_total": int(cat_total.get("memory", 0)),
+        "memory_pass_count": int(cat_pass.get("memory", 0)),
+        "memory_pass_rate": _rate(int(cat_pass.get("memory", 0)), int(cat_total.get("memory", 0))),
+        "dialogue_total": int(cat_total.get("dialogue", 0)),
+        "dialogue_pass_count": int(cat_pass.get("dialogue", 0)),
+        "dialogue_pass_rate": _rate(int(cat_pass.get("dialogue", 0)), int(cat_total.get("dialogue", 0))),
         "failures": list(failures),
         "plan_trace_turns_total": int(plan_turns_total),
         "plan_trace_missing_turns": int(plan_turns_missing),
@@ -1694,6 +3191,148 @@ def run_skill_suite(
             sorted((str(k), int(v)) for k, v in contract_used_by_kind.items() if str(k))
         ),
     }
+
+    # Per-concept usage evidence (deterministic, compact): used by ICS to compute cross-context
+    # fitness and perform ablation selection without relying on task_id-specific logic.
+    try:
+        usage_out: Dict[str, Any] = {}
+        for cid in sorted(concept_usage_by_id.keys(), key=str):
+            rec = concept_usage_by_id.get(cid) if isinstance(concept_usage_by_id.get(cid), dict) else {}
+            fams = rec.get("families") if isinstance(rec.get("families"), dict) else {}
+            fams_out: Dict[str, Any] = {}
+            for fid in sorted(fams.keys(), key=str):
+                frec = fams.get(fid) if isinstance(fams.get(fid), dict) else {}
+                ex = frec.get("example_task_ids")
+                if isinstance(ex, set):
+                    ex_list = sorted([str(x) for x in ex if str(x)], key=str)[:8]
+                elif isinstance(ex, list):
+                    ex_list = sorted([str(x) for x in ex if str(x)], key=str)[:8]
+                else:
+                    ex_list = []
+                fams_out[str(fid)] = {
+                    "used_turns": int(frec.get("used_turns", 0) or 0),
+                    "ok_turns": int(frec.get("ok_turns", 0) or 0),
+                    "example_task_ids": list(ex_list),
+                }
+            usage_out[str(cid)] = {
+                "used_turns": int(rec.get("used_turns", 0) or 0),
+                "ok_turns": int(rec.get("ok_turns", 0) or 0),
+                "calls_max_depth_max": int(rec.get("calls_max_depth_max", 0) or 0),
+                "families": dict(fams_out),
+            }
+        if usage_out:
+            metrics["concept_usage_by_id"] = dict(usage_out)
+    except Exception:
+        pass
+
+    # Cross-tag semantic reuse: at least one concept should be exercised across different
+    # utility categories (e.g., instruction+json, json+math) in the same run.
+    cross_tag = [
+        (cid, sorted(list(tags0))) for cid, tags0 in concept_used_tags_by_id.items() if len(tags0) >= 2
+    ]
+
+    def _is_seed_concept(cid: str) -> bool:
+        c = str(cid or "")
+        if c.startswith("concept_seed_") or c.startswith("goal_seed_"):
+            return True
+        if c.startswith("act_s000000_concept_"):
+            return True
+        try:
+            act0 = engine.store.get_concept_act(c)
+        except Exception:
+            act0 = None
+        if act0 is None or not isinstance(getattr(act0, "evidence", None), dict):
+            return False
+        name0 = str(act0.evidence.get("name") or "")
+        return name0 in {"concept_seed_v0"}
+
+    cross_tag.sort(key=lambda kv: (_is_seed_concept(str(kv[0])), -len(kv[1]), str(kv[0])))
+    metrics["concept_cross_tag_reuse_count"] = int(len(cross_tag))
+    if cross_tag:
+        metrics["concept_cross_tag_reuse_example"] = {
+            "concept_id": str(cross_tag[0][0]),
+            "used_tags": list(cross_tag[0][1]),
+        }
+
+    # Cross-context reuse (birth vs usage): count concepts whose declared birth_tags are a strict
+    # subset of the categories where they end up being used.
+    cross_ctx = []
+    for cid, used_tags in concept_used_tags_by_id.items():
+        try:
+            act = engine.store.get_concept_act(str(cid))
+        except Exception:
+            act = None
+        if act is None or not isinstance(getattr(act, "evidence", None), dict):
+            continue
+        ev = act.evidence
+        meta0 = ev.get("meta") if isinstance(ev.get("meta"), dict) else {}
+        bt = meta0.get("birth_tags") if isinstance(meta0, dict) else None
+        if not isinstance(bt, list) or not bt:
+            continue
+        birth_tags = {str(x) for x in bt if str(x)}
+        extra = sorted([t for t in used_tags if t not in birth_tags])
+        if extra:
+            cross_ctx.append((cid, sorted(list(birth_tags)), sorted(list(used_tags)), extra))
+    cross_ctx.sort(key=lambda t: (_is_seed_concept(str(t[0])), -len(t[3]), str(t[0])))
+    metrics["concept_cross_context_reuse_count"] = int(len(cross_ctx))
+    if cross_ctx:
+        metrics["concept_cross_context_reuse_example"] = {
+            "concept_id": str(cross_ctx[0][0]),
+            "birth_tags": list(cross_ctx[0][1]),
+            "used_tags": list(cross_ctx[0][2]),
+            "extra_used_tags": list(cross_ctx[0][3]),
+        }
+
+    # Static concept depth (stored hierarchy): depth=0 is leaf (no CSV_CALL),
+    # depth>=1 means calls other concepts, etc. This is independent of dynamic execution depth.
+    try:
+        memo_depth: Dict[str, int] = {}
+
+        def _static_depth(concept_id: str, stack: set) -> int:
+            cid = str(concept_id or "")
+            if not cid:
+                return 0
+            if cid in memo_depth:
+                return int(memo_depth[cid])
+            if cid in stack:
+                memo_depth[cid] = 0
+                return 0
+            try:
+                act0 = engine.store.get_concept_act(cid)
+            except Exception:
+                act0 = None
+            if act0 is None:
+                memo_depth[cid] = 0
+                return 0
+            callees: List[str] = []
+            for ins in list(getattr(act0, "program", []) or []):
+                if str(getattr(ins, "op", "")) != "CSV_CALL":
+                    continue
+                args0 = getattr(ins, "args", {}) or {}
+                if not isinstance(args0, dict):
+                    args0 = {}
+                callee = str(args0.get("concept_id") or "")
+                if callee:
+                    callees.append(callee)
+            if not callees:
+                d0 = 0
+            else:
+                st2 = set(stack)
+                st2.add(cid)
+                d0 = 1 + max(_static_depth(c, st2) for c in callees)
+            memo_depth[cid] = int(d0)
+            return int(d0)
+
+        depths: List[int] = []
+        for a in getattr(engine.store, "concept_acts", lambda: [])():
+            depths.append(int(_static_depth(str(getattr(a, "id", "") or ""), set())))
+        depths.sort()
+        metrics["concept_static_depth_max"] = int(depths[-1]) if depths else 0
+        metrics["concept_static_depth_median"] = int(depths[len(depths) // 2]) if depths else 0
+        metrics["concept_static_depth_ge2_count"] = int(sum(1 for d in depths if int(d) >= 2))
+        metrics["concept_static_depth_ge3_count"] = int(sum(1 for d in depths if int(d) >= 3))
+    except Exception:
+        pass
     return transcripts, metrics
 
 

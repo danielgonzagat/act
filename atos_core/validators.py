@@ -98,6 +98,33 @@ def validate_json_ab_int_exact(output: Any, expected: Any) -> ValidatorResult:
     return ValidatorResult(True, "ok")
 
 
+def validate_json_obj_exact(output: Any, expected: Any) -> ValidatorResult:
+    """
+    Exact JSON object/list validator.
+
+    - `expected` must be a dict or list.
+    - `output` may be a Python dict/list or a JSON string.
+    - If `output` is a string, require it to be canonical JSON for the parsed object.
+    """
+    if not isinstance(expected, (dict, list)):
+        return ValidatorResult(False, "expected_not_json_obj")
+
+    obj, err = _parse_json_obj(output)
+    if obj is None:
+        return ValidatorResult(False, err)
+    if not isinstance(obj, (dict, list)):
+        return ValidatorResult(False, "output_json_wrong_type")
+    if obj != expected:
+        return ValidatorResult(False, "value_mismatch")
+
+    if isinstance(output, str):
+        out_s = str(output).strip()
+        if canonical_json_dumps(obj) != out_s:
+            return ValidatorResult(False, "output_not_canonical_json")
+
+    return ValidatorResult(True, "ok")
+
+
 def validate_list_contains_all_str(output: Any, expected: Any) -> ValidatorResult:
     if not isinstance(output, (list, tuple)):
         return ValidatorResult(False, "output_not_list")
@@ -410,6 +437,7 @@ VALIDATORS: Dict[str, ValidatorFn] = {
     "int_value_exact": validate_int_value_exact,
     "int_text_canonical_exact": validate_int_text_canonical_exact,
     "json_ab_int_exact": validate_json_ab_int_exact,
+    "json_obj_exact": validate_json_obj_exact,
     "list_contains_all_str": validate_list_contains_all_str,
     "text_exact": validate_text_exact,
     "instruction_following_validator": validate_instruction_following,

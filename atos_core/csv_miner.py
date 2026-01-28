@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .act import Act, Instruction, canonical_json_dumps, deterministic_iso, sha256_hex
 from .concepts import PRIMITIVE_OPS
+
+
+_CANON_OUT_RE = re.compile(r"^v[0-9]+$", flags=re.UNICODE)
 
 
 def _read_jsonl(path: str) -> Iterator[Dict[str, Any]]:
@@ -63,6 +67,9 @@ class CsvCandidate:
 def _infer_validator_id(*, ops: List[Dict[str, Any]], output_type: str) -> str:
     if str(output_type) == "int":
         return "int_value_exact"
+    if str(output_type) == "dict":
+        # Deterministic exact object equality (used for intermediate plan/state objects).
+        return "json_obj_exact"
     if ops:
         fns = [str(o.get("fn") or "") for o in ops]
         if fns and fns[-1] == "json_canonical" and "make_dict_ab" in fns:
@@ -91,7 +98,13 @@ def _alpha_rename_segment(
     for idx, v in enumerate(required_vars):
         varmap[str(v)] = f"in{idx}"
     for idx, (_, _, out_v) in enumerate(segment):
-        varmap[str(out_v)] = f"v{idx}"
+        # Preserve canonical plan-style output names ("v0","v1",...) to avoid collisions when
+        # composing mined operators in PlannerV79. For non-canonical outputs, keep alpha-renaming.
+        out_s = str(out_v)
+        if _CANON_OUT_RE.fullmatch(out_s):
+            varmap[out_s] = out_s
+        else:
+            varmap[out_s] = f"v{idx}"
     ops: List[Dict[str, Any]] = []
     for fn, ins, out_v in segment:
         ops.append(

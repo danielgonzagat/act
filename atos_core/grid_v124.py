@@ -45,8 +45,18 @@ def grid_shape_v124(g: GridV124) -> Tuple[int, int]:
 
 
 def grid_hash_v124(g: GridV124) -> str:
-    body = {"schema_version": 124, "grid": grid_to_list_v124(g)}
-    return sha256_hex(canonical_json_dumps(body).encode("utf-8"))
+    # Performance-critical: used heavily by ARC solver memoization.
+    # Keep deterministic and collision-resistant, but avoid JSON encoding overhead.
+    h, w = grid_shape_v124(g)
+    buf = bytearray()
+    buf.extend(b"grid_v124")
+    # ARC grids are small (<256 in both dims), but clamp defensively.
+    buf.append(int(h) & 0xFF)
+    buf.append(int(w) & 0xFF)
+    for row in g:
+        for v in row:
+            buf.append(int(v) & 0xFF)
+    return sha256_hex(bytes(buf))
 
 
 def grid_equal_v124(a: GridV124, b: GridV124) -> bool:
@@ -265,4 +275,3 @@ def detect_symmetry_v124(g: GridV124) -> Dict[str, Any]:
     out["reflect_v"] = bool(reflect_v_v124(g) == g)
     out["rotate180"] = bool(rotate180_v124(g) == g)
     return out
-

@@ -20,6 +20,10 @@ ActKind = Literal[
     "gate_table_ctxsig",
     "concept_csv",
     "goal",
+    "plan",
+    "hypothesis",
+    "causal_link",
+    "reference",
 ]
 
 
