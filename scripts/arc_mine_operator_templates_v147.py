@@ -74,6 +74,29 @@ def _extract_trace_program_op_ids(
         return []
 
     out: List[List[str]] = []
+
+    def _flatten_steps(steps: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Flatten meta steps (macro_call / concept_call) into base steps.
+
+        Operators are sequences of base op_ids; meta-calls are packaging and should not block mining.
+        """
+        flat: List[Dict[str, Any]] = []
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            op_id = str(st.get("op_id") or "")
+            args = st.get("args") if isinstance(st.get("args"), dict) else {}
+            if not op_id:
+                continue
+            if op_id in {"macro_call", "concept_call"}:
+                inner = args.get("steps")
+                if isinstance(inner, list):
+                    flat.extend(_flatten_steps([x for x in inner if isinstance(x, dict)]))
+                continue
+            flat.append({"op_id": str(op_id), "args": dict(args)})
+        return flat
+
     for row in tps[: int(max(0, int(max_programs)))]:
         if not isinstance(row, dict):
             continue
@@ -87,18 +110,8 @@ def _extract_trace_program_op_ids(
         steps = row.get("steps")
         if not isinstance(steps, list) or not steps:
             continue
-        op_ids: List[str] = []
-        for st in steps:
-            if not isinstance(st, dict):
-                continue
-            op_id = str(st.get("op_id") or "")
-            if not op_id:
-                continue
-            if op_id in {"macro_call", "concept_call"}:
-                # Avoid recursive operators / nested concepts; operators are sequences of base op_ids.
-                op_ids = []
-                break
-            op_ids.append(op_id)
+        flat = _flatten_steps([s for s in steps if isinstance(s, dict)])
+        op_ids = [str(s.get("op_id") or "") for s in flat if str(s.get("op_id") or "")]
         if op_ids:
             out.append(op_ids)
     return out

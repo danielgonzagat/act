@@ -21,6 +21,7 @@ NO_PROGRESS_TIMEOUT_S="${NO_PROGRESS_TIMEOUT_S:-0}"
 SCALE_NO_PROGRESS_TIMEOUT_S="${SCALE_NO_PROGRESS_TIMEOUT_S:-${NO_PROGRESS_TIMEOUT_S}}"
 PRESSURE="${PRESSURE:-0}"
 SCALE_USE_PRESSURE_ARGS="${SCALE_USE_PRESSURE_ARGS:-0}"
+REQUIRE_CONCEPT_CALL="${REQUIRE_CONCEPT_CALL:-1}"
 MACRO_TRY_ON_FAIL_ONLY="${MACRO_TRY_ON_FAIL_ONLY:-1}"
 # Macro stage can run with a different policy. Default is 1 (baseline-first) to avoid
 # macro-first branching explosions during operator bootstrapping.
@@ -61,6 +62,32 @@ MACRO_TRACE_MAX_LOSS_SHAPE="${MACRO_TRACE_MAX_LOSS_SHAPE:-2}"
 MACRO_TRACE_MAX_LOSS_CELLS="${MACRO_TRACE_MAX_LOSS_CELLS:-120}"
 CONCEPT_MIN_SUPPORT="${CONCEPT_MIN_SUPPORT:-1}"
 CONCEPT_MAX_CONCEPTS="${CONCEPT_MAX_CONCEPTS:-128}"
+# Concept mining controls (v146). Defaults preserve existing behavior.
+CONCEPT_MIN_LEN="${CONCEPT_MIN_LEN:-1}"
+CONCEPT_MAX_LEN="${CONCEPT_MAX_LEN:-3}"
+CONCEPT_TRACE_MAX_PROGRAMS_PER_TASK="${CONCEPT_TRACE_MAX_PROGRAMS_PER_TASK:-40}"
+CONCEPT_TRACE_MAX_LOSS_SHAPE="${CONCEPT_TRACE_MAX_LOSS_SHAPE:-0}"
+CONCEPT_TRACE_MAX_LOSS_CELLS="${CONCEPT_TRACE_MAX_LOSS_CELLS:-120}"
+# Concept CSG mining controls. These produce concrete, binderized multi-step closures
+# that keep concept_call atomic (no arg branching) and collapse search depth early.
+CSG_MIN_LEN="${CSG_MIN_LEN:-3}"
+CSG_MAX_LEN="${CSG_MAX_LEN:-12}"
+CSG_MIN_SUPPORT="${CSG_MIN_SUPPORT:-3}"
+CSG_SUPPORT_SLACK_EVERY="${CSG_SUPPORT_SLACK_EVERY:-2}"
+CSG_MAX_TEMPLATES="${CSG_MAX_TEMPLATES:-512}"
+CSG_MAX_LOSS_SHAPE="${CSG_MAX_LOSS_SHAPE:-0}"
+CSG_MAX_LOSS_CELLS="${CSG_MAX_LOSS_CELLS:-80}"
+CSG_PREFIX_ONLY="${CSG_PREFIX_ONLY:-1}"
+# v153: window miner (not just prefixes) and strict TRAIN-loss drop from the window start state.
+CSG_MAX_CANDIDATES_PER_TASK="${CSG_MAX_CANDIDATES_PER_TASK:-3}"
+CSG_MIN_LOSS_DROP="${CSG_MIN_LOSS_DROP:-1}"
+CSG_REQUIRE_LAST_WRITES_GRID="${CSG_REQUIRE_LAST_WRITES_GRID:-1}"
+# Optional: enable deterministic trace→CSG induction retry pass inside the solver (learn mode only).
+# This can collapse deep near-miss pipelines into atomic concept_call steps and improve mining yield.
+TRACE_CSG_INDUCTION="${TRACE_CSG_INDUCTION:-0}"
+TRACE_CSG_FIRST_PASS_FRAC="${TRACE_CSG_FIRST_PASS_FRAC:-0.55}"
+# Concept bank merge cap (v146). Defaults preserve existing behavior.
+CONCEPT_BANK_MAX_LEN="${CONCEPT_BANK_MAX_LEN:-3}"
 # Keep merged min support low to bootstrap concept emergence; concept calls remain fail-closed per-task.
 CONCEPT_MERGED_MIN_SUPPORT="${CONCEPT_MERGED_MIN_SUPPORT:-1}"
 CONCEPT_BANK_MAX_CONCEPTS="${CONCEPT_BANK_MAX_CONCEPTS:-128}"
@@ -116,6 +143,12 @@ if [ "${PRESSURE}" != "0" ] && [ "${SCALE_USE_PRESSURE_ARGS}" != "0" ]; then
   # This avoids long-tail stalls from the full repair stage while we are still mining/validating operators.
   SCALE_ARGS+=(--disable_repair_stage --abstraction_pressure)
 fi
+# Contract safety: when concept_call is required, the macro/scale stage must still
+# surface concept_call (fail-closed). Without abstraction pressure, the solver can
+# produce primitive-only programs that are rejected by --require_concept_call.
+if [ "${REQUIRE_CONCEPT_CALL}" != "0" ]; then
+  SCALE_ARGS+=(--abstraction_pressure)
+fi
 
 CONCEPT_ARGS=()
 if [ "${CONCEPTS}" != "0" ] && [ -n "${CONCEPT_BANK_IN}" ]; then
@@ -126,13 +159,27 @@ if [ "${CONCEPTS}" != "0" ] && [ -n "${CONCEPT_BANK_IN}" ]; then
   CONCEPT_ARGS+=(--concept_templates "${CONCEPT_BANK_IN}")
 fi
 
+MACRO_ARGS_BASE=()
+if [ "${MACROS}" != "0" ] && [ -n "${MACRO_BANK_IN}" ]; then
+  if [ ! -f "${MACRO_BANK_IN}" ]; then
+    echo "[arc_loop] ERROR: MACRO_BANK_IN not found: ${MACRO_BANK_IN}"
+    exit 2
+  fi
+  # Use the current macro bank during the LEARN/base run as well.
+  # Rationale: macro_call steps can be flattened into primitive pipelines for CSG mining,
+  # and can also help reach informative near-miss traces under tight budgets.
+  MACRO_ARGS_BASE+=(--macro_templates "${MACRO_BANK_IN}")
+fi
+
 RUN_BASE_CMD=(python3 scripts/run_arc_scalpel_v141.py)
+RUN_BASE_CMD+=(--mode learn)
 RUN_BASE_CMD+=(--arc_root "${ARC_ROOT}")
 RUN_BASE_CMD+=(--split training)
 RUN_BASE_CMD+=(--limit "${LIMIT}")
 RUN_BASE_CMD+=(--seed "${SEED}")
 RUN_BASE_CMD+=(--tries "${TRIES}")
 RUN_BASE_CMD+=(--jobs "${JOBS}")
+RUN_BASE_CMD+=(--require_concept_call "${REQUIRE_CONCEPT_CALL}")
 RUN_BASE_CMD+=(--task_timeout_s "${TASK_TIMEOUT_S}")
 RUN_BASE_CMD+=(--no_progress_timeout_s "${NO_PROGRESS_TIMEOUT_S}")
 RUN_BASE_CMD+=(--max_depth "${MAX_DEPTH}")
@@ -145,6 +192,9 @@ RUN_BASE_CMD+=(--macro_max_branch_per_op "${MACRO_MAX_BRANCH_PER_OP}")
 if [ "${DISABLE_REACHABILITY_PRUNING}" != "0" ]; then
   RUN_BASE_CMD+=(--disable_reachability_pruning)
 fi
+if [ "${TRACE_CSG_INDUCTION}" != "0" ]; then
+  RUN_BASE_CMD+=(--trace_csg_induction 1 --trace_csg_first_pass_frac "${TRACE_CSG_FIRST_PASS_FRAC}")
+fi
 if [ "${#EXTRA_ARGS[@]}" != "0" ]; then
   RUN_BASE_CMD+=("${EXTRA_ARGS[@]}")
 fi
@@ -153,6 +203,9 @@ if [ "${#PRESSURE_ARGS[@]}" != "0" ]; then
 fi
 if [ "${#CONCEPT_ARGS[@]}" != "0" ]; then
   RUN_BASE_CMD+=("${CONCEPT_ARGS[@]}")
+fi
+if [ "${#MACRO_ARGS_BASE[@]}" != "0" ]; then
+  RUN_BASE_CMD+=("${MACRO_ARGS_BASE[@]}")
 fi
 if [ "${OMEGA}" != "0" ]; then
   RUN_BASE_CMD+=(--omega)
@@ -211,23 +264,64 @@ if [ "${CONCEPTS}" != "0" ]; then
     --out "${CONCEPTS_OUT}" \
     --induction_log "${INDUCTION_LOG_OUT}" \
     --min_support "${CONCEPT_MIN_SUPPORT}" \
+    --min_len "${CONCEPT_MIN_LEN}" \
+    --max_len "${CONCEPT_MAX_LEN}" \
+    --trace_max_programs_per_task "${CONCEPT_TRACE_MAX_PROGRAMS_PER_TASK}" \
+    --trace_max_loss_shape "${CONCEPT_TRACE_MAX_LOSS_SHAPE}" \
+    --trace_max_loss_cells "${CONCEPT_TRACE_MAX_LOSS_CELLS}" \
     --max_concepts "${CONCEPT_MAX_CONCEPTS}"
   echo "[arc_loop] concept induction log: ${INDUCTION_LOG_OUT}"
 
-  CONCEPT_BANK_OUT="artifacts/arc_concept_bank_v146_${TS}.jsonl"
+  CSG_OUT_V152="artifacts/arc_concept_csg_templates_v152_${TS}.jsonl"
+  echo
+  echo "[arc_loop] mining concept CSGs (v152 prefixes): ${CSG_OUT_V152}"
+  python3 scripts/arc_induce_concept_csg_templates_v152.py \
+    --tasks_jsonl "${OUT_BASE}_try1/input/arc_tasks_canonical_v141.jsonl" \
+    --traces "${OUT_BASE}_try1/trace_candidates.jsonl" \
+    --out "${CSG_OUT_V152}" \
+    --min_len "${CSG_MIN_LEN}" \
+    --max_len "${CSG_MAX_LEN}" \
+    --min_support "${CSG_MIN_SUPPORT}" \
+    --support_slack_every "${CSG_SUPPORT_SLACK_EVERY}" \
+    --max_templates "${CSG_MAX_TEMPLATES}" \
+    --max_loss_shape "${CSG_MAX_LOSS_SHAPE}" \
+    --max_loss_cells "${CSG_MAX_LOSS_CELLS}" \
+    --max_candidates_per_task "${CSG_MAX_CANDIDATES_PER_TASK}" \
+    --min_loss_drop "${CSG_MIN_LOSS_DROP}" \
+    --require_last_writes_grid "${CSG_REQUIRE_LAST_WRITES_GRID}"
+
+  CSG_OUT_V153="artifacts/arc_concept_csg_templates_v153_${TS}.jsonl"
+  echo
+  echo "[arc_loop] mining concept CSGs (v153 windows): ${CSG_OUT_V153}"
+  python3 scripts/arc_induce_concept_csg_templates_v153.py \
+    --tasks_jsonl "${OUT_BASE}_try1/input/arc_tasks_canonical_v141.jsonl" \
+    --traces "${OUT_BASE}_try1/trace_candidates.jsonl" \
+    --out "${CSG_OUT_V153}" \
+    --min_len "${CSG_MIN_LEN}" \
+    --max_len "${CSG_MAX_LEN}" \
+    --min_support "${CSG_MIN_SUPPORT}" \
+    --support_slack_every "${CSG_SUPPORT_SLACK_EVERY}" \
+    --max_templates "${CSG_MAX_TEMPLATES}" \
+    --max_loss_shape "${CSG_MAX_LOSS_SHAPE}" \
+    --max_loss_cells "${CSG_MAX_LOSS_CELLS}" \
+    --max_candidates_per_task "${CSG_MAX_CANDIDATES_PER_TASK}" \
+    --min_loss_drop "${CSG_MIN_LOSS_DROP}" \
+    --require_last_writes_grid "${CSG_REQUIRE_LAST_WRITES_GRID}"
+
+  CONCEPT_BANK_OUT="artifacts/arc_concept_bank_v150_${TS}.jsonl"
   MERGE_CONCEPT_INS=()
   if [ -n "${CONCEPT_BANK_IN}" ]; then
     MERGE_CONCEPT_INS+=(--in "${CONCEPT_BANK_IN}")
   fi
   MERGE_CONCEPT_INS+=(--in "${CONCEPTS_OUT}")
+  MERGE_CONCEPT_INS+=(--in "${CSG_OUT_V152}")
+  MERGE_CONCEPT_INS+=(--in "${CSG_OUT_V153}")
 
   echo
   echo "[arc_loop] updating concept bank: ${CONCEPT_BANK_OUT}"
-  python3 scripts/arc_merge_concept_templates_v146.py \
+  python3 scripts/arc_merge_concept_bank_v150.py \
     "${MERGE_CONCEPT_INS[@]}" \
-    --out "${CONCEPT_BANK_OUT}" \
-    --min_support "${CONCEPT_MERGED_MIN_SUPPORT}" \
-    --max_concepts "${CONCEPT_BANK_MAX_CONCEPTS}"
+    --out "${CONCEPT_BANK_OUT}"
 
   CONCEPT_BANK_IN="${CONCEPT_BANK_OUT}"
   echo "[arc_loop] next CONCEPT_BANK_IN: ${CONCEPT_BANK_OUT}"
@@ -366,6 +460,7 @@ if [ "${MACROS}" != "0" ]; then
   RUN_MACRO_CMD+=(--seed "${SEED}")
   RUN_MACRO_CMD+=(--tries "${TRIES}")
   RUN_MACRO_CMD+=(--jobs "${JOBS}")
+  RUN_MACRO_CMD+=(--require_concept_call "${REQUIRE_CONCEPT_CALL}")
   RUN_MACRO_CMD+=(--task_timeout_s "${SCALE_TASK_TIMEOUT_S}")
   RUN_MACRO_CMD+=(--no_progress_timeout_s "${SCALE_NO_PROGRESS_TIMEOUT_S}")
   RUN_MACRO_CMD+=(--max_depth "${MAX_DEPTH}")
@@ -531,15 +626,51 @@ if [ "${MACROS}" != "0" ]; then
       --min_support "${CONCEPT_MIN_SUPPORT}" \
       --max_concepts "${CONCEPT_MAX_CONCEPTS}"
 
-    CONCEPT_BANK_OUT2="artifacts/arc_concept_bank_v146_${TS}_macros.jsonl"
+    CSG_OUT_MACRO_V152="artifacts/arc_concept_csg_templates_v152_${TS}_macros.jsonl"
+    echo
+    echo "[arc_loop] mining concept CSGs (v152 prefixes, macro run): ${CSG_OUT_MACRO_V152}"
+    python3 scripts/arc_induce_concept_csg_templates_v152.py \
+      --tasks_jsonl "${OUT_BASE_MACRO}_try1/input/arc_tasks_canonical_v141.jsonl" \
+      --traces "${OUT_BASE_MACRO}_try1/trace_candidates.jsonl" \
+      --out "${CSG_OUT_MACRO_V152}" \
+      --min_len "${CSG_MIN_LEN}" \
+      --max_len "${CSG_MAX_LEN}" \
+      --min_support "${CSG_MIN_SUPPORT}" \
+      --support_slack_every "${CSG_SUPPORT_SLACK_EVERY}" \
+      --max_templates "${CSG_MAX_TEMPLATES}" \
+      --max_loss_shape "${CSG_MAX_LOSS_SHAPE}" \
+      --max_loss_cells "${CSG_MAX_LOSS_CELLS}" \
+      --max_candidates_per_task "${CSG_MAX_CANDIDATES_PER_TASK}" \
+      --min_loss_drop "${CSG_MIN_LOSS_DROP}" \
+      --require_last_writes_grid "${CSG_REQUIRE_LAST_WRITES_GRID}"
+
+    CSG_OUT_MACRO_V153="artifacts/arc_concept_csg_templates_v153_${TS}_macros.jsonl"
+    echo
+    echo "[arc_loop] mining concept CSGs (v153 windows, macro run): ${CSG_OUT_MACRO_V153}"
+    python3 scripts/arc_induce_concept_csg_templates_v153.py \
+      --tasks_jsonl "${OUT_BASE_MACRO}_try1/input/arc_tasks_canonical_v141.jsonl" \
+      --traces "${OUT_BASE_MACRO}_try1/trace_candidates.jsonl" \
+      --out "${CSG_OUT_MACRO_V153}" \
+      --min_len "${CSG_MIN_LEN}" \
+      --max_len "${CSG_MAX_LEN}" \
+      --min_support "${CSG_MIN_SUPPORT}" \
+      --support_slack_every "${CSG_SUPPORT_SLACK_EVERY}" \
+      --max_templates "${CSG_MAX_TEMPLATES}" \
+      --max_loss_shape "${CSG_MAX_LOSS_SHAPE}" \
+      --max_loss_cells "${CSG_MAX_LOSS_CELLS}" \
+      --max_candidates_per_task "${CSG_MAX_CANDIDATES_PER_TASK}" \
+      --min_loss_drop "${CSG_MIN_LOSS_DROP}" \
+      --require_last_writes_grid "${CSG_REQUIRE_LAST_WRITES_GRID}"
+
+    CONCEPT_BANK_OUT2="artifacts/arc_concept_bank_v150_${TS}_macros.jsonl"
     echo
     echo "[arc_loop] updating concept bank (macro run): ${CONCEPT_BANK_OUT2}"
-    python3 scripts/arc_merge_concept_templates_v146.py \
+    python3 scripts/arc_merge_concept_bank_v150.py \
       --in "${CONCEPT_BANK_IN}" \
       --in "${CONCEPTS_OUT_MACRO}" \
-      --out "${CONCEPT_BANK_OUT2}" \
-      --min_support "${CONCEPT_MERGED_MIN_SUPPORT}" \
-      --max_concepts "${CONCEPT_BANK_MAX_CONCEPTS}"
+      --in "${CSG_OUT_MACRO_V152}" \
+      --in "${CSG_OUT_MACRO_V153}" \
+      --out "${CONCEPT_BANK_OUT2}"
 
     CONCEPT_BANK_IN="${CONCEPT_BANK_OUT2}"
     echo "[arc_loop] next CONCEPT_BANK_IN (macro merged): ${CONCEPT_BANK_OUT2}"
@@ -661,6 +792,9 @@ PY
       fi
     fi
     RUN_DEEP_MACRO_CMD+=(--macro_templates "${MERGED_MACROS_OUT}")
+    if [ -n "${CONCEPT_BANK_IN}" ]; then
+      RUN_DEEP_MACRO_CMD+=(--concept_templates "${CONCEPT_BANK_IN}")
+    fi
     RUN_DEEP_MACRO_CMD+=(--out_base "${OUT_BASE_MERGED}")
     "${RUN_DEEP_MACRO_CMD[@]}"
 
@@ -672,6 +806,58 @@ PY
     echo
     echo "[arc_loop] merged macro summary: ${OUT_BASE_MERGED}_try1/summary.json"
     echo "[arc_loop] merged macro diag: artifacts/arc_diag_v142_${TS}_macros_deep.md"
+
+    if [ "${CONCEPTS}" != "0" ] && [ -n "${CONCEPT_BANK_IN}" ]; then
+      # Bump concept support based on actual concept_call usage in the merged macro run.
+      CONCEPT_BANK_BUMPED3="artifacts/arc_concept_bank_v146_${TS}_macros_deep_bumped.jsonl"
+      echo
+      echo "[arc_loop] bumping concept support (merged macro run): ${CONCEPT_BANK_BUMPED3}"
+      python3 scripts/arc_bump_concept_support_v146.py \
+        --concept_bank_in "${CONCEPT_BANK_IN}" \
+        --run_dir "${OUT_BASE_MERGED}_try1" \
+        --out "${CONCEPT_BANK_BUMPED3}"
+      CONCEPT_BANK_IN="${CONCEPT_BANK_BUMPED3}"
+      echo "[arc_loop] next CONCEPT_BANK_IN (macros_deep bumped): ${CONCEPT_BANK_BUMPED3}"
+
+      CONCEPTS_OUT_MACRO_DEEP="artifacts/arc_concept_templates_v146_${TS}_macros_deep.jsonl"
+      echo
+      echo "[arc_loop] mining concepts (merged macro run): ${CONCEPTS_OUT_MACRO_DEEP}"
+      python3 scripts/arc_induce_concept_templates_v146.py \
+        --run_dir "${OUT_BASE_MERGED}_try1" \
+        --out "${CONCEPTS_OUT_MACRO_DEEP}" \
+        --min_support "${CONCEPT_MIN_SUPPORT}" \
+        --max_concepts "${CONCEPT_MAX_CONCEPTS}"
+
+      CSG_OUT_MACRO_DEEP="artifacts/arc_concept_csg_templates_v153_${TS}_macros_deep.jsonl"
+      echo
+      echo "[arc_loop] mining concept CSGs (v153, merged macro run): ${CSG_OUT_MACRO_DEEP}"
+      python3 scripts/arc_induce_concept_csg_templates_v153.py \
+        --tasks_jsonl "${OUT_BASE_MERGED}_try1/input/arc_tasks_canonical_v141.jsonl" \
+        --traces "${OUT_BASE_MERGED}_try1/trace_candidates.jsonl" \
+        --out "${CSG_OUT_MACRO_DEEP}" \
+        --min_len "${CSG_MIN_LEN}" \
+        --max_len "${CSG_MAX_LEN}" \
+        --min_support "${CSG_MIN_SUPPORT}" \
+        --support_slack_every "${CSG_SUPPORT_SLACK_EVERY}" \
+        --max_templates "${CSG_MAX_TEMPLATES}" \
+        --max_loss_shape "${CSG_MAX_LOSS_SHAPE}" \
+        --max_loss_cells "${CSG_MAX_LOSS_CELLS}" \
+        --max_candidates_per_task "${CSG_MAX_CANDIDATES_PER_TASK}" \
+        --min_loss_drop "${CSG_MIN_LOSS_DROP}" \
+        --require_last_writes_grid "${CSG_REQUIRE_LAST_WRITES_GRID}"
+
+      CONCEPT_BANK_OUT3="artifacts/arc_concept_bank_v150_${TS}_macros_deep.jsonl"
+      echo
+      echo "[arc_loop] updating concept bank (merged macro run): ${CONCEPT_BANK_OUT3}"
+      python3 scripts/arc_merge_concept_bank_v150.py \
+        --in "${CONCEPT_BANK_IN}" \
+        --in "${CONCEPTS_OUT_MACRO_DEEP}" \
+        --in "${CSG_OUT_MACRO_DEEP}" \
+        --out "${CONCEPT_BANK_OUT3}"
+
+      CONCEPT_BANK_IN="${CONCEPT_BANK_OUT3}"
+      echo "[arc_loop] next CONCEPT_BANK_IN (macros_deep merged): ${CONCEPT_BANK_OUT3}"
+    fi
 
     if [ "${OMEGA}" != "0" ]; then
       echo

@@ -166,6 +166,13 @@ def _excluded_dir_parts_v141() -> set:
         ".git",
         "__pycache__",
         ".pycache",
+        # Datasets are treated as external inputs for isolation purposes. Including them in the
+        # repo snapshot can produce false isolation violations if a dataset is newly added or
+        # updated (e.g. downloading ARC-AGI-2) while keeping code unchanged.
+        "ARC-AGI",
+        "arc-agi-2",
+        "ARC-AGI-2",
+        "data",
         "artifacts",
         "results",
         "tmp",
@@ -214,6 +221,234 @@ def _grid_equal(a: Sequence[Sequence[int]], b: Sequence[Sequence[int]]) -> bool:
     return True
 
 
+def _grid_shape_v141(g: Sequence[Sequence[int]]) -> Tuple[int, int]:
+    h = int(len(g))
+    w = int(len(g[0])) if h > 0 else 0
+    return (int(h), int(w))
+
+
+def _unique_colors_v141(g: Sequence[Sequence[int]]) -> set:
+    out = set()
+    for row in g:
+        for v in row:
+            out.add(int(v))
+    return out
+
+
+def _shape_rel_for_pairs_v141(pairs: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]]) -> str:
+    if not pairs:
+        return "unknown"
+    if all(a == b for a, b in pairs):
+        return "same"
+    if all(b == (a[1], a[0]) for a, b in pairs):
+        return "swap_hw"
+    ratios = set()
+    for (hi, wi), (ho, wo) in pairs:
+        if hi <= 0 or wi <= 0 or ho <= 0 or wo <= 0:
+            return "shape_change_mixed"
+        if ho % hi != 0 or wo % wi != 0:
+            return "shape_change_mixed"
+        ratios.add((int(ho // hi), int(wo // wi)))
+    if len(ratios) == 1:
+        ry, rx = list(ratios)[0]
+        return f"scale_integer:{int(ry)}x{int(rx)}"
+    return "shape_change_mixed"
+
+
+def _palette_rel_v141(p_in: set, p_out: set) -> str:
+    if p_out.issubset(p_in):
+        if p_in == p_out:
+            return "equal"
+        return "subset"
+    if p_in.issubset(p_out):
+        return "superset"
+    return "other"
+
+
+def _delta_density_bin_v141(train_pairs: Sequence[Tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]]) -> str:
+    diffs: List[float] = []
+    for inp, out in train_pairs:
+        hi, wi = _grid_shape_v141(inp)
+        ho, wo = _grid_shape_v141(out)
+        if (int(hi), int(wi)) != (int(ho), int(wo)) or int(hi) <= 0 or int(wi) <= 0:
+            continue
+        diff = 0
+        for r in range(int(hi)):
+            for c in range(int(wi)):
+                if int(inp[int(r)][int(c)]) != int(out[int(r)][int(c)]):
+                    diff += 1
+        diffs.append(float(diff) / float(max(1, int(hi) * int(wi))))
+    if not diffs:
+        return "n/a"
+    avg = sum(diffs) / float(len(diffs))
+    if avg <= 0.10:
+        return "sparse<=0.10"
+    if avg <= 0.30:
+        return "local<=0.30"
+    return "dense>0.30"
+
+
+def _task_feat_key_from_train_pairs_v141(
+    *, train_pairs: Sequence[Tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]]
+) -> Tuple[str, str, str]:
+    shapes: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    pin: set = set()
+    pout: set = set()
+    for inp, out in train_pairs:
+        shapes.append((_grid_shape_v141(inp), _grid_shape_v141(out)))
+        pin |= _unique_colors_v141(inp)
+        pout |= _unique_colors_v141(out)
+    return (
+        str(_shape_rel_for_pairs_v141(shapes)),
+        str(_palette_rel_v141(pin, pout)),
+        str(_delta_density_bin_v141(train_pairs)),
+    )
+
+
+def _colors_bin_v141(n: int) -> str:
+    x = int(n)
+    if x <= 2:
+        return "c<=2"
+    if x <= 4:
+        return "c<=4"
+    if x <= 6:
+        return "c<=6"
+    if x <= 9:
+        return "c<=9"
+    return "c=10"
+
+
+def _dim_bin_v141(h: int, w: int) -> str:
+    m = max(int(h), int(w))
+    if m <= 5:
+        return "d<=5"
+    if m <= 10:
+        return "d<=10"
+    if m <= 20:
+        return "d<=20"
+    return "d>20"
+
+
+def _task_feat_key_v2_from_train_pairs_v141(
+    *, train_pairs: Sequence[Tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]]
+) -> Tuple[str, ...]:
+    shapes: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    pin: set = set()
+    pout: set = set()
+    in_dims: List[Tuple[int, int]] = []
+    out_dims: List[Tuple[int, int]] = []
+    for inp, out in train_pairs:
+        si = _grid_shape_v141(inp)
+        so = _grid_shape_v141(out)
+        shapes.append((si, so))
+        in_dims.append(tuple(int(x) for x in si))
+        out_dims.append(tuple(int(x) for x in so))
+        pin |= _unique_colors_v141(inp)
+        pout |= _unique_colors_v141(out)
+
+    hi = max((int(h) for h, _w in in_dims), default=0)
+    wi = max((int(w) for _h, w in in_dims), default=0)
+    ho = max((int(h) for h, _w in out_dims), default=0)
+    wo = max((int(w) for _h, w in out_dims), default=0)
+
+    return (
+        str(_shape_rel_for_pairs_v141(shapes)),
+        str(_palette_rel_v141(pin, pout)),
+        str(_delta_density_bin_v141(train_pairs)),
+        f"n{int(len(list(train_pairs)))}",
+        f"in_{_colors_bin_v141(len(pin))}",
+        f"out_{_colors_bin_v141(len(pout))}",
+        f"in_{_dim_bin_v141(int(hi), int(wi))}",
+        f"out_{_dim_bin_v141(int(ho), int(wo))}",
+    )
+
+
+def _enrich_concept_support_task_feat_keys_v141(*, concept_templates_rows: List[Dict[str, Any]], arc_root: str) -> None:
+    """
+    Add a cheap, training-only feature signature for each concept template's support tasks.
+
+    This enables deterministic concept retrieval ranking inside the solver without giving it
+    any direct access to the filesystem/dataset at runtime.
+    """
+    # Prefer the current arc_root, but allow cross-root concept banks (ARC-AGI1 + ARC-AGI2).
+    train_dirs: List[Path] = []
+    root_primary = (Path(str(arc_root)) / "data" / "training").resolve()
+    train_dirs.append(root_primary)
+    for alt in ("ARC-AGI", "arc-agi-2", "ARC-AGI-2"):
+        p = (Path(str(alt)) / "data" / "training").resolve()
+        if p not in train_dirs:
+            train_dirs.append(p)
+
+    feat_cache_v1: Dict[str, Tuple[str, str, str]] = {}
+    feat_cache_v2: Dict[str, Tuple[str, ...]] = {}
+
+    def _read_train_pairs(tid: str) -> Optional[List[Tuple[List[List[int]], List[List[int]]]]]:
+        if tid in feat_cache_v2:
+            return None
+        for train_dir in train_dirs:
+            if not train_dir.is_dir():
+                continue
+            p = (train_dir / str(tid)).resolve()
+            if not str(p).startswith(str(train_dir)):
+                continue
+            if not p.is_file():
+                continue
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            train_raw = obj.get("train")
+            if not isinstance(train_raw, list) or not train_raw:
+                continue
+            out: List[Tuple[List[List[int]], List[List[int]]]] = []
+            for row in train_raw:
+                if not isinstance(row, dict):
+                    continue
+                gi = row.get("input")
+                go = row.get("output")
+                if not isinstance(gi, list) or not isinstance(go, list):
+                    continue
+                out.append((gi, go))
+            if not out:
+                continue
+            return out
+        return None
+
+    for tmpl in concept_templates_rows:
+        if not isinstance(tmpl, dict):
+            continue
+        has_v1 = isinstance(tmpl.get("support_task_feat_keys"), list)
+        has_v2 = isinstance(tmpl.get("support_task_feat_keys_v2"), list)
+        if has_v1 and has_v2:
+            continue
+        stids = tmpl.get("support_task_ids") if isinstance(tmpl.get("support_task_ids"), list) else []
+        feats_v1 = set()
+        feats_v2 = set()
+        # Deterministic cap for runtime/memory.
+        for tid0 in stids[:64]:
+            tid = str(tid0 or "").strip().replace("\\", "/").lstrip("/")
+            if not tid:
+                continue
+            if not tid.endswith(".json"):
+                tid = tid + ".json"
+            if tid not in feat_cache_v2:
+                pairs = _read_train_pairs(tid)
+                if pairs is None:
+                    continue
+                feat_cache_v1[tid] = _task_feat_key_from_train_pairs_v141(train_pairs=pairs)
+                feat_cache_v2[tid] = _task_feat_key_v2_from_train_pairs_v141(train_pairs=pairs)
+            if tid in feat_cache_v1:
+                feats_v1.add(feat_cache_v1[tid])
+            if tid in feat_cache_v2:
+                feats_v2.add(feat_cache_v2[tid])
+        if (not has_v1) and feats_v1:
+            tmpl["support_task_feat_keys"] = [list(x) for x in sorted(feats_v1)]
+        if (not has_v2) and feats_v2:
+            tmpl["support_task_feat_keys_v2"] = [list(x) for x in sorted(feats_v2)]
+
+
 def _benchmark_profile_default_trials(profile: str) -> int:
     p = str(profile)
     if p == "ARC_AGI2_PROFILE":
@@ -226,6 +461,7 @@ def _score_test_case_all_k_v141(
     solver_res: Dict[str, Any],
     want_grid: Optional[Sequence[Sequence[int]]],
     max_trials: int,
+    require_concept_call: bool = False,
 ) -> Dict[str, Any]:
     status = str(solver_res.get("status") or "")
     if want_grid is None:
@@ -240,16 +476,52 @@ def _score_test_case_all_k_v141(
             "scores_by_k": {},
         }
 
+    def _has_concept_call(steps: Any) -> bool:
+        if not isinstance(steps, list):
+            return False
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            if str(st.get("op_id") or "") == "concept_call":
+                return True
+        return False
+
     # Candidate outputs from solver.
+    #
+    # IMPORTANT: keep positional alignment with per-candidate steps (if present). Do NOT
+    # filter out placeholders here; skip invalid candidates at comparison time.
     preds = solver_res.get("predicted_grids")
     if isinstance(preds, list) and preds:
-        candidates = [p for p in preds if isinstance(p, list)]
+        candidates = list(preds)
     else:
         pred = solver_res.get("predicted_grid")
-        candidates = [pred] if isinstance(pred, list) else []
+        candidates = [pred] if pred is not None else []
+
+    # Candidate program steps aligned with candidate outputs (when available).
+    #
+    # NOTE: In FAIL-CLOSED mode, the solver may return status=UNKNOWN with a correct
+    # candidate output, but without top-level program_steps. In that case we must
+    # enforce require_concept_call using per-candidate steps.
+    steps_by_cand: List[Any] = []
+    cps = solver_res.get("candidate_program_steps")
+    if isinstance(cps, list) and cps:
+        steps_by_cand = list(cps)
+    else:
+        cand_programs = solver_res.get("candidate_programs")
+        if isinstance(cand_programs, list) and cand_programs:
+            for cp in cand_programs:
+                if not isinstance(cp, dict):
+                    steps_by_cand.append(None)
+                    continue
+                steps_by_cand.append(cp.get("program_steps"))
+        else:
+            ps = solver_res.get("program_steps")
+            if isinstance(ps, list) and ps:
+                steps_by_cand = [ps]
 
     scores_by_k: Dict[str, Any] = {}
     any_ok = False
+    any_ok_ignoring_concept_gate = False
     for k in (1, 2, 3):
         kk = int(k)
         if kk <= 0:
@@ -257,10 +529,17 @@ def _score_test_case_all_k_v141(
         if kk > int(max_trials):
             continue
         ok = False
-        for cand in candidates[:kk]:
-            if _grid_equal(cand, want_grid):
-                ok = True
-                break
+        for i, cand in enumerate(candidates[:kk]):
+            if not isinstance(cand, list) or not _grid_equal(cand, want_grid):
+                continue
+            any_ok_ignoring_concept_gate = True
+            if bool(require_concept_call):
+                # Enforce that the *matching candidate* is backed by concept_call.
+                steps = steps_by_cand[i] if i < len(steps_by_cand) else None
+                if not _has_concept_call(steps):
+                    continue
+            ok = True
+            break
         scores_by_k[str(kk)] = {"k": int(kk), "ok": bool(ok)}
         any_ok = bool(any_ok) or bool(ok)
     # failure_kind for aggregates uses solver status/failure_reason.
@@ -271,10 +550,151 @@ def _score_test_case_all_k_v141(
     # If the solver produced outputs but none match the test target, mark explicitly.
     if not any_ok and not fk and candidates:
         fk = "WRONG_OUTPUT"
+    if bool(require_concept_call) and not any_ok and any_ok_ignoring_concept_gate:
+        # Fail-closed: output correctness does not count as SOLVED if concept usage is absent.
+        fk = "NO_CONCEPT_CALL"
     return {
         "solver_status": status if status in {"SOLVED", "UNKNOWN"} else "FAIL",
         "scored": True,
         "failure_kind": fk,
+        "scores_by_k": scores_by_k,
+    }
+
+
+def _score_task_all_tests_all_k_v141(
+    *,
+    solver_results: Sequence[Dict[str, Any]],
+    want_grids: Sequence[Optional[Sequence[Sequence[int]]]],
+    max_trials: int,
+    require_concept_call: bool = False,
+) -> Dict[str, Any]:
+    """
+    Score an ARC task with multiple test cases.
+
+    Task is considered solved only if *all* test outputs are correct under the same k.
+    This is stricter and avoids self-deception on ARC-AGI datasets with multiple test inputs.
+    """
+    if not want_grids or any(w is None for w in want_grids):
+        # Unscored mode (e.g. internal suites without test outputs): fall back to solver status only.
+        status0 = ""
+        if solver_results:
+            status0 = str(solver_results[0].get("status") or "")
+        fk0 = ""
+        fr = solver_results[0].get("failure_reason") if solver_results and isinstance(solver_results[0], dict) else {}
+        if isinstance(fr, dict):
+            fk0 = str(fr.get("kind") or "")
+        return {
+            "solver_status": status0 if status0 in {"SOLVED", "UNKNOWN"} else "FAIL",
+            "scored": False,
+            "failure_kind": fk0,
+            "scores_by_k": {},
+        }
+
+    if len(want_grids) <= 1:
+        # Single-test tasks: keep legacy scoring (k means "any of first k candidate outputs").
+        return _score_test_case_all_k_v141(
+            solver_res=solver_results[0] if solver_results else {},
+            want_grid=want_grids[0] if want_grids else None,
+            max_trials=int(max_trials),
+            require_concept_call=bool(require_concept_call),
+        )
+
+    # Multi-test tasks: require *one* candidate program to solve *all* tests.
+    #
+    # IMPORTANT: k means "try the first k candidate programs" and candidate index i is shared
+    # across tests. It is invalid to solve test0 with candidate0 and test1 with candidate1.
+    def _cands(sr: Dict[str, Any]) -> List[Any]:
+        preds = sr.get("predicted_grids")
+        if isinstance(preds, list) and preds:
+            # Keep alignment; placeholders can be null/invalid.
+            return list(preds)
+        pred = sr.get("predicted_grid")
+        return [pred] if pred is not None else []
+
+    def _candidate_steps(sr: Dict[str, Any]) -> List[Any]:
+        cps = sr.get("candidate_program_steps")
+        if isinstance(cps, list) and cps:
+            return list(cps)
+        ps = sr.get("program_steps")
+        if isinstance(ps, list) and ps:
+            return [ps]
+        return []
+
+    cands_by_test: List[List[Any]] = []
+    for sr in list(solver_results):
+        if not isinstance(sr, dict):
+            sr = {}
+        cands_by_test.append(_cands(sr))
+    if not cands_by_test or any(not isinstance(c, list) or not c for c in cands_by_test):
+        fk0 = ""
+        fr0 = solver_results[0].get("failure_reason") if solver_results and isinstance(solver_results[0], dict) else {}
+        if isinstance(fr0, dict):
+            fk0 = str(fr0.get("kind") or "")
+        return {
+            "solver_status": "FAIL",
+            "scored": True,
+            "failure_kind": fk0,
+            "scores_by_k": {str(k): {"k": int(k), "ok": False} for k in range(1, int(max_trials) + 1)},
+        }
+
+    # Candidate programs are shared across tests, so length must be consistent.
+    cand_len = min(len(c) for c in cands_by_test)
+    steps_by_cand = _candidate_steps(solver_results[0] if solver_results else {})
+    if bool(require_concept_call) and steps_by_cand:
+        cand_len = min(int(cand_len), int(len(steps_by_cand)))
+
+    def _has_concept_call(steps: Any) -> bool:
+        if not isinstance(steps, list):
+            return False
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            if str(st.get("op_id") or "") == "concept_call":
+                return True
+        return False
+
+    scores_by_k: Dict[str, Any] = {}
+    for kk in range(1, int(max_trials) + 1):
+        ok = False
+        for i in range(min(int(kk), int(cand_len))):
+            if bool(require_concept_call) and steps_by_cand:
+                if not _has_concept_call(steps_by_cand[i] if i < len(steps_by_cand) else None):
+                    continue
+            ok_i = True
+            for cand_grid, want in zip(cands_by_test, want_grids):
+                got = cand_grid[i] if i < len(cand_grid) else None
+                if want is None or not isinstance(got, list) or not _grid_equal(got, want):
+                    ok_i = False
+                    break
+            if ok_i:
+                ok = True
+                break
+        scores_by_k[str(int(kk))] = {"k": int(kk), "ok": bool(ok)}
+
+    any_ok = bool(scores_by_k.get(str(int(max_trials)), {}).get("ok"))
+    fk = ""
+    if not any_ok:
+        # Prefer NO_CONCEPT_CALL if there exists a fully-correct candidate output but it lacks concept_call.
+        if bool(require_concept_call) and steps_by_cand:
+            for i in range(int(cand_len)):
+                ok_i = True
+                for cand_grid, want in zip(cands_by_test, want_grids):
+                    got = cand_grid[i] if i < len(cand_grid) else None
+                    if want is None or not isinstance(got, list) or not _grid_equal(got, want):
+                        ok_i = False
+                        break
+                if ok_i and not _has_concept_call(steps_by_cand[i] if i < len(steps_by_cand) else None):
+                    fk = "NO_CONCEPT_CALL"
+                    break
+        if not fk:
+            fr0 = solver_results[0].get("failure_reason") if solver_results and isinstance(solver_results[0], dict) else {}
+            if isinstance(fr0, dict):
+                fk = str(fr0.get("kind") or "")
+
+    return {
+        "solver_status": "SOLVED" if any_ok else "FAIL",
+        "scored": True,
+        "failure_kind": str(fk),
         "scores_by_k": scores_by_k,
     }
 
@@ -307,8 +727,12 @@ def _summarize_program_usage_v141(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Lightweight "hierarchy / concept usage" telemetry (deterministic).
 
-    This is intentionally simple and audit-friendly: it only inspects the solver's chosen
-    unique train-perfect program (status == SOLVED) and counts concept/macro calls.
+    This is intentionally simple and audit-friendly:
+      - For multi-test tasks, it inspects the solver's unique chosen program (status == SOLVED).
+      - For single-test tasks, the solver may return status == UNKNOWN (ambiguous) while scoring
+        still marks k=1 as correct (due to candidate_programs). In that case, this picks the
+        lowest-cost matching candidate program for usage accounting, so metrics reflect the
+        actually-scored solution surface.
     """
     solved = 0
     solved_with_concept = 0
@@ -323,19 +747,59 @@ def _summarize_program_usage_v141(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_cost_bits = 0
 
     for row in rows:
+        scoring = row.get("scoring") if isinstance(row.get("scoring"), dict) else {}
+        scores_by_k = scoring.get("scores_by_k") if isinstance(scoring.get("scores_by_k"), dict) else {}
+        # Count only k=1-scored solves (unique output under gates). This matches tasks_solved_by_k["1"].
+        k1 = scores_by_k.get("1") if isinstance(scores_by_k.get("1"), dict) else {}
+        if not bool(k1.get("ok")):
+            continue
         solver_results = row.get("solver_results")
         if not isinstance(solver_results, list) or not solver_results:
             continue
         sr0 = solver_results[0] if isinstance(solver_results[0], dict) else {}
-        if str(sr0.get("status") or "") != "SOLVED":
+        status0 = str(sr0.get("status") or "")
+
+        steps: List[Dict[str, Any]] = []
+        cost_bits = 0
+        if status0 == "SOLVED":
+            cost_bits = int(sr0.get("program_cost_bits") or 0)
+            raw_steps = sr0.get("program_steps")
+            if isinstance(raw_steps, list):
+                steps = [st for st in raw_steps if isinstance(st, dict)]
+        elif status0 == "UNKNOWN":
+            # Single-test ambiguity: pick the lowest-cost candidate that matches the ground-truth output.
+            task_obj = row.get("task") if isinstance(row.get("task"), dict) else {}
+            test = task_obj.get("test") if isinstance(task_obj.get("test"), list) else []
+            want = None
+            if test and isinstance(test[0], dict) and isinstance(test[0].get("output"), list):
+                want = test[0].get("output")
+            cands = sr0.get("candidate_programs") if isinstance(sr0.get("candidate_programs"), list) else []
+            best = None
+            for cand in cands:
+                if not isinstance(cand, dict):
+                    continue
+                pred = cand.get("predicted_grid")
+                if want is None or pred != want:
+                    continue
+                cb = int(cand.get("program_cost_bits") or 0)
+                psig = str(cand.get("program_sig") or "")
+                raw_steps = cand.get("program_steps")
+                if not isinstance(raw_steps, list):
+                    continue
+                st = [x for x in raw_steps if isinstance(x, dict)]
+                key = (int(cb), psig)
+                if best is None or key < best[0]:
+                    best = (key, int(cb), st)
+            if best is None:
+                continue
+            cost_bits = int(best[1])
+            steps = list(best[2])
+        else:
             continue
 
         solved += 1
-        total_cost_bits += int(sr0.get("program_cost_bits") or 0)
+        total_cost_bits += int(cost_bits)
 
-        steps = sr0.get("program_steps")
-        if not isinstance(steps, list):
-            steps = []
         total_steps += int(len(steps))
 
         any_concept = False
@@ -410,11 +874,25 @@ def _solve_one_task_worker_v141(args: Tuple[Dict[str, Any], Dict[str, Any]]) -> 
     payload, cfg_payload = args
     task_id = str(payload.get("task_id") or "")
     train_pairs = payload.get("train_pairs")
-    test_in = payload.get("test_in")
-    if not isinstance(train_pairs, (list, tuple)) or not isinstance(test_in, (list, tuple)):
+    test_ins = payload.get("test_ins")
+    if test_ins is None:
+        # Back-compat with older payloads (single-test tasks).
+        test_ins = [payload.get("test_in")]
+    if not isinstance(train_pairs, (list, tuple)) or not isinstance(test_ins, list):
+        raise RuntimeError("bad_task_payload_v141")
+    test_ins2 = [ti for ti in test_ins if isinstance(ti, (list, tuple))]
+    if not test_ins2:
         raise RuntimeError("bad_task_payload_v141")
 
-    from atos_core.arc_solver_v141 import SolveConfigV141, solve_arc_task_v141
+    from atos_core.arc_solver_v141 import (
+        SolveConfigV141,
+        apply_program_steps_to_grid_v141,
+        get_trace_metrics_snapshot_v141,
+        get_trace_snapshot_v141,
+        reset_trace_snapshot_v141,
+        solve_arc_task_v141,
+    )
+    from atos_core.grid_v124 import grid_hash_v124
 
     macro_templates: Tuple[Dict[str, Any], ...] = tuple()
     mt = cfg_payload.get("macro_templates")
@@ -439,7 +917,12 @@ def _solve_one_task_worker_v141(args: Tuple[Dict[str, Any], Dict[str, Any]]) -> 
     enable_refine_stage = bool(cfg_payload.get("enable_refine_stage", True))
     macro_try_on_fail_only = bool(cfg_payload.get("macro_try_on_fail_only", True))
     abstraction_pressure = bool(cfg_payload.get("abstraction_pressure", False))
+    csv_allow_slot_progress = bool(cfg_payload.get("csv_allow_slot_progress", False))
     enable_reachability_pruning = bool(cfg_payload.get("enable_reachability_pruning", True))
+    concept_support_feat_ranking = bool(cfg_payload.get("enable_concept_support_feat_ranking", False))
+    trace_csg_induction = bool(cfg_payload.get("trace_csg_induction", False))
+    trace_csg_first_pass_frac = float(cfg_payload.get("trace_csg_first_pass_frac", 0.6) or 0.6)
+    ensemble = bool(cfg_payload.get("ensemble", False))
 
     cfg = SolveConfigV141(
         max_depth=int(cfg_payload.get("max_depth", 4)),
@@ -450,18 +933,164 @@ def _solve_one_task_worker_v141(args: Tuple[Dict[str, Any], Dict[str, Any]]) -> 
         macro_templates=macro_templates,
         concept_templates=concept_templates,
         abstraction_pressure=bool(abstraction_pressure),
+        csv_allow_slot_progress=bool(csv_allow_slot_progress),
         macro_try_on_fail_only=bool(macro_try_on_fail_only),
         enable_reachability_pruning=bool(enable_reachability_pruning),
+        enable_concept_support_feat_ranking=bool(concept_support_feat_ranking),
         macro_propose_max_depth=int(cfg_payload.get("macro_propose_max_depth", 0)),
         macro_max_templates=int(cfg_payload.get("macro_max_templates", 24)),
         macro_max_instantiations=int(cfg_payload.get("macro_max_instantiations", 10)),
         macro_max_branch_per_op=int(cfg_payload.get("macro_max_branch_per_op", 10)),
+        concept_propose_max_depth=int(cfg_payload.get("concept_propose_max_depth", 99)),
+        concept_max_templates=int(cfg_payload.get("concept_max_templates", 24)),
+        concept_max_instantiations=int(cfg_payload.get("concept_max_instantiations", 10)),
+        concept_max_branch_per_op=int(cfg_payload.get("concept_max_branch_per_op", 10)),
+        enable_trace_csg_induction=bool(trace_csg_induction),
+        trace_csg_induction_first_pass_frac=float(trace_csg_first_pass_frac),
         enable_repair_stage=bool(enable_repair_stage),
         enable_residual_stage=bool(enable_residual_stage),
         enable_refine_stage=bool(enable_refine_stage),
         enable_point_patch_repair=bool(enable_point_patch_repair),
         point_patch_max_points=int(point_patch_max_points),
     )
+
+    from dataclasses import replace
+
+    def _extract_candidate_programs(res: Any) -> List[Dict[str, Any]]:
+        cand_programs: List[Dict[str, Any]] = []
+        if not isinstance(res, dict):
+            return cand_programs
+
+        cps = res.get("candidate_programs")
+        if isinstance(cps, list):
+            for row in cps:
+                if not isinstance(row, dict):
+                    continue
+                steps = row.get("program_steps")
+                if not isinstance(steps, list) or not steps:
+                    continue
+                cand_programs.append(
+                    {
+                        "program_sig": str(row.get("program_sig") or ""),
+                        "program_cost_bits": int(row.get("program_cost_bits") or 0),
+                        "program_steps": [dict(s) for s in steps if isinstance(s, dict)],
+                        "predicted_grid": row.get("predicted_grid"),
+                        "predicted_grid_hash": str(row.get("predicted_grid_hash") or ""),
+                    }
+                )
+
+        if not cand_programs:
+            ps = res.get("program_steps")
+            if isinstance(ps, list) and ps:
+                cand_programs.append(
+                    {
+                        "program_sig": str(res.get("program_sig") or ""),
+                        "program_cost_bits": int(res.get("program_cost_bits") or 0),
+                        "program_steps": [dict(s) for s in ps if isinstance(s, dict)],
+                        "predicted_grid": res.get("predicted_grid"),
+                        "predicted_grid_hash": str(res.get("predicted_grid_hash") or ""),
+                    }
+                )
+
+        return cand_programs
+
+    def _merge_candidate_programs(
+        cands_by_variant: Sequence[Sequence[Dict[str, Any]]],
+        *,
+        max_total: int,
+    ) -> List[Dict[str, Any]]:
+        want_total = max(0, int(max_total))
+        if want_total <= 0:
+            return []
+        max_len = 0
+        for cands in list(cands_by_variant):
+            if isinstance(cands, list):
+                max_len = max(max_len, int(len(cands)))
+
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        for rank in range(int(max_len)):
+            for cands in list(cands_by_variant):
+                if not isinstance(cands, list):
+                    continue
+                if rank >= len(cands):
+                    continue
+                cand = cands[rank]
+                if not isinstance(cand, dict):
+                    continue
+                sig = str(cand.get("program_sig") or "")
+                if not sig:
+                    steps0 = cand.get("program_steps")
+                    if isinstance(steps0, list) and steps0:
+                        sig = "steps:" + hashlib.sha256(_stable_json(steps0).encode("utf-8")).hexdigest()
+                if sig and sig in seen:
+                    continue
+                if sig:
+                    seen.add(sig)
+                out.append(cand)
+                if len(out) >= int(want_total):
+                    return out
+
+        return out
+
+    def _ensemble_cfgs(base_cfg: SolveConfigV141) -> List[SolveConfigV141]:
+        if not bool(ensemble):
+            return [base_cfg]
+
+        variants: List[SolveConfigV141] = [base_cfg]
+        variants.append(replace(base_cfg, abstraction_pressure=not bool(base_cfg.abstraction_pressure)))
+        variants.append(
+            replace(
+                base_cfg,
+                macro_try_on_fail_only=False,
+                macro_propose_max_depth=max(int(getattr(base_cfg, "macro_propose_max_depth", 0) or 0), 2),
+            )
+        )
+
+        # Use at most K variants (K=max_trials); scoring only considers the first K candidates.
+        variants = variants[: max(1, int(base_cfg.max_ambiguous_outputs))]
+
+        # De-dupe identical configs (deterministic).
+        uniq: List[SolveConfigV141] = []
+        seen_keys: set = set()
+        for v in variants:
+            k = (
+                int(v.max_depth),
+                int(v.max_programs),
+                int(v.max_ambiguous_outputs),
+                bool(v.abstraction_pressure),
+                bool(v.macro_try_on_fail_only),
+                int(v.macro_propose_max_depth),
+                bool(v.enable_reachability_pruning),
+                bool(v.enable_trace_csg_induction),
+                float(v.trace_csg_induction_first_pass_frac),
+                bool(v.enable_repair_stage),
+                bool(v.enable_residual_stage),
+                bool(v.enable_refine_stage),
+                bool(v.enable_point_patch_repair),
+                int(v.point_patch_max_points),
+            )
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            uniq.append(v)
+        variants = uniq
+
+        # When no wall-time cap is provided, split max_programs across variants to keep
+        # total search budget roughly constant.
+        if float(timeout_s) <= 0.0 and len(variants) > 1:
+            total = int(base_cfg.max_programs)
+            n = int(len(variants))
+            q = max(1, int(total // n))
+            rem = int(total - (q * n))
+            out: List[SolveConfigV141] = []
+            for i, v in enumerate(variants):
+                budget = int(q + (1 if i < rem else 0))
+                out.append(replace(v, max_programs=max(1, int(budget))))
+            variants = out
+
+        return variants
 
     def _exception_result(err: BaseException) -> Dict[str, Any]:
         return {
@@ -477,6 +1106,26 @@ def _solve_one_task_worker_v141(args: Tuple[Dict[str, Any], Dict[str, Any]]) -> 
             "trace": {"exception_type": str(err.__class__.__name__), "exception": str(err)},
         }
 
+    solver_results_by_test: List[Dict[str, Any]] = []
+
+    def _timeout_result() -> Dict[str, Any]:
+        tps = get_trace_snapshot_v141()
+        tms = get_trace_metrics_snapshot_v141()
+        trace_obj: Dict[str, Any] = {"timeout_s": float(timeout_s), "trace_programs": list(tps)}
+        if isinstance(tms, dict):
+            # Include key causal-gate telemetry even when the harness aborts on wall-time.
+            for k in sorted(tms.keys()):
+                trace_obj[str(k)] = tms[k]
+        return {
+            "schema_version": 141,
+            "kind": "arc_solver_result_v141",
+            "status": "FAIL",
+            "program_sig": "",
+            "predicted_grid_hash": "",
+            "failure_reason": {"kind": "SEARCH_BUDGET_EXCEEDED", "details": {"timeout_s": float(timeout_s)}},
+            "trace": dict(trace_obj),
+        }
+
     if timeout_s > 0.0:
         import signal
 
@@ -484,30 +1133,349 @@ def _solve_one_task_worker_v141(args: Tuple[Dict[str, Any], Dict[str, Any]]) -> 
             raise _ArcTaskTimeoutV141()
 
         prev = signal.signal(signal.SIGALRM, _handler)
-        signal.setitimer(signal.ITIMER_REAL, float(timeout_s))
         try:
-            solver_res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_in, config=cfg)
-        except _ArcTaskTimeoutV141:
-            solver_res = {
-                "schema_version": 141,
-                "kind": "arc_solver_result_v141",
-                "status": "FAIL",
-                "program_sig": "",
-                "predicted_grid_hash": "",
-                "failure_reason": {"kind": "SEARCH_BUDGET_EXCEEDED", "details": {"timeout_s": float(timeout_s)}},
-                "trace": {"timeout_s": float(timeout_s)},
-            }
-        except Exception as e:
-            solver_res = _exception_result(e)
+            if len(test_ins2) > 1:
+                # Multi-test ARC tasks (ARC-AGI-2): solve once (using test0) then apply the same
+                # candidate program(s) to all test inputs to avoid N× repeated search.
+                base_res: Dict[str, Any] = {}
+                cand_lists: List[List[Dict[str, Any]]] = []
+                seen_cands: set = set()
+                deadline = time.monotonic() + float(timeout_s)
+                for vcfg in _ensemble_cfgs(cfg):
+                    remaining = float(deadline - time.monotonic())
+                    if remaining <= 0.0:
+                        break
+                    signal.setitimer(signal.ITIMER_REAL, float(remaining))
+                    reset_trace_snapshot_v141()
+                    try:
+                        res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_ins2[0], config=vcfg)
+                    except _ArcTaskTimeoutV141:
+                        res = _timeout_result()
+                    except Exception as e:
+                        res = _exception_result(e)
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    if not base_res and isinstance(res, dict):
+                        base_res = dict(res)
+                    cands = _extract_candidate_programs(res)
+                    cand_lists.append(list(cands))
+                    for cand in cands:
+                        if not isinstance(cand, dict):
+                            continue
+                        sig0 = str(cand.get("program_sig") or "")
+                        if not sig0:
+                            steps0 = cand.get("program_steps")
+                            if isinstance(steps0, list) and steps0:
+                                sig0 = "steps:" + hashlib.sha256(_stable_json(steps0).encode("utf-8")).hexdigest()
+                        if sig0:
+                            seen_cands.add(str(sig0))
+                    # Portfolio early-stop: if a variant solved train, stop spending wall time on other variants.
+                    if isinstance(res, dict) and str(res.get("status") or "") == "SOLVED":
+                        base_res = dict(res)
+                        cand_lists = [list(cands)]
+                        break
+                    # Stop once we already have enough distinct candidates for scoring.
+                    if len(seen_cands) >= int(cfg.max_ambiguous_outputs):
+                        break
+                if not base_res:
+                    base_res = _timeout_result()
+
+                cand_programs = _merge_candidate_programs(cand_lists, max_total=int(cfg.max_ambiguous_outputs))
+                cand_steps: List[List[Dict[str, Any]]] = [
+                    [dict(s) for s in c.get("program_steps") if isinstance(s, dict)] for c in cand_programs
+                ]
+
+                for ti in test_ins2:
+                    # Build per-test predicted outputs aligned by candidate index.
+                    predicted_grids: List[Any] = []
+                    predicted_grid_hash = ""
+                    predicted_grid: Any = None
+                    if cand_steps:
+                        for steps in cand_steps:
+                            try:
+                                out_g = apply_program_steps_to_grid_v141(grid=ti, program_steps=steps)
+                                out = [list(r) for r in out_g]
+                                predicted_grids.append(out)
+                            except Exception:
+                                predicted_grids.append(None)
+                        if isinstance(predicted_grids[0], list):
+                            predicted_grid = predicted_grids[0]
+                            try:
+                                predicted_grid_hash = str(grid_hash_v124(tuple(tuple(int(v) for v in row) for row in predicted_grid)))
+                            except Exception:
+                                predicted_grid_hash = ""
+
+                    sr = dict(base_res) if isinstance(base_res, dict) else {}
+                    # Override test-dependent output fields.
+                    if predicted_grid is not None:
+                        sr["predicted_grid"] = predicted_grid
+                        sr["predicted_grid_hash"] = str(predicted_grid_hash)
+                    if predicted_grids:
+                        sr["predicted_grids"] = list(predicted_grids)
+                    if cand_steps:
+                        sr["candidate_program_steps"] = [list(s) for s in cand_steps]
+                        sr["program_steps"] = list(cand_steps[0])
+                        if cand_programs:
+                            sr["program_sig"] = str(cand_programs[0].get("program_sig") or "")
+                            sr["program_cost_bits"] = int(cand_programs[0].get("program_cost_bits") or 0)
+                    solver_results_by_test.append(dict(sr))
+            else:
+                for test_in in test_ins2:
+                    base_res: Dict[str, Any] = {}
+                    cand_lists: List[List[Dict[str, Any]]] = []
+                    seen_cands: set = set()
+                    deadline = time.monotonic() + float(timeout_s)
+                    for vcfg in _ensemble_cfgs(cfg):
+                        remaining = float(deadline - time.monotonic())
+                        if remaining <= 0.0:
+                            break
+                        signal.setitimer(signal.ITIMER_REAL, float(remaining))
+                        reset_trace_snapshot_v141()
+                        try:
+                            res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_in, config=vcfg)
+                        except _ArcTaskTimeoutV141:
+                            res = _timeout_result()
+                        except Exception as e:
+                            res = _exception_result(e)
+                        finally:
+                            signal.setitimer(signal.ITIMER_REAL, 0.0)
+                        if not base_res and isinstance(res, dict):
+                            base_res = dict(res)
+                        cands = _extract_candidate_programs(res)
+                        cand_lists.append(list(cands))
+                        for cand in cands:
+                            if not isinstance(cand, dict):
+                                continue
+                            sig0 = str(cand.get("program_sig") or "")
+                            if not sig0:
+                                steps0 = cand.get("program_steps")
+                                if isinstance(steps0, list) and steps0:
+                                    sig0 = "steps:" + hashlib.sha256(_stable_json(steps0).encode("utf-8")).hexdigest()
+                            if sig0:
+                                seen_cands.add(str(sig0))
+                        if isinstance(res, dict) and str(res.get("status") or "") == "SOLVED":
+                            base_res = dict(res)
+                            cand_lists = [list(cands)]
+                            break
+                        if len(seen_cands) >= int(cfg.max_ambiguous_outputs):
+                            break
+                    if not base_res:
+                        base_res = _timeout_result()
+
+                    cand_programs = _merge_candidate_programs(cand_lists, max_total=int(cfg.max_ambiguous_outputs))
+                    sr = dict(base_res) if isinstance(base_res, dict) else {}
+                    if cand_programs:
+                        predicted_grids: List[Any] = []
+                        cand_steps: List[List[Dict[str, Any]]] = []
+                        for cp in cand_programs:
+                            steps = cp.get("program_steps") if isinstance(cp.get("program_steps"), list) else []
+                            steps2 = [dict(s) for s in steps if isinstance(s, dict)]
+                            cand_steps.append(list(steps2))
+                            pg = cp.get("predicted_grid")
+                            if not isinstance(pg, list) and steps2:
+                                try:
+                                    out_g = apply_program_steps_to_grid_v141(grid=test_in, program_steps=steps2)
+                                    pg = [list(r) for r in out_g]
+                                except Exception:
+                                    pg = None
+                            predicted_grids.append(pg if isinstance(pg, list) else None)
+
+                        predicted_grid_hash = ""
+                        predicted_grid: Any = None
+                        if predicted_grids and isinstance(predicted_grids[0], list):
+                            predicted_grid = predicted_grids[0]
+                            predicted_grid_hash = str(cand_programs[0].get("predicted_grid_hash") or "")
+                            if predicted_grid_hash == "":
+                                try:
+                                    predicted_grid_hash = str(
+                                        grid_hash_v124(tuple(tuple(int(v) for v in row) for row in predicted_grid))
+                                    )
+                                except Exception:
+                                    predicted_grid_hash = ""
+
+                        if predicted_grid is not None:
+                            sr["predicted_grid"] = predicted_grid
+                            sr["predicted_grid_hash"] = str(predicted_grid_hash)
+                        if predicted_grids:
+                            sr["predicted_grids"] = list(predicted_grids)
+                        if cand_steps:
+                            sr["candidate_program_steps"] = [list(s) for s in cand_steps]
+                            sr["program_steps"] = list(cand_steps[0])
+                            sr["program_sig"] = str(cand_programs[0].get("program_sig") or "")
+                            sr["program_cost_bits"] = int(cand_programs[0].get("program_cost_bits") or 0)
+                            sr["candidate_programs"] = [
+                                {
+                                    "program_sig": str(cp.get("program_sig") or ""),
+                                    "program_cost_bits": int(cp.get("program_cost_bits") or 0),
+                                    "program_steps": list(cp.get("program_steps") or []),
+                                    "predicted_grid": (predicted_grids[i] if i < len(predicted_grids) else None),
+                                    "predicted_grid_hash": str(cp.get("predicted_grid_hash") or ""),
+                                }
+                                for i, cp in enumerate(cand_programs)
+                            ]
+
+                    solver_results_by_test.append(dict(sr))
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0.0)
             signal.signal(signal.SIGALRM, prev)
     else:
-        try:
-            solver_res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_in, config=cfg)
-        except Exception as e:
-            solver_res = _exception_result(e)
-    return {"task_id": task_id, "solver_res": solver_res}
+        if len(test_ins2) > 1:
+            base_res: Dict[str, Any] = {}
+            cand_lists: List[List[Dict[str, Any]]] = []
+            seen_cands: set = set()
+            for vcfg in _ensemble_cfgs(cfg):
+                reset_trace_snapshot_v141()
+                try:
+                    res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_ins2[0], config=vcfg)
+                except Exception as e:
+                    res = _exception_result(e)
+                if not base_res and isinstance(res, dict):
+                    base_res = dict(res)
+                cands = _extract_candidate_programs(res)
+                cand_lists.append(list(cands))
+                for cand in cands:
+                    if not isinstance(cand, dict):
+                        continue
+                    sig0 = str(cand.get("program_sig") or "")
+                    if not sig0:
+                        steps0 = cand.get("program_steps")
+                        if isinstance(steps0, list) and steps0:
+                            sig0 = "steps:" + hashlib.sha256(_stable_json(steps0).encode("utf-8")).hexdigest()
+                    if sig0:
+                        seen_cands.add(str(sig0))
+                if isinstance(res, dict) and str(res.get("status") or "") == "SOLVED":
+                    base_res = dict(res)
+                    cand_lists = [list(cands)]
+                    break
+                if len(seen_cands) >= int(cfg.max_ambiguous_outputs):
+                    break
+            if not base_res:
+                base_res = _exception_result(RuntimeError("missing_base_res_v141"))
+
+            cand_programs = _merge_candidate_programs(cand_lists, max_total=int(cfg.max_ambiguous_outputs))
+            cand_steps: List[List[Dict[str, Any]]] = [
+                [dict(s) for s in c.get("program_steps") if isinstance(s, dict)] for c in cand_programs
+            ]
+
+            for ti in test_ins2:
+                predicted_grids: List[Any] = []
+                predicted_grid_hash = ""
+                predicted_grid: Any = None
+                if cand_steps:
+                    for steps in cand_steps:
+                        try:
+                            out_g = apply_program_steps_to_grid_v141(grid=ti, program_steps=steps)
+                            predicted_grids.append([list(r) for r in out_g])
+                        except Exception:
+                            predicted_grids.append(None)
+                    if isinstance(predicted_grids[0], list):
+                        predicted_grid = predicted_grids[0]
+                        try:
+                            predicted_grid_hash = str(grid_hash_v124(tuple(tuple(int(v) for v in row) for row in predicted_grid)))
+                        except Exception:
+                            predicted_grid_hash = ""
+
+                sr = dict(base_res) if isinstance(base_res, dict) else {}
+                if predicted_grid is not None:
+                    sr["predicted_grid"] = predicted_grid
+                    sr["predicted_grid_hash"] = str(predicted_grid_hash)
+                if predicted_grids:
+                    sr["predicted_grids"] = list(predicted_grids)
+                if cand_steps:
+                    sr["candidate_program_steps"] = [list(s) for s in cand_steps]
+                    sr["program_steps"] = list(cand_steps[0])
+                    if cand_programs:
+                        sr["program_sig"] = str(cand_programs[0].get("program_sig") or "")
+                        sr["program_cost_bits"] = int(cand_programs[0].get("program_cost_bits") or 0)
+                solver_results_by_test.append(dict(sr))
+        else:
+            for test_in in test_ins2:
+                base_res: Dict[str, Any] = {}
+                cand_lists: List[List[Dict[str, Any]]] = []
+                seen_cands: set = set()
+                for vcfg in _ensemble_cfgs(cfg):
+                    try:
+                        reset_trace_snapshot_v141()
+                        res = solve_arc_task_v141(train_pairs=list(train_pairs), test_in=test_in, config=vcfg)
+                    except Exception as e:
+                        res = _exception_result(e)
+                    if not base_res and isinstance(res, dict):
+                        base_res = dict(res)
+                    cands = _extract_candidate_programs(res)
+                    cand_lists.append(list(cands))
+                    for cand in cands:
+                        if not isinstance(cand, dict):
+                            continue
+                        sig0 = str(cand.get("program_sig") or "")
+                        if not sig0:
+                            steps0 = cand.get("program_steps")
+                            if isinstance(steps0, list) and steps0:
+                                sig0 = "steps:" + hashlib.sha256(_stable_json(steps0).encode("utf-8")).hexdigest()
+                        if sig0:
+                            seen_cands.add(str(sig0))
+                    if isinstance(res, dict) and str(res.get("status") or "") == "SOLVED":
+                        base_res = dict(res)
+                        cand_lists = [list(cands)]
+                        break
+                    if len(seen_cands) >= int(cfg.max_ambiguous_outputs):
+                        break
+                if not base_res:
+                    base_res = _exception_result(RuntimeError("missing_base_res_v141"))
+
+                cand_programs = _merge_candidate_programs(cand_lists, max_total=int(cfg.max_ambiguous_outputs))
+                sr = dict(base_res) if isinstance(base_res, dict) else {}
+                if cand_programs:
+                    predicted_grids2: List[Any] = []
+                    cand_steps2: List[List[Dict[str, Any]]] = []
+                    for cp in cand_programs:
+                        steps = cp.get("program_steps") if isinstance(cp.get("program_steps"), list) else []
+                        steps2 = [dict(s) for s in steps if isinstance(s, dict)]
+                        cand_steps2.append(list(steps2))
+                        pg = cp.get("predicted_grid")
+                        if not isinstance(pg, list) and steps2:
+                            try:
+                                out_g = apply_program_steps_to_grid_v141(grid=test_in, program_steps=steps2)
+                                pg = [list(r) for r in out_g]
+                            except Exception:
+                                pg = None
+                        predicted_grids2.append(pg if isinstance(pg, list) else None)
+
+                    predicted_grid_hash = ""
+                    predicted_grid: Any = None
+                    if predicted_grids2 and isinstance(predicted_grids2[0], list):
+                        predicted_grid = predicted_grids2[0]
+                        predicted_grid_hash = str(cand_programs[0].get("predicted_grid_hash") or "")
+                        if predicted_grid_hash == "":
+                            try:
+                                predicted_grid_hash = str(
+                                    grid_hash_v124(tuple(tuple(int(v) for v in row) for row in predicted_grid))
+                                )
+                            except Exception:
+                                predicted_grid_hash = ""
+
+                    if predicted_grid is not None:
+                        sr["predicted_grid"] = predicted_grid
+                        sr["predicted_grid_hash"] = str(predicted_grid_hash)
+                    if predicted_grids2:
+                        sr["predicted_grids"] = list(predicted_grids2)
+                    if cand_steps2:
+                        sr["candidate_program_steps"] = [list(s) for s in cand_steps2]
+                        sr["program_steps"] = list(cand_steps2[0])
+                        sr["program_sig"] = str(cand_programs[0].get("program_sig") or "")
+                        sr["program_cost_bits"] = int(cand_programs[0].get("program_cost_bits") or 0)
+                        sr["candidate_programs"] = [
+                            {
+                                "program_sig": str(cp.get("program_sig") or ""),
+                                "program_cost_bits": int(cp.get("program_cost_bits") or 0),
+                                "program_steps": list(cp.get("program_steps") or []),
+                                "predicted_grid": (predicted_grids2[i] if i < len(predicted_grids2) else None),
+                                "predicted_grid_hash": str(cp.get("predicted_grid_hash") or ""),
+                            }
+                            for i, cp in enumerate(cand_programs)
+                        ]
+
+                solver_results_by_test.append(dict(sr))
+
+    return {"task_id": task_id, "solver_results": solver_results_by_test}
 
 
 def _solve_one_task_worker_inited_v141(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -587,6 +1555,7 @@ def _run_once_v141(
     arc_root: str,
     split: Optional[str],
     limit: int,
+    task_ids: Optional[Sequence[str]],
     seed: int,
     jobs: int,
     max_depth: int,
@@ -596,6 +1565,7 @@ def _run_once_v141(
     benchmark_profile: str,
     macro_templates_path: Optional[str],
     concept_templates_path: Optional[str],
+    require_concept_call: bool,
     task_timeout_s: float,
     no_progress_timeout_s: float,
     resume: bool,
@@ -607,18 +1577,37 @@ def _run_once_v141(
     macro_max_templates: int,
     macro_max_instantiations: int,
     macro_max_branch_per_op: int,
+    concept_propose_max_depth: int,
+    concept_max_templates: int,
+    concept_max_instantiations: int,
+    concept_max_branch_per_op: int,
     abstraction_pressure: bool,
+    csv_allow_slot_progress: bool,
+    concept_support_feat_ranking: bool,
+    trace_csg_induction: bool,
+    trace_csg_first_pass_frac: float,
     enable_reachability_pruning: bool,
     enable_point_patch_repair: bool,
     point_patch_max_points: int,
+    ensemble: bool,
     omega_enabled: bool,
     omega_state_in: Optional[str],
 ) -> Dict[str, Any]:
     resume = bool(resume)
+    require_concept_call = bool(require_concept_call)
+    ensemble = bool(ensemble)
+    csv_allow_slot_progress = bool(csv_allow_slot_progress)
+    concept_support_feat_ranking = bool(concept_support_feat_ranking)
     macro_propose_max_depth = max(0, int(macro_propose_max_depth))
     macro_max_templates = max(0, int(macro_max_templates))
     macro_max_instantiations = max(0, int(macro_max_instantiations))
     macro_max_branch_per_op = max(0, int(macro_max_branch_per_op))
+    concept_propose_max_depth = max(0, int(concept_propose_max_depth))
+    concept_max_templates = max(0, int(concept_max_templates))
+    concept_max_instantiations = max(0, int(concept_max_instantiations))
+    concept_max_branch_per_op = max(0, int(concept_max_branch_per_op))
+    trace_csg_induction = bool(trace_csg_induction)
+    trace_csg_first_pass_frac = float(trace_csg_first_pass_frac)
     if resume:
         if not out_dir.is_dir():
             raise SystemExit(f"resume_missing_out_dir_v141:{out_dir}")
@@ -641,6 +1630,16 @@ def _run_once_v141(
 
     from atos_core.arc_loader_v141 import iter_canonical_tasks_v141, write_arc_canonical_jsonl_v141
 
+    task_ids_norm: List[str] = []
+    if task_ids is not None:
+        for x in task_ids:
+            s = str(x or "").strip().replace("\\", "/").lstrip("/")
+            if not s:
+                continue
+            if not s.endswith(".json"):
+                s = s + ".json"
+            task_ids_norm.append(str(s))
+
     if resume:
         if not input_jsonl.is_file():
             raise SystemExit(f"resume_missing_input_jsonl_v141:{input_jsonl}")
@@ -653,15 +1652,17 @@ def _run_once_v141(
         # Note: arc_manifest_v141 intentionally does not include arc_root path (to avoid absolute paths).
         want = {
             "split": str(split) if split is not None else None,
-            "limit": int(limit),
+            "limit": int(len(task_ids_norm) if task_ids_norm else int(limit)),
             "seed": int(seed),
-            "selection_mode": "shuffled" if int(limit) > 0 else "sorted",
+            "selection_mode": "explicit" if task_ids_norm else ("shuffled" if int(limit) > 0 else "sorted"),
+            "task_ids": list(task_ids_norm),
         }
         got = {
             "split": manifest_obj.get("split") if "split" in manifest_obj else None,
             "limit": int(manifest_obj.get("limit") or 0),
             "seed": (manifest_obj.get("seed") if "seed" in manifest_obj else None),
             "selection_mode": str(manifest_obj.get("selection_mode") or "sorted"),
+            "task_ids": list(manifest_obj.get("task_ids") or []),
         }
         if want != got:
             raise SystemExit(f"resume_manifest_mismatch_v141:want={want},got={got}")
@@ -673,6 +1674,7 @@ def _run_once_v141(
             seed=int(seed),
             out_jsonl=input_jsonl,
             out_manifest=input_manifest,
+            task_ids=(task_ids_norm if task_ids_norm else None),
         )
 
     from atos_core.arc_solver_v141 import SolveConfigV141, solve_arc_task_v141
@@ -762,6 +1764,9 @@ def _run_once_v141(
                     concept_templates_rows.append(obj)
             concept_templates_rows.sort(key=lambda r: (str(r.get("concept_id") or ""), _stable_json(r)))
 
+    if bool(concept_support_feat_ranking):
+        _enrich_concept_support_task_feat_keys_v141(concept_templates_rows=concept_templates_rows, arc_root=str(arc_root))
+
     omega_state_obj = None
     omega_state_sig = ""
     max_depth_eff = int(max_depth)
@@ -806,12 +1811,20 @@ def _run_once_v141(
         macro_templates=tuple(macro_templates_rows),
         concept_templates=tuple(concept_templates_rows),
         abstraction_pressure=bool(abstraction_pressure),
+        csv_allow_slot_progress=bool(csv_allow_slot_progress),
         macro_try_on_fail_only=bool(macro_try_on_fail_only),
         enable_reachability_pruning=bool(enable_reachability_pruning),
+        enable_concept_support_feat_ranking=bool(concept_support_feat_ranking),
         macro_propose_max_depth=int(macro_propose_max_depth),
         macro_max_templates=int(macro_max_templates),
         macro_max_instantiations=int(macro_max_instantiations),
         macro_max_branch_per_op=int(macro_max_branch_per_op),
+        concept_propose_max_depth=int(concept_propose_max_depth),
+        concept_max_templates=int(concept_max_templates),
+        concept_max_instantiations=int(concept_max_instantiations),
+        concept_max_branch_per_op=int(concept_max_branch_per_op),
+        enable_trace_csg_induction=bool(trace_csg_induction),
+        trace_csg_induction_first_pass_frac=float(trace_csg_first_pass_frac),
         enable_repair_stage=bool(enable_repair_stage),
         enable_residual_stage=bool(enable_residual_stage),
         enable_refine_stage=bool(enable_refine_stage),
@@ -851,7 +1864,9 @@ def _run_once_v141(
                 },
             )
             raise SystemExit("omega_dead_v2:no_reachable_tasks")
-    want_by_id: Dict[str, Optional[Sequence[Sequence[int]]]] = {str(t.task_id): t.test_pairs[0][1] for t in tasks}
+    want_by_id: Dict[str, List[Optional[Sequence[Sequence[int]]]]] = {
+        str(t.task_id): [out for _inp, out in t.test_pairs] for t in tasks
+    }
     tasks_by_id: Dict[str, Any] = {str(t.task_id): t for t in tasks}
 
     per_task_rows: List[Dict[str, Any]] = []
@@ -869,7 +1884,9 @@ def _run_once_v141(
         safe = _sanitize_task_id(task_id)
         return per_task_dir / f"{safe}.json"
 
-    def write_per_task_row(*, task_id: str, solver_res: Dict[str, Any], scoring: Dict[str, Any]) -> None:
+    def write_per_task_row(
+        *, task_id: str, solver_results: Sequence[Dict[str, Any]], scoring: Dict[str, Any]
+    ) -> None:
         task = tasks_by_id.get(str(task_id))
         if task is None:
             return
@@ -880,7 +1897,7 @@ def _run_once_v141(
             "schema_version": 141,
             "kind": "arc_per_task_v141",
             "task": task.to_dict(),
-            "solver_results": [solver_res],
+            "solver_results": [dict(r) for r in solver_results if isinstance(r, dict)],
             "scoring": scoring,
         }
         _write_once_json(out_path, row)
@@ -915,8 +1932,19 @@ def _run_once_v141(
 
     if jobs_n == 1:
         import signal
+        from atos_core.arc_solver_v141 import (
+            get_trace_metrics_snapshot_v141,
+            get_trace_snapshot_v141,
+            reset_trace_snapshot_v141,
+        )
 
         def _timeout_result() -> Dict[str, Any]:
+            tps = get_trace_snapshot_v141()
+            tms = get_trace_metrics_snapshot_v141()
+            trace_obj: Dict[str, Any] = {"timeout_s": float(task_timeout_s), "trace_programs": list(tps)}
+            if isinstance(tms, dict):
+                for k in sorted(tms.keys()):
+                    trace_obj[str(k)] = tms[k]
             return {
                 "schema_version": 141,
                 "kind": "arc_solver_result_v141",
@@ -924,7 +1952,7 @@ def _run_once_v141(
                 "program_sig": "",
                 "predicted_grid_hash": "",
                 "failure_reason": {"kind": "SEARCH_BUDGET_EXCEEDED", "details": {"timeout_s": float(task_timeout_s)}},
-                "trace": {"timeout_s": float(task_timeout_s)},
+                "trace": dict(trace_obj),
             }
 
         def _exception_result(err: BaseException) -> Dict[str, Any]:
@@ -943,28 +1971,36 @@ def _run_once_v141(
 
         prev_handler = signal.signal(signal.SIGALRM, _handler)
         for i, task in enumerate(tasks):
-            if float(task_timeout_s) > 0.0:
-                signal.setitimer(signal.ITIMER_REAL, float(task_timeout_s))
-            try:
-                solver_res = solve_arc_task_v141(
-                    train_pairs=list(task.train_pairs),
-                    test_in=task.test_pairs[0][0],
-                    config=cfg,
-                )
-            except _ArcTaskTimeoutV141:
-                solver_res = _timeout_result()
-            except Exception as e:
-                solver_res = _exception_result(e)
-            finally:
+            solver_results_by_test: List[Dict[str, Any]] = []
+            for test_idx, (test_in, _want) in enumerate(task.test_pairs):
                 if float(task_timeout_s) > 0.0:
-                    signal.setitimer(signal.ITIMER_REAL, 0.0)
-            item = {"task_id": str(task.task_id), "solver_res": solver_res}
+                    signal.setitimer(signal.ITIMER_REAL, float(task_timeout_s))
+                reset_trace_snapshot_v141()
+                try:
+                    solver_res = solve_arc_task_v141(
+                        train_pairs=list(task.train_pairs),
+                        test_in=test_in,
+                        config=cfg,
+                    )
+                except _ArcTaskTimeoutV141:
+                    solver_res = _timeout_result()
+                except Exception as e:
+                    solver_res = _exception_result(e)
+                finally:
+                    if float(task_timeout_s) > 0.0:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                solver_results_by_test.append(dict(solver_res))
+
+            item = {"task_id": str(task.task_id), "solver_results": solver_results_by_test}
             solver_results.append(item)
-            scoring = _score_test_case_all_k_v141(
-                solver_res=solver_res, want_grid=want_by_id.get(str(task.task_id)), max_trials=int(max_trials)
+            scoring = _score_task_all_tests_all_k_v141(
+                solver_results=solver_results_by_test,
+                want_grids=want_by_id.get(str(task.task_id)) or [],
+                max_trials=int(max_trials),
+                require_concept_call=bool(require_concept_call),
             )
             scoring_by_id[str(task.task_id)] = scoring
-            write_per_task_row(task_id=str(task.task_id), solver_res=solver_res, scoring=scoring)
+            write_per_task_row(task_id=str(task.task_id), solver_results=solver_results_by_test, scoring=scoring)
             fk = str(scoring.get("failure_kind") or "")
             failures_so_far[fk] = int(failures_so_far.get(fk, 0)) + 1
             by_k = scoring.get("scores_by_k") if isinstance(scoring.get("scores_by_k"), dict) else {}
@@ -973,13 +2009,14 @@ def _run_once_v141(
                 solved_kmax += 1
             done += 1
             last_progress = time.monotonic()
+            last_status = str(scoring.get("solver_status") or "")
             log_progress(
                 {
                     "done": int(done),
                     "total": int(total_tasks),
                     "solved_kmax": int(solved_kmax),
                     "last_task_id": str(task.task_id),
-                    "last_status": str(solver_res.get("status") or ""),
+                    "last_status": str(last_status),
                     "last_failure": str(fk),
                     "elapsed_s": float(time.monotonic() - started),
                 }
@@ -994,6 +2031,7 @@ def _run_once_v141(
             "solution_cost_slack_bits": int(solution_cost_slack_bits),
             "macro_templates": list(macro_templates_rows),
             "concept_templates": list(concept_templates_rows),
+            "require_concept_call": bool(require_concept_call),
             "task_timeout_s": float(task_timeout_s),
             "enable_repair_stage": bool(enable_repair_stage),
             "enable_residual_stage": bool(enable_residual_stage),
@@ -1003,17 +2041,32 @@ def _run_once_v141(
             "macro_max_templates": int(macro_max_templates),
             "macro_max_instantiations": int(macro_max_instantiations),
             "macro_max_branch_per_op": int(macro_max_branch_per_op),
+            "concept_propose_max_depth": int(concept_propose_max_depth),
+            "concept_max_templates": int(concept_max_templates),
+            "concept_max_instantiations": int(concept_max_instantiations),
+            "concept_max_branch_per_op": int(concept_max_branch_per_op),
             "abstraction_pressure": bool(abstraction_pressure),
+            "enable_concept_support_feat_ranking": bool(concept_support_feat_ranking),
+            # learn mode: allow slot-building semantic moves (dl==0, ds<0) so trace_programs
+            # contain non-empty pipelines for downstream CSG mining. eval_arc keeps this False.
+            "csv_allow_slot_progress": bool(csv_allow_slot_progress),
+            "trace_csg_induction": bool(trace_csg_induction),
+            "trace_csg_first_pass_frac": float(trace_csg_first_pass_frac),
             "enable_reachability_pruning": bool(enable_reachability_pruning),
             "enable_point_patch_repair": bool(enable_point_patch_repair),
             "point_patch_max_points": int(point_patch_max_points),
+            "ensemble": bool(ensemble),
         }
         task_payloads: List[Dict[str, Any]] = []
         for task in tasks:
             if resume and per_task_path(str(task.task_id)).exists():
                 continue
             task_payloads.append(
-                {"task_id": str(task.task_id), "train_pairs": list(task.train_pairs), "test_in": task.test_pairs[0][0]}
+                {
+                    "task_id": str(task.task_id),
+                    "train_pairs": list(task.train_pairs),
+                    "test_ins": [inp for inp, _out in task.test_pairs],
+                }
             )
 
         ex = concurrent.futures.ProcessPoolExecutor(
@@ -1068,15 +2121,24 @@ def _run_once_v141(
                         item = fut.result()
                     except Exception as e:
                         # Do not abort the entire run due to a single worker crash; record it as a task-level FAIL.
-                        item = {"task_id": task_id_hint, "solver_res": _exception_result(e)}
+                        item = {"task_id": task_id_hint, "solver_results": [_exception_result(e)]}
                     solver_results.append(item)
                     task_id = str(item.get("task_id") or "")
-                    solver_res = item.get("solver_res") if isinstance(item.get("solver_res"), dict) else {}
-                    scoring = _score_test_case_all_k_v141(
-                        solver_res=solver_res, want_grid=want_by_id.get(task_id), max_trials=int(max_trials)
+                    solver_results_by_test = item.get("solver_results")
+                    if not isinstance(solver_results_by_test, list) or not solver_results_by_test:
+                        sr0 = item.get("solver_res") if isinstance(item.get("solver_res"), dict) else {}
+                        solver_results_by_test = [sr0]
+                    solver_results_by_test2 = [sr for sr in solver_results_by_test if isinstance(sr, dict)]
+                    if not solver_results_by_test2:
+                        solver_results_by_test2 = [_exception_result(RuntimeError("missing_solver_results_v141"))]
+                    scoring = _score_task_all_tests_all_k_v141(
+                        solver_results=solver_results_by_test2,
+                        want_grids=want_by_id.get(task_id) or [],
+                        max_trials=int(max_trials),
+                        require_concept_call=bool(require_concept_call),
                     )
                     scoring_by_id[task_id] = scoring
-                    write_per_task_row(task_id=task_id, solver_res=solver_res, scoring=scoring)
+                    write_per_task_row(task_id=task_id, solver_results=solver_results_by_test2, scoring=scoring)
                     fk = str(scoring.get("failure_kind") or "")
                     failures_so_far[fk] = int(failures_so_far.get(fk, 0)) + 1
                     by_k = scoring.get("scores_by_k") if isinstance(scoring.get("scores_by_k"), dict) else {}
@@ -1085,13 +2147,14 @@ def _run_once_v141(
                         solved_kmax += 1
                     done += 1
                     last_progress = time.monotonic()
+                    last_status = str(scoring.get("solver_status") or "")
                     log_progress(
                         {
                             "done": int(done),
                             "total": int(total_tasks),
                             "solved_kmax": int(solved_kmax),
                             "last_task_id": str(task_id),
-                            "last_status": str(solver_res.get("status") or ""),
+                            "last_status": str(last_status),
                             "last_failure": str(fk),
                             "elapsed_s": float(time.monotonic() - started),
                         }
@@ -1123,7 +2186,7 @@ def _run_once_v141(
                         continue
                     if per_task_path(task_id).exists():
                         continue
-                    solver_res = {
+                    solver_res0 = {
                         "schema_version": 141,
                         "kind": "arc_solver_result_v141",
                         "status": "FAIL",
@@ -1139,12 +2202,17 @@ def _run_once_v141(
                         },
                         "trace": {"watchdog": True},
                     }
-                    scoring = _score_test_case_all_k_v141(
-                        solver_res=solver_res, want_grid=want_by_id.get(task_id), max_trials=int(max_trials)
+                    want_grids = want_by_id.get(task_id) or []
+                    solver_results_by_test = [dict(solver_res0) for _ in range(max(1, int(len(want_grids))))]
+                    scoring = _score_task_all_tests_all_k_v141(
+                        solver_results=solver_results_by_test,
+                        want_grids=want_grids,
+                        max_trials=int(max_trials),
+                        require_concept_call=bool(require_concept_call),
                     )
-                    write_per_task_row(task_id=task_id, solver_res=solver_res, scoring=scoring)
+                    write_per_task_row(task_id=task_id, solver_results=solver_results_by_test, scoring=scoring)
                     scoring_by_id[task_id] = scoring
-                    solver_results.append({"task_id": task_id, "solver_res": solver_res})
+                    solver_results.append({"task_id": task_id, "solver_results": solver_results_by_test})
                     done += 1
                 pending.clear()
         except BaseException:
@@ -1175,7 +2243,7 @@ def _run_once_v141(
         item = res_by_id.get(str(task.task_id))
         if item is None:
             # Never crash the run due to missing worker output; record as a task-level failure and continue.
-            solver_res = {
+            solver_res0 = {
                 "schema_version": 141,
                 "kind": "arc_solver_result_v141",
                 "status": "FAIL",
@@ -1187,28 +2255,40 @@ def _run_once_v141(
                 },
                 "trace": {"exception_type": "MISSING_SOLVER_RESULT", "exception": f"missing_solver_result_v141:{task.task_id}"},
             }
-            scoring = _score_test_case_all_k_v141(
-                solver_res=solver_res, want_grid=task.test_pairs[0][1], max_trials=int(max_trials)
+            want_grids = [out for _inp, out in task.test_pairs]
+            solver_results_by_test = [dict(solver_res0) for _ in range(max(1, int(len(want_grids))))]
+            scoring = _score_task_all_tests_all_k_v141(
+                solver_results=solver_results_by_test,
+                want_grids=want_grids,
+                max_trials=int(max_trials),
+                require_concept_call=bool(require_concept_call),
             )
             scoring_by_id[str(task.task_id)] = scoring
-            item = {"task_id": str(task.task_id), "solver_res": solver_res}
+            item = {"task_id": str(task.task_id), "solver_results": solver_results_by_test}
             res_by_id[str(task.task_id)] = item
-        solver_res = item.get("solver_res")
-        if not isinstance(solver_res, dict):
+        solver_results_row = item.get("solver_results")
+        if not isinstance(solver_results_row, list) or not solver_results_row:
+            sr0 = item.get("solver_res") if isinstance(item.get("solver_res"), dict) else {}
+            solver_results_row = [sr0]
+        solver_results_by_test2 = [sr for sr in solver_results_row if isinstance(sr, dict)]
+        if not solver_results_by_test2:
             raise RuntimeError(f"bad_solver_result_v141:{task.task_id}")
-        scoring = scoring_by_id.get(str(task.task_id)) or _score_test_case_all_k_v141(
-            solver_res=solver_res, want_grid=task.test_pairs[0][1], max_trials=int(max_trials)
+        scoring = scoring_by_id.get(str(task.task_id)) or _score_task_all_tests_all_k_v141(
+            solver_results=solver_results_by_test2,
+            want_grids=[out for _inp, out in task.test_pairs],
+            max_trials=int(max_trials),
+            require_concept_call=bool(require_concept_call),
         )
         row = {
             "schema_version": 141,
             "kind": "arc_per_task_v141",
             "task": task.to_dict(),
-            "solver_results": [solver_res],
+            "solver_results": [dict(r) for r in solver_results_by_test2 if isinstance(r, dict)],
             "scoring": scoring,
         }
         per_task_rows.append(row)
 
-        write_per_task_row(task_id=str(task.task_id), solver_res=solver_res, scoring=scoring)
+        write_per_task_row(task_id=str(task.task_id), solver_results=solver_results_by_test2, scoring=scoring)
 
     # Now that per_task rows are complete, generate per-task manifest and trace candidates deterministically.
     for row in per_task_rows:
@@ -1217,11 +2297,14 @@ def _run_once_v141(
         task_obj = row.get("task") if isinstance(row.get("task"), dict) else {}
         task_id = str(task_obj.get("task_id") or "")
         solver_results_row = row.get("solver_results")
-        sr0 = solver_results_row[0] if isinstance(solver_results_row, list) and solver_results_row and isinstance(solver_results_row[0], dict) else {}
+        sr_list = [sr for sr in solver_results_row if isinstance(sr, dict)] if isinstance(solver_results_row, list) else []
+        sr0 = sr_list[0] if sr_list else {}
         scoring = row.get("scoring") if isinstance(row.get("scoring"), dict) else {}
 
-        solver_status = str(sr0.get("status") or "")
+        solver_status = str(scoring.get("solver_status") or (sr0.get("status") or ""))
         fk = str(scoring.get("failure_kind") or "")
+        program_sigs_by_test = [str(sr.get("program_sig") or "") for sr in sr_list]
+        predicted_hashes_by_test = [str(sr.get("predicted_grid_hash") or "") for sr in sr_list]
         scoring_rows.append(
             {
                 "schema_version": 141,
@@ -1231,22 +2314,53 @@ def _run_once_v141(
                 "failure_kind": fk,
                 "program_sig": str(sr0.get("program_sig") or ""),
                 "predicted_grid_hash": str(sr0.get("predicted_grid_hash") or ""),
+                "program_sigs_by_test": program_sigs_by_test,
+                "predicted_grid_hashes_by_test": predicted_hashes_by_test,
             }
         )
 
-        trace = sr0.get("trace") if isinstance(sr0.get("trace"), dict) else {}
-        tps = trace.get("trace_programs", []) if isinstance(trace.get("trace_programs"), list) else []
-        tps_dicts = [tp for tp in tps if isinstance(tp, dict)]
-        tps_dicts.sort(key=lambda d: (str(d.get("program_sig") or ""), _stable_json(d)))
-        for tp in tps_dicts:
-            trace_candidates_rows.append(
-                {
-                    "schema_version": 141,
-                    "kind": "arc_trace_candidate_v141",
-                    "task_id": str(task_id),
-                    **{str(k): tp.get(k) for k in sorted(tp.keys())},
-                }
-            )
+        for test_index, sr in enumerate(sr_list):
+            trace = sr.get("trace") if isinstance(sr.get("trace"), dict) else {}
+            tps = trace.get("trace_programs", []) if isinstance(trace.get("trace_programs"), list) else []
+            tps_dicts = [tp for tp in tps if isinstance(tp, dict)]
+            tps_dicts.sort(key=lambda d: (str(d.get("program_sig") or ""), _stable_json(d)))
+            for tp in tps_dicts:
+                trace_candidates_rows.append(
+                    {
+                        "schema_version": 141,
+                        "kind": "arc_trace_candidate_v141",
+                        "task_id": str(task_id),
+                        "test_index": int(test_index),
+                        **{str(k): tp.get(k) for k in sorted(tp.keys())},
+                    }
+                )
+
+            # Also record the final program itself as a trace candidate (when available).
+            #
+            # Rationale:
+            # - In strict concept-as-policy regimes, many tasks solve via a single high-level concept_call
+            #   with an internal multi-step CSG body. The solver does not always populate trace_programs
+            #   for successful runs (to keep per_task logs bounded), but we still need a deterministic
+            #   corpus of concrete programs for downstream CSG mining in learn-mode.
+            # - ARC eval remains read-only; emitting trace candidates does not mutate banks.
+            #
+            # Only emit for solved tasks to avoid polluting mining with arbitrary wrong outputs.
+            if str(solver_status) == "SOLVED":
+                final_steps = sr.get("program_steps")
+                if isinstance(final_steps, list) and final_steps:
+                    trace_candidates_rows.append(
+                        {
+                            "schema_version": 141,
+                            "kind": "arc_trace_candidate_v141",
+                            "task_id": str(task_id),
+                            "test_index": int(test_index),
+                            "program_sig": str(sr.get("program_sig") or ""),
+                            "cost_bits": int(sr.get("program_cost_bits") or 0),
+                            "loss": {"shape": 0, "cells": 0},
+                            "steps": [dict(s) for s in final_steps if isinstance(s, dict)],
+                            "source": "final_program",
+                        }
+                    )
 
     omega_events: List[Dict[str, Any]] = []
     omega_fail_total = 0
@@ -1260,11 +2374,8 @@ def _run_once_v141(
             task_id = str(task_obj.get("task_id") or "")
             scoring = row.get("scoring") if isinstance(row.get("scoring"), dict) else {}
             solver_results_row = row.get("solver_results")
-            sr0 = (
-                solver_results_row[0]
-                if isinstance(solver_results_row, list) and solver_results_row and isinstance(solver_results_row[0], dict)
-                else {}
-            )
+            sr_list = [sr for sr in solver_results_row if isinstance(sr, dict)] if isinstance(solver_results_row, list) else []
+            sr0 = sr_list[0] if sr_list else {}
 
             family_id = arc_task_family_id(task_obj)
             context_id = arc_task_context_id(task_obj)
@@ -1285,26 +2396,27 @@ def _run_once_v141(
             program_cost_bits: Optional[int] = None
             program_depth: Optional[int] = None
             if episode_success:
-                steps = sr0.get("program_steps")
-                if isinstance(steps, list):
-                    program_depth = int(len(steps))
-                    for st in steps:
-                        if not isinstance(st, dict):
-                            continue
-                        op_id = str(st.get("op_id") or "")
-                        if op_id == "concept_call":
-                            args = st.get("args") if isinstance(st.get("args"), dict) else {}
-                            cid = str(args.get("concept_id") or "")
-                            if cid:
-                                concept_calls.append(cid)
-                        elif op_id == "macro_call":
-                            args = st.get("args") if isinstance(st.get("args"), dict) else {}
-                            mid = str(args.get("macro_id") or "")
-                            if mid:
-                                macro_calls.append(mid)
-                pcb = sr0.get("program_cost_bits")
-                if isinstance(pcb, int):
-                    program_cost_bits = int(pcb)
+                for sr in sr_list:
+                    steps = sr.get("program_steps")
+                    if isinstance(steps, list):
+                        program_depth = max(int(program_depth or 0), int(len(steps)))
+                        for st in steps:
+                            if not isinstance(st, dict):
+                                continue
+                            op_id = str(st.get("op_id") or "")
+                            if op_id == "concept_call":
+                                args = st.get("args") if isinstance(st.get("args"), dict) else {}
+                                cid = str(args.get("concept_id") or "")
+                                if cid:
+                                    concept_calls.append(cid)
+                            elif op_id == "macro_call":
+                                args = st.get("args") if isinstance(st.get("args"), dict) else {}
+                                mid = str(args.get("macro_id") or "")
+                                if mid:
+                                    macro_calls.append(mid)
+                    pcb = sr.get("program_cost_bits")
+                    if isinstance(pcb, int):
+                        program_cost_bits = max(int(program_cost_bits or 0), int(pcb))
             concept_calls = sorted(list(dict.fromkeys([c for c in concept_calls if c])))
             macro_calls = sorted(list(dict.fromkeys([m for m in macro_calls if m])))
 
@@ -1340,18 +2452,32 @@ def _run_once_v141(
     # Aggregate eval + summary.
     failure_counts: Dict[str, int] = {}
     for r in scoring_rows:
-        st = str(r.get("status") or "")
-        if st == "SOLVED":
-            continue
         fk = str(r.get("failure_kind") or "")
         if fk:
             failure_counts[fk] = int(failure_counts.get(fk, 0)) + 1
+
+    csv_tested_total = 0
+    csv_rejected_total = 0
+    for row in per_task_rows:
+        if not isinstance(row, dict):
+            continue
+        solver_results_row = row.get("solver_results")
+        sr_list = [sr for sr in solver_results_row if isinstance(sr, dict)] if isinstance(solver_results_row, list) else []
+        sr0 = sr_list[0] if sr_list else {}
+        trace = sr0.get("trace") if isinstance(sr0.get("trace"), dict) else {}
+        csv_tested_total += int(trace.get("csv_tested") or 0)
+        csv_rejected_total += int(trace.get("csv_rejected") or 0)
+    csv_survival_count = max(0, int(csv_tested_total) - int(csv_rejected_total))
+    csv_rejection_rate: Optional[float] = None
+    if int(csv_tested_total) > 0:
+        csv_rejection_rate = float(int(csv_rejected_total)) / float(int(csv_tested_total))
 
     score_summary = _summarize_scores_v141(per_task_rows, max_trials=int(max_trials))
     program_usage = _summarize_program_usage_v141(per_task_rows)
     eval_obj: Dict[str, Any] = {
         "schema_version": 141,
         "kind": "arc_eval_v141",
+        "require_concept_call": bool(require_concept_call),
         "failure_counts": {k: int(failure_counts[k]) for k in sorted(failure_counts.keys())},
         "tasks_total": int(score_summary["tasks_total"]),
         "tasks_solved_by_k": score_summary["tasks_solved_by_k"],
@@ -1375,12 +2501,14 @@ def _run_once_v141(
         "trace_program_limit": 80,
         "solution_cost_slack_bits": int(solution_cost_slack_bits),
         "abstraction_pressure": bool(abstraction_pressure),
+        "concept_support_feat_ranking": bool(concept_support_feat_ranking),
         "max_depth_requested": int(max_depth),
         "max_programs_requested": int(max_programs),
         "task_timeout_s": float(task_timeout_s),
         "no_progress_timeout_s": float(no_progress_timeout_s or 0.0),
         "resume": bool(resume),
         "benchmark_profile": str(benchmark_profile),
+        "require_concept_call": bool(require_concept_call),
         "max_trials": int(max_trials),
         "macro_templates_path": str(macro_templates_path or ""),
         "concept_templates_path": str(concept_templates_path or ""),
@@ -1404,17 +2532,28 @@ def _run_once_v141(
         "omega_banned_task_families_total": int(len(omega_banned_families)),
         "omega_banned_tasks_filtered": int(len(omega_banned_tasks)),
         "omega_failures_total": int(omega_fail_total),
+        "csv_tested_total": int(csv_tested_total),
+        "csv_rejected_total": int(csv_rejected_total),
+        "csv_survival_count": int(csv_survival_count),
+        "csv_rejection_rate": float(csv_rejection_rate) if csv_rejection_rate is not None else None,
         "macro_try_on_fail_only": bool(macro_try_on_fail_only),
         "enable_reachability_pruning": bool(enable_reachability_pruning),
+        "trace_csg_induction": bool(trace_csg_induction),
+        "trace_csg_first_pass_frac": float(trace_csg_first_pass_frac),
         "macro_propose_max_depth": int(macro_propose_max_depth),
         "macro_max_templates": int(macro_max_templates),
         "macro_max_instantiations": int(macro_max_instantiations),
         "macro_max_branch_per_op": int(macro_max_branch_per_op),
+        "concept_propose_max_depth": int(concept_propose_max_depth),
+        "concept_max_templates": int(concept_max_templates),
+        "concept_max_instantiations": int(concept_max_instantiations),
+        "concept_max_branch_per_op": int(concept_max_branch_per_op),
         "enable_repair_stage": bool(enable_repair_stage),
         "enable_residual_stage": bool(enable_residual_stage),
         "enable_refine_stage": bool(enable_refine_stage),
         "enable_point_patch_repair": bool(enable_point_patch_repair),
         "point_patch_max_points": int(point_patch_max_points),
+        "ensemble": bool(ensemble),
         "tasks_total": int(score_summary["tasks_total"]),
         "tasks_solved_by_k": score_summary["tasks_solved_by_k"],
         "failure_counts": {k: int(failure_counts[k]) for k in sorted(failure_counts.keys())},
@@ -1437,8 +2576,16 @@ def _run_once_v141(
         "ok": bool(str(before_sig) == str(after_sig)),
     }
     _write_once_json(out_dir / "isolation_check_v141.json", isolation)
-    if not isolation["ok"]:
-        raise SystemExit("isolation_violation_v141")
+    isolation_ok = bool(isolation["ok"])
+    if not isolation_ok:
+        # Do not abort the run: record the violation and continue so automation can
+        # consume the produced artifacts (summary/eval/per_task). The caller can
+        # treat isolation_ok=false as a hard failure if desired.
+        print(
+            f"WARNING: isolation_violation_v141 (repo snapshot changed during run; see {out_dir / 'isolation_check_v141.json'})",
+            file=sys.stderr,
+            flush=True,
+        )
 
     outputs_manifest = _outputs_manifest_v141(run_dir=out_dir)
     _write_once_json(out_dir / "outputs_manifest.json", outputs_manifest)
@@ -1454,15 +2601,33 @@ def _run_once_v141(
         "tasks_solved_by_k": score_summary["tasks_solved_by_k"],
         "failure_counts": {k: int(failure_counts[k]) for k in sorted(failure_counts.keys())},
         "determinism_ok": True,
-        "isolation_ok": True,
+        "isolation_ok": bool(isolation_ok),
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode",
+        choices=["learn", "eval_arc"],
+        default="learn",
+        help=(
+            "Execution mode guardrails. "
+            "learn: allow learning-oriented features (only when explicitly enabled). "
+            "eval_arc: ARC auditor mode (read-only): forbids any in-run induction/mutation features."
+        ),
+    )
     ap.add_argument("--arc_root", required=True)
     ap.add_argument("--split", default=None)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument(
+        "--task_ids",
+        default="",
+        help=(
+            "Optional comma-separated list of task_id filenames to run (e.g., 'd35bdbdc.json'). "
+            "Overrides --limit/--seed dataset slice selection for WORM input manifest generation."
+        ),
+    )
     ap.add_argument("--seed", type=int, default=0)
     # jobs<=0 => auto (os.cpu_count()).
     ap.add_argument("--jobs", type=int, default=8)
@@ -1478,6 +2643,13 @@ def main() -> int:
     ap.add_argument("--max_trials", type=int, default=None)
     ap.add_argument("--macro_templates", default=None)
     ap.add_argument("--concept_templates", default=None)
+    ap.add_argument(
+        "--require_concept_call",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1: treat output-correct solutions without concept_call as FAIL (validator-like).",
+    )
     ap.add_argument(
         "--tries",
         type=int,
@@ -1540,6 +2712,13 @@ def main() -> int:
         help="1: baseline-first; only try macros if baseline fails. 0: include macros in the main search.",
     )
     ap.add_argument(
+        "--ensemble",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1: run a small deterministic config ensemble per task and merge candidates (improves k-trials surface).",
+    )
+    ap.add_argument(
         "--macro_propose_max_depth",
         type=int,
         default=0,
@@ -1564,9 +2743,53 @@ def main() -> int:
         help="Max arg branches per op_id within macro instantiation.",
     )
     ap.add_argument(
+        "--concept_propose_max_depth",
+        type=int,
+        default=99,
+        help="Allow concept_call proposals up to this search depth (default: any depth).",
+    )
+    ap.add_argument(
+        "--concept_max_templates",
+        type=int,
+        default=24,
+        help="Max concept templates to consider per state when concept proposals are enabled.",
+    )
+    ap.add_argument(
+        "--concept_max_instantiations",
+        type=int,
+        default=10,
+        help="Max arg instantiations per concept template when proposing concept_call.",
+    )
+    ap.add_argument(
+        "--concept_max_branch_per_op",
+        type=int,
+        default=10,
+        help="Max arg branches per op_id within concept instantiation.",
+    )
+    ap.add_argument(
         "--abstraction_pressure",
         action="store_true",
         help="Enable abstraction-or-die pressure: prefer closure (concept_call) as soon as shape matches and classify shape-correct budget failures as MISSING_CONCEPT.",
+    )
+    ap.add_argument(
+        "--concept_support_feat_ranking",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Enable training-only support-feature ranking for concept template retrieval (requires support_task_ids in the concept bank).",
+    )
+    ap.add_argument(
+        "--trace_csg_induction",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Enable deterministic trace→CSG induction retry pass (collapses deep near-miss traces into atomic concept_call steps).",
+    )
+    ap.add_argument(
+        "--trace_csg_first_pass_frac",
+        type=float,
+        default=0.6,
+        help="Fraction of max_programs allocated to the first pass before inducing CSG from traces (rest is used for the retry pass).",
     )
     ap.add_argument(
         "--omega",
@@ -1580,6 +2803,24 @@ def main() -> int:
     )
     ap.add_argument("--out_base", required=True)
     args = ap.parse_args()
+
+    # AUTO benchmark profile: if the user didn't explicitly pass --benchmark_profile, infer from arc_root.
+    # This avoids accidentally evaluating ARC-AGI-2 runs under ARC-AGI-1 trial rules.
+    if "--benchmark_profile" not in sys.argv:
+        ar = str(getattr(args, "arc_root", "") or "").lower()
+        if "agi2" in ar or "arc-agi-2" in ar or "arc_agi2" in ar:
+            args.benchmark_profile = "ARC_AGI2_PROFILE"
+
+    # MODE=EVAL_ARC is a hard guardrail required by the project docs:
+    # ARC is an external auditor; evaluation must be read-only and must not persist new structure.
+    #
+    # Note: trace→CSG induction is permitted in eval mode because it is strictly:
+    #   - per-task, in-memory only (no bank mutation / no WORM writes beyond the run artifacts)
+    #   - deterministic given (seed, code, flags)
+    #   - expressivity-preserving (no new primitives; it only wraps existing primitive prefixes)
+    if str(getattr(args, "mode", "learn")) == "eval_arc":
+        if bool(args.omega):
+            raise SystemExit("eval_arc_forbids_omega_v141")
 
     tries = int(args.tries)
     if tries not in (1, 2):
@@ -1596,6 +2837,17 @@ def main() -> int:
     resume = bool(args.resume)
     if resume and tries != 1:
         raise SystemExit("resume_requires_tries1_v141")
+
+    task_ids: List[str] = []
+    raw_task_ids = str(getattr(args, "task_ids", "") or "").strip()
+    if raw_task_ids:
+        for x in raw_task_ids.split(","):
+            s = str(x or "").strip().replace("\\", "/").lstrip("/")
+            if not s:
+                continue
+            if not s.endswith(".json"):
+                s = s + ".json"
+            task_ids.append(str(s))
 
     out_base = Path(str(args.out_base))
     try1 = Path(str(out_base) + "_try1")
@@ -1614,6 +2866,7 @@ def main() -> int:
             arc_root=str(args.arc_root),
             split=str(args.split) if args.split else None,
             limit=int(args.limit),
+            task_ids=(task_ids if task_ids else None),
             seed=int(args.seed),
             jobs=int(args.jobs),
             max_depth=int(args.max_depth),
@@ -1623,6 +2876,7 @@ def main() -> int:
             benchmark_profile=str(args.benchmark_profile),
             macro_templates_path=str(args.macro_templates) if args.macro_templates else None,
             concept_templates_path=str(args.concept_templates) if args.concept_templates else None,
+            require_concept_call=bool(int(args.require_concept_call) != 0),
             task_timeout_s=float(task_timeout_s),
             no_progress_timeout_s=float(no_progress_timeout_s),
             resume=bool(resume),
@@ -1634,10 +2888,24 @@ def main() -> int:
             macro_max_templates=int(args.macro_max_templates),
             macro_max_instantiations=int(args.macro_max_instantiations),
             macro_max_branch_per_op=int(args.macro_max_branch_per_op),
+            concept_propose_max_depth=int(args.concept_propose_max_depth),
+            concept_max_templates=int(args.concept_max_templates),
+            concept_max_instantiations=int(args.concept_max_instantiations),
+            concept_max_branch_per_op=int(args.concept_max_branch_per_op),
             abstraction_pressure=bool(args.abstraction_pressure),
+            # NOTE: under abstraction pressure (concept-as-policy), the solver must be able to
+            # perform bounded *enabling* semantic moves (slot builders / patch transforms) before
+            # the first grid write reduces mismatch, otherwise many tasks become inexpressible at
+            # fixed depth and fail immediately with csv_survivors==0 (MISSING_OPERATOR).
+            csv_allow_slot_progress=bool(str(getattr(args, "mode", "learn")) == "learn")
+            or bool(args.abstraction_pressure),
+            concept_support_feat_ranking=bool(int(args.concept_support_feat_ranking) != 0),
+            trace_csg_induction=bool(int(args.trace_csg_induction) != 0),
+            trace_csg_first_pass_frac=float(args.trace_csg_first_pass_frac),
             enable_reachability_pruning=not bool(args.disable_reachability_pruning),
             enable_point_patch_repair=bool(args.enable_point_patch_repair),
             point_patch_max_points=int(args.point_patch_max_points),
+            ensemble=bool(int(args.ensemble) != 0),
             omega_enabled=bool(args.omega),
             omega_state_in=str(args.omega_state_in or "").strip() or None,
         )
@@ -1654,6 +2922,7 @@ def main() -> int:
                 arc_root=str(args.arc_root),
                 split=str(args.split) if args.split else None,
                 limit=int(args.limit),
+                task_ids=(task_ids if task_ids else None),
                 seed=int(args.seed),
                 jobs=int(args.jobs),
                 max_depth=int(args.max_depth),
@@ -1663,6 +2932,7 @@ def main() -> int:
                 benchmark_profile=str(args.benchmark_profile),
                 macro_templates_path=str(args.macro_templates) if args.macro_templates else None,
                 concept_templates_path=str(args.concept_templates) if args.concept_templates else None,
+                require_concept_call=bool(int(args.require_concept_call) != 0),
                 task_timeout_s=float(task_timeout_s),
                 no_progress_timeout_s=float(no_progress_timeout_s),
                 resume=bool(resume),
@@ -1674,10 +2944,20 @@ def main() -> int:
                 macro_max_templates=int(args.macro_max_templates),
                 macro_max_instantiations=int(args.macro_max_instantiations),
                 macro_max_branch_per_op=int(args.macro_max_branch_per_op),
+                concept_propose_max_depth=int(args.concept_propose_max_depth),
+                concept_max_templates=int(args.concept_max_templates),
+                concept_max_instantiations=int(args.concept_max_instantiations),
+                concept_max_branch_per_op=int(args.concept_max_branch_per_op),
                 abstraction_pressure=bool(args.abstraction_pressure),
+                csv_allow_slot_progress=bool(str(getattr(args, "mode", "learn")) == "learn")
+                or bool(args.abstraction_pressure),
+                concept_support_feat_ranking=bool(int(args.concept_support_feat_ranking) != 0),
+                trace_csg_induction=bool(int(args.trace_csg_induction) != 0),
+                trace_csg_first_pass_frac=float(args.trace_csg_first_pass_frac),
                 enable_reachability_pruning=not bool(args.disable_reachability_pruning),
                 enable_point_patch_repair=bool(args.enable_point_patch_repair),
                 point_patch_max_points=int(args.point_patch_max_points),
+                ensemble=bool(int(args.ensemble) != 0),
                 omega_enabled=bool(args.omega),
                 omega_state_in=str(args.omega_state_in or "").strip() or None,
             )

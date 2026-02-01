@@ -68,6 +68,7 @@ def merge_concept_templates_v146(
     inputs: Sequence[Path],
     min_support: int,
     max_concepts: int,
+    max_len: int,
 ) -> List[Dict[str, Any]]:
     by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -77,7 +78,7 @@ def merge_concept_templates_v146(
             op_ids = _norm_op_ids(row.get("op_ids"))
             if sig is None or op_ids is None:
                 continue
-            if len(op_ids) > 3:
+            if len(op_ids) > int(max_len):
                 continue
             key_sig = _stable_json(sig)
             key_ops = _stable_json(op_ids)
@@ -132,6 +133,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Output concept templates jsonl (WORM: must not exist)")
     ap.add_argument("--min_support", type=int, default=2)
     ap.add_argument("--max_concepts", type=int, default=128)
+    ap.add_argument("--max_len", type=int, default=3, help="Max op_ids length to retain (default: 3)")
     args = ap.parse_args()
 
     inputs: List[Path] = [Path(str(p)).resolve() for p in list(args.inputs or [])]
@@ -156,7 +158,12 @@ def main() -> int:
         raise SystemExit(f"worm_exists:{out_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = merge_concept_templates_v146(inputs=inputs, min_support=int(args.min_support), max_concepts=int(args.max_concepts))
+    rows = merge_concept_templates_v146(
+        inputs=inputs,
+        min_support=int(args.min_support),
+        max_concepts=int(args.max_concepts),
+        max_len=int(args.max_len),
+    )
     out_path.write_text("\n".join(_stable_json(r) for r in rows) + ("\n" if rows else ""), encoding="utf-8")
     print(_stable_json({"ok": True, "out": str(out_path), "concepts_written": int(len(rows))}))
     return 0

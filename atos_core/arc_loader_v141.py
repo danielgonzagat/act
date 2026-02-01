@@ -139,7 +139,14 @@ def _parse_task_json_v141(*, path: Path, task_id: str) -> ArcTaskV141:
 
 
 def write_arc_canonical_jsonl_v141(
-    *, arc_root: str, split: Optional[str], limit: int, seed: Optional[int], out_jsonl: Path, out_manifest: Path
+    *,
+    arc_root: str,
+    split: Optional[str],
+    limit: int,
+    seed: Optional[int],
+    out_jsonl: Path,
+    out_manifest: Path,
+    task_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     tasks_root = _resolve_arc_tasks_root_v141(arc_root=str(arc_root), split=split)
     if out_jsonl.exists():
@@ -150,9 +157,30 @@ def write_arc_canonical_jsonl_v141(
     out_manifest.parent.mkdir(parents=True, exist_ok=True)
 
     task_paths_all = sorted(tasks_root.rglob("*.json"), key=lambda p: str(p.relative_to(tasks_root)))
-    task_paths = list(task_paths_all)
+    # Non-task metadata files are allowed in synthetic roots (e.g., MANIFEST.json); ignore them.
+    task_paths_all = [p for p in task_paths_all if str(p.name) not in {"MANIFEST.json"}]
+    task_paths: List[Path] = list(task_paths_all)
+
     selection_mode = "sorted"
-    if int(limit) > 0:
+    task_ids_norm: List[str] = []
+    if task_ids is not None:
+        for x in task_ids:
+            s = str(x or "").strip().replace("\\", "/").lstrip("/")
+            if not s:
+                continue
+            if not s.endswith(".json"):
+                s = s + ".json"
+            task_ids_norm.append(str(s))
+
+    if task_ids_norm:
+        selection_mode = "explicit"
+        by_id: Dict[str, Path] = {str(p.relative_to(tasks_root)).replace("\\", "/"): p for p in task_paths_all}
+        missing = [tid for tid in task_ids_norm if tid not in by_id]
+        if missing:
+            raise ValueError(f"arc_task_ids_not_found:{','.join(missing)} root={tasks_root}")
+        # Preserve requested ordering deterministically.
+        task_paths = [by_id[tid] for tid in task_ids_norm]
+    elif int(limit) > 0:
         if seed is not None:
             selection_mode = "shuffled"
             rng = random.Random(int(seed))
@@ -178,9 +206,10 @@ def write_arc_canonical_jsonl_v141(
         "arc_root_input": str(Path(str(arc_root)).resolve()),
         "tasks_root": str(tasks_root),
         "split": str(split or ""),
-        "limit": int(limit),
+        "limit": int(len(task_paths) if task_ids_norm else int(limit)),
         "seed": (int(seed) if seed is not None else None),
         "selection_mode": str(selection_mode),
+        "task_ids": (list(task_ids_norm) if task_ids_norm else []),
         "inputs": inputs,
         "canonical_jsonl_sha256": _sha256_file(out_jsonl),
     }

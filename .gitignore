@@ -9,8 +9,13 @@ external_world/
 external_world_*/
 data/raw/
 data/history/
+data/grid_synth_*/
+data/sample_text.txt
+
+arc-agi-2/
 
 tmp/
 cache/
 artifacts/
 results/
+results*/
