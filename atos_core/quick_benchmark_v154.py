@@ -111,7 +111,7 @@ def run_benchmark(
     num_tasks: int = 100,
     max_depth: int = 4,
     max_programs: int = 4000,
-    workers: int = 8,
+    workers: int = 16,
     verbose: bool = True,
 ) -> BenchmarkResult:
     """Run parallel benchmark on ARC tasks."""

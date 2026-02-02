@@ -477,7 +477,7 @@ class FullTrainingPipeline:
         max_iterations: int = 10,
         solver_depth: int = 4,
         solver_programs: int = 2000,
-        workers: int = 8,
+        workers: int = 16,
         min_concept_reuse: int = 2,
         target_accuracy: float = 0.90,
     ) -> None:
@@ -744,7 +744,7 @@ def run_quick_training_test() -> FullTrainingResult:
         max_iterations=3,
         solver_depth=4,
         solver_programs=2000,
-        workers=8,
+        workers=16,
         min_concept_reuse=2,
         target_accuracy=0.90,
     )

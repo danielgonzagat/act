@@ -1129,7 +1129,7 @@ def solve_v158(
     test_input: GridV124,
     max_depth: int = 4,
     max_programs: int = 2000,
-    num_workers: int = 8,
+    num_workers: int = 16,
     enable_shared_cache: bool = True,
     seed: int = 0,
 ) -> Dict[str, Any]:
