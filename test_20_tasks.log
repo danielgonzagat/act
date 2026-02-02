@@ -1,0 +1,83 @@
+
+======================================================================
+OVER-MINING PIPELINE V160 - EXPLORAÇÃO AGRESSIVA TOTAL
+======================================================================
+>> MINERA TUDO. NÃO DESCARTA NADA. VENCE A TODO CUSTO. <<
+======================================================================
+✓ Authority hierarchy verified
+✓ Loaded 20 tasks from ARC-AGI/data
+
+======================================================================
+ITERATION 1/3
+======================================================================
+   Injecting 0 concepts as operators
+   ✓ Solved: 2/20 (10.0%)
+   ✓ NEW tasks solved this iter: 2
+   ✓ Concepts mined this iter: 2
+   ✓ Total concepts: 2
+   ✓ Cross-task concepts: 0
+   ✓ Time: 400.9s
+   ❌ Failures:
+      • SEARCH_BUDGET_EXCEEDED: 18 (100%)
+
+======================================================================
+ITERATION 2/3
+======================================================================
+   Injecting 2 concepts as operators
+   ✓ Solved: 2/20 (10.0%)
+   ✓ NEW tasks solved this iter: 0
+   ✓ Concepts mined this iter: 2
+   ✓ Total concepts: 2
+   ✓ Cross-task concepts: 0
+   ✓ Time: 389.9s
+   ❌ Failures:
+      • SEARCH_BUDGET_EXCEEDED: 18 (100%)
+
+======================================================================
+ITERATION 3/3
+======================================================================
+   Injecting 2 concepts as operators
+   ✓ Solved: 2/20 (10.0%)
+   ✓ NEW tasks solved this iter: 0
+   ✓ Concepts mined this iter: 2
+   ✓ Total concepts: 2
+   ✓ Cross-task concepts: 0
+   ✓ Time: 371.5s
+   ❌ Failures:
+      • SEARCH_BUDGET_EXCEEDED: 18 (100%)
+
+======================================================================
+OVER-MINING FINAL REPORT - V160
+======================================================================
+
+## Configuration
+- Tasks: 20
+- Depth: 6
+- Programs: 8000
+- Workers: 16
+- Target: 90%
+
+## Results
+- Final Accuracy: 10.0%
+- Tasks Solved: 2/20
+- Iterations: 3
+
+## Concept Bank
+- Total Concepts: 2
+- Alive Concepts: 2
+- Cross-Task Concepts: 0
+- Unique Tasks Covered: 2
+
+## Accuracy History
+   Iter 1: 10.0% (concepts: 2)
+   Iter 2: 10.0% (concepts: 2)
+   Iter 3: 10.0% (concepts: 2)
+
+## Verdict
+   ⏳ Target not yet reached
+   → Continue mining
+   → Consider increasing depth/programs
+
+======================================================================
+Generated: 2026-02-02T17:57:07.912993
+======================================================================

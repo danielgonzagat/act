@@ -1,0 +1,27 @@
+
+======================================================================
+OVER-MINING PIPELINE V160 - EXPLORAÇÃO AGRESSIVA TOTAL
+======================================================================
+>> MINERA TUDO. NÃO DESCARTA NADA. VENCE A TODO CUSTO. <<
+======================================================================
+✓ Authority hierarchy verified
+✓ Loaded 100 tasks from ARC-AGI/data
+
+======================================================================
+ITERATION 1/3
+======================================================================
+   Injecting 0 concepts as operators
+   ✓ Solved: 9/100 (9.0%)
+   ✓ NEW tasks solved this iter: 9
+   ✓ Concepts mined this iter: 9
+   ✓ Total concepts: 9
+   ✓ Cross-task concepts: 0
+   ✓ Time: 893.4s
+   ❌ Failures:
+      • SEARCH_BUDGET_EXCEEDED: 90 (99%)
+      • UNKNOWN: 1 (1%)
+
+======================================================================
+ITERATION 2/3
+======================================================================
+   Injecting 9 concepts as operators

@@ -1,0 +1,63 @@
+nohup: ignoring input
+
+======================================================================
+FULL TRAINING PIPELINE V158
+======================================================================
+✓ Authority hierarchy verified: AUTHORITY_HIERARCHY_VALID
+✓ Loaded 30 tasks from ARC-AGI/data
+
+======================================================================
+ITERATION 1/2
+======================================================================
+   Solved: 2/30 (6.7%)
+   Concepts: 0 alive, 0 total reuse
+   Max depth: 0
+   Time: 127.8s
+   Failures: {'SEARCH_BUDGET_EXCEEDED': 28}
+
+======================================================================
+ITERATION 2/2
+======================================================================
+   Solved: 2/30 (6.7%)
+   Concepts: 0 alive, 0 total reuse
+   Max depth: 0
+   Time: 127.4s
+   Failures: {'SEARCH_BUDGET_EXCEEDED': 28}
+
+======================================================================
+FINAL EVALUATION REPORT (FER) - V158
+======================================================================
+
+## 1. Configuration
+- Schema Version: 158
+- Max Tasks: 30
+- Iterations: 2
+- Solver Depth: 4
+- Solver Programs: 2000
+- Workers: 4
+- Target Accuracy: 90%
+
+## 2. Results
+- Final Accuracy: 6.7%
+- Best Accuracy: 6.7%
+- Concepts Total: 1
+- Concepts Alive: 0
+
+## 3. Accuracy History
+   Iteration 1: 6.7%
+   Iteration 2: 6.7%
+
+## 4. Concept Library
+
+## 5. Verdict
+   AGI_NÃO_CONFIRMADA
+   Details: {'final_accuracy': 0.06666666666666667, 'target': 0.9, 'passed': False, 'concepts_alive': 0, 'total_reuse': 0}
+
+## 6. Honest Assessment
+   ❌ Target accuracy NOT achieved (6.7% < 90%)
+   ⚠ Concepts alive: 0
+   Next: Increase solver depth/programs, add operators
+
+======================================================================
+Generated: 2026-02-02T16:20:52.708300
+======================================================================
