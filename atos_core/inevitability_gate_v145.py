@@ -391,11 +391,18 @@ def check_law_composition(
         })
     
     # Check for flat concepts
+    # Exception: depth=0 concepts (base concepts) are allowed to be flat
+    # because they are the foundation of the hierarchy
     if config.reject_flat_concepts:
         for concept in concepts_used:
             ev = concept.evidence or {}
             pcc = ev.get("pcc_v2", {})
+            depth = int(pcc.get("depth", 0))
             call_deps = list(pcc.get("call_deps", []))
+            
+            # Base concepts (depth 0) are allowed to be flat
+            if depth == 0:
+                continue
             
             if len(call_deps) == 0:
                 rejections.append(GateRejectionReason.FLAT_CONCEPT)
@@ -504,9 +511,11 @@ def check_law_proof(
                 })
         
         # Check call_deps
+        # Exception: depth=0 concepts (base concepts) don't need call_deps
         if config.require_call_deps:
+            depth = int(pcc.get("depth", 0))
             call_deps = list(pcc.get("call_deps", []))
-            if len(call_deps) == 0:
+            if depth > 0 and len(call_deps) == 0:
                 rejections.append(GateRejectionReason.MISSING_CALL_DEPS)
                 audit.append({
                     "law": "LAW_PROOF",
